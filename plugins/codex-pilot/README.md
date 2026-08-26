@@ -1,8 +1,13 @@
 # codex-pilot
 
-Drive Codex Desktop threads from Claude Code: send work, steer a running turn,
-stop one, answer approval requests, change model / reasoning / plan mode, and
-get told when a thread goes idle.
+Drive Codex Desktop threads from Claude Code: start work in the repo or worktree
+it belongs to, steer a running turn, stop one, answer approval requests, change
+model / reasoning / plan mode, and get told when a thread goes idle.
+
+Nothing blocks on Codex. Every call returns while the agent keeps working, so a
+session that hands off a job stays free to do something else instead of sitting
+on a synchronous `codex exec`. The one exception is `collect_events`, which waits
+only if you ask it to and is capped at two minutes.
 
 Built by decoding Codex Desktop's private local IPC protocol from the installed
 app bundle and validating every call against the running app. The full decode is
@@ -16,15 +21,16 @@ in [`docs/protocol.md`](docs/protocol.md).
 
 | Tool | |
 | --- | --- |
+| `start_thread` | create a thread in a repo or worktree you name and start its first turn |
 | `list_threads` | every thread across every installed Codex instance, with its route |
 | `thread_status` | busy/idle, current turn, settings, and anything the thread is waiting on |
-| `send_message` | start a turn — routes itself over IPC or a detached resume |
+| `send_message` | start a turn on an existing thread; routes itself over IPC or a detached resume |
 | `steer_turn` | inject into a *running* turn without restarting it |
-| `stop_turn` | interrupt, optionally only if a specific turn is still running |
+| `stop_turn` | interrupt a turn, or terminate a detached run and its process group |
 | `respond` | answer an approval, permission request, tool question or MCP elicitation |
 | `edit_thread` | model, reasoning effort, plan mode, fast mode, sandbox, approvals; or compact |
 | `set_goal` | give a thread a standing objective |
-| `follow_thread` / `collect_events` | learn when a turn finished, without polling |
+| `follow_thread` / `collect_events` | learn when a turn finished, without polling — covers detached runs too |
 | `focus_thread` | make the app mount a thread it is holding but not showing |
 
 ## Install
@@ -42,7 +48,7 @@ Or as a plugin, which ships the MCP server and the usage skill together:
 /plugin install codex-pilot@<your-marketplace>
 ```
 
-## The three things that decide what is possible
+## The things that decide what is possible
 
 **The writer lock picks the route.** Codex allows one writer per thread. A thread
 the app has open can only be driven over IPC; one nothing holds can only be
@@ -60,6 +66,30 @@ external stream after that thread's route is mounted."*
 set to `auto_review` (the default) a subagent silently decides escalations and
 `thread_status` shows nothing pending — indistinguishable from a thread that
 never asked. Set it to `user` on threads you intend to supervise.
+
+**Creating a thread is the one thing the IPC surface cannot do.** The app's
+follower protocol only drives threads that already exist, and there is no
+`codex://new` deep link, so `start_thread` spawns `codex exec` detached and
+reads the new thread id off its JSONL. It returns in about a second, works in
+the directory you name rather than the caller's, and the thread it creates can
+be pulled into Codex Desktop afterwards with `focus_thread`.
+
+That introduces a third lock state, which the rest of the surface is built
+around rather than papering over. While such a run is going, the lock holder is
+*ours*, not the app's: `route` reads `detached_running`, every app-driven verb
+refuses instead of walking you into a second writer on the rollout, and
+`stop_turn` terminates the run's process group. When it exits, the run reports
+`turn_completed` on the same event stream a followed thread uses, so one
+`collect_events` waits on app threads and detached runs alike.
+
+**Codex's own worktrees are not reachable from here.** Codex Desktop can run a
+thread in its own git worktree and fork a conversation into one, but that is an
+app-side affordance: no IPC method creates a thread, and a thread started from
+here does not hold the app-control tools that do it — asked to fork itself into a
+worktree it spawns subagents in the same directory instead. So parallel work
+either starts in the app (and codex-pilot drives the threads it produces) or uses
+worktrees you made yourself, kept out of Codex's own worktree root, which it
+garbage-collects.
 
 ## Waiting without burning a turn
 

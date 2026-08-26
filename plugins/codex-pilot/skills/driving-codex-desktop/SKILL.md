@@ -1,6 +1,6 @@
 ---
 name: driving-codex-desktop
-description: Drive Codex Desktop threads - send work, steer a running turn, stop one, answer approval requests, change model/reasoning/plan mode, set goals. Use when supervising or orchestrating Codex agents from Claude Code, or when a codex-pilot tool returns something unexpected.
+description: Drive Codex agents from Claude Code - start a new thread in a given repo or worktree, send work, steer a running turn, stop one, answer approval requests, change model/reasoning/plan mode, set goals, and fan work out across several threads. Use whenever handing work to Codex or supervising it, instead of running `codex exec` or the standalone codex MCP server, and when a codex-pilot tool returns something unexpected.
 ---
 
 # Driving Codex Desktop threads
@@ -13,7 +13,8 @@ stop discards what a turn had in flight; an approval runs a command. Read
 
 | Situation | Use |
 | --- | --- |
-| Thread is idle, you have new work | `send_message` |
+| New work, no thread for it yet | `start_thread` (never `codex exec`) |
+| Thread exists and is idle, you have new work | `send_message` |
 | Turn is running and heading the wrong way | `steer_turn` |
 | Turn is running and should stop | `stop_turn` |
 | Thread is waiting on an approval or a question | `respond` |
@@ -24,6 +25,61 @@ stop discards what a turn had in flight; an approval runs a command. Read
 `send_message` on a busy thread queues behind the running turn rather than
 interrupting it. To change what the *current* turn is doing, steer.
 
+## Nothing here blocks on Codex
+
+Every tool in this plugin returns straight away. `send_message` hands back the
+turn id with status `inProgress` in well under a second and does not wait for
+the answer; `thread_status` reads projected state in milliseconds;
+`start_thread` returns as soon as the thread has an id.
+
+The one deliberate exception is `collect_events(wait_seconds=N)`, which blocks
+because being told is the point, and it is capped at 120 seconds.
+
+So never reach for a blocking route to "just get the answer". Start the work,
+do something else, and collect the result when the thread reports idle.
+
+## Starting new threads
+
+`start_thread(text, cwd=...)`. It creates the thread, starts its first turn, and
+returns the new thread id in about a second while the agent keeps working.
+
+**Do not use `codex exec` from Bash, and do not use the standalone `codex` MCP
+server, to start Codex work.** Both block until the agent finishes, so the
+session sits idle for however long the task takes, and both inherit whatever
+directory they were called from. `start_thread` has neither problem, and the
+thread it creates is drivable by every other tool here.
+
+### `cwd` is not optional, and not your own directory
+
+`cwd` is where the agent works. Pass the repo or worktree the work belongs to.
+Your own working directory is almost never the right answer, and a thread
+started in the wrong one edits the wrong checkout.
+
+**If the work is a distinct slice, give it a worktree first.** Two agents in one
+checkout overwrite each other; that is the whole reason to isolate them. Create
+it with the tools you already have, then point the thread at it:
+
+    git worktree add -b feature/<slice> <path>     # or the EnterWorktree tool
+    start_thread(text="...", cwd="<path>")
+
+codex-pilot does not create worktrees itself, on purpose: where they belong is a
+per-repo convention, not something this plugin should decide. Codex Desktop does
+create its own, but not for threads started from here — see *Parallel work* below
+for which mechanism applies.
+
+### After it finishes
+
+While it runs, the CLI holds the thread's writer lock, so its `route` reads
+`detached_running` and every app-driven verb refuses rather than fighting the
+lock. `stop_turn` still works: on a run started here it terminates the process
+group. Once it goes idle:
+
+- `focus_thread` pulls it into Codex Desktop, after which IPC works on it
+  normally: steer, stop, respond, follow. Only once it is idle — never while it
+  is running.
+- `log_path` holds streamed JSONL for the run; `thread_status` gives the
+  `rollout` path for the full transcript.
+
 ## The writer lock decides the route
 
 Codex allows one writer per thread, and `send_message` picks accordingly:
@@ -33,6 +89,10 @@ Codex allows one writer per thread, and `send_message` picks accordingly:
   immediately and runs in the background. Steer and stop are *not* available;
   poll the log. An archived thread is unarchived first, reported as
   `unarchived: true`.
+
+- **One of our own detached runs holds it** (`route: detached_running`) →
+  neither driving route works until it exits. Wait for `turn_completed`, read
+  its log, or `stop_turn` it. Do not focus it into the app meanwhile.
 
 - **App holds it but is not *showing* it** → neither route works. The app locks
   every thread it has open but only answers for the one a window is rendering,
@@ -100,7 +160,9 @@ even when it stopped nothing, both for an already-idle thread and for an
   `{"mode": "plan", "settings": {"model": "<model>"}}`. `{"mode": "plan"}` alone
   is rejected.
 - `approvalPolicy`, `approvalsReviewer`, `sandboxPolicy`, `permissions`
-- `multiAgentMode`, `cwd`
+- `multiAgentMode`, `cwd` — note that multi-agent means *subagents inside the
+  thread*, sharing its working directory. It is not a way to get parallel work
+  in separate worktrees; see *Parallel work* below.
 
 ## Several Codex apps
 
@@ -143,7 +205,11 @@ doing other work, and a background watch whenever you have nothing to do but
 wait.
 
 A follow only streams while the app has the thread **mounted**. If a follow stays
-silent, `focus_thread` and retry.
+silent on an app-owned thread, `focus_thread` and retry.
+
+Runs started by `start_thread` need no follow: they are watched as processes, and
+their exit arrives on the same stream as `turn_completed` (or `run_failed`), so
+one `collect_events` covers both kinds.
 
 ## Queued follow-ups are not available
 
@@ -152,7 +218,97 @@ read. Using it would blind-overwrite follow-ups queued in the app. To hand work
 to a busy thread, either `steer_turn` it now or wait for `turn_completed` and
 `send_message` then.
 
-## Starting new threads
+## Parallel work: which worktree, and who makes it
 
-`codex-pilot` drives existing threads. To create one, use the separate `codex`
-MCP server (`codex mcp-server`), or `codex exec` in the target directory.
+Codex has worktree support of its own, and it is the better mechanism when you
+can reach it — but you usually cannot reach it from here. Know which lane you
+are in before fanning anything out.
+
+**Codex Desktop's own worktrees.** A thread can run in its own git worktree on
+its own branch, under the root set in Settings → Git (default
+`~/.codex/worktrees/<id>/<repo>`). The composer toggles between working locally
+and in a new worktree, `/fork` forks a conversation into one, and there is a
+handoff flow that moves the changes back to the local checkout afterwards. Codex
+creates the branch, tracks the worktree, and cleans it up later.
+
+**codex-pilot cannot start that.** There is no IPC method that creates a thread,
+and a thread `start_thread` created does not hold the app-control tools that fork
+into a worktree — those belong to threads Codex Desktop made itself. Asked in
+prose to fork itself into a worktree, such a thread instead spawns *subagents*,
+which share its working directory. That is the opposite of isolation.
+
+So:
+
+| You want | Do |
+| --- | --- |
+| Parallel work in Codex's own worktrees | Ask the user to start it in Codex Desktop (worktree mode, or `/fork` into a worktree). codex-pilot then drives the resulting threads normally — they are app-owned and list with the worktree as their `cwd`. |
+| Parallel work you drive yourself | Make the worktree first, then `start_thread(cwd=<worktree>)`. |
+
+Two rules that follow:
+
+- **Never put your own worktrees under Codex's worktree root.** That directory is
+  Codex's to name and to delete — it garbage-collects worktrees to reclaim space,
+  and it would take yours with them. Use the repo's own convention instead.
+- **Do not park unmerged work in a Codex worktree.** Same reason. Bring it back
+  through the app's handoff, or commit and push the branch.
+
+## Orchestrating several threads
+
+The loop is start, follow, wait once, harvest.
+
+1. **A worktree per slice, then `start_thread` in each** — one you made, not one
+   under Codex's worktree root (see *Parallel work* above). Keep the returned
+   thread ids; they are your handle on the work. If the slices should instead run
+   in Codex's own worktrees, that is the user's move in the app, and you drive the
+   threads it produces.
+2. **`follow_thread` the ones the app has mounted.** A follow is a subscription
+   to the app's stream, so it only streams for a thread Codex Desktop is
+   rendering. You do *not* need it for `start_thread` runs: those are watched as
+   processes and report on their own.
+3. **Wait once, not per thread.** One `collect_events(wait_seconds=60)` covers
+   every followed thread and every detached run, across every instance. Pass the
+   previous `cursor` so you only see what is new; a non-zero `dropped` means
+   re-read state rather than trusting the list.
+4. **`turn_completed` means that thread is free.** For a detached run its `data`
+   carries `route: "detached"` and the exit code; `run_failed` means it exited
+   non-zero, so read `log_path` before assuming the work happened — unless its
+   `stopped` is true, which means you stopped it yourself.
+5. **Harvest by reading**, not by re-running the agent. `rollout` from
+   `thread_status`/`list_threads` is the transcript; `log_path` is the JSONL for
+   a run started here.
+
+Do not poll `thread_status` in a loop. Nothing pushes into a Claude Code
+session, so you do have to *call* `collect_events` — but events accumulate while
+you are away, so one call after doing something else returns the whole backlog.
+
+### Supervising a thread
+
+**Approvals only reach you on a thread the app owns.** A detached run has no way
+to ask a human, which is why `start_thread` defaults to `approval="never"`. So
+ordering matters, and the obvious order is wrong:
+
+    start_thread(...)                       # runs unattended, holds the lock
+    → wait for turn_completed
+    → focus_thread                          # now the app owns it
+    → edit_thread(..., {"approvalsReviewer": "user"})
+    → send_message(...)                     # this turn is supervised
+
+`edit_thread` needs the app to own the thread, so it cannot be used on a
+freshly started one — the run itself holds the lock. If a slice needs approvals
+from its very first turn, create the thread in Codex Desktop instead and drive
+it over IPC from the start.
+
+### While a detached run is going
+
+Its route reads `detached_running`, and neither driving route works: `steer_turn`,
+`respond`, `edit_thread` and `focus_thread` all refuse, by design. What you can
+do is wait for it, read `log_path`, or `stop_turn` to terminate it and its whole
+process group.
+
+**Never `focus_thread` a running one.** That asks the app to open a thread our
+own writer still holds, and two writers on one rollout corrupt it. The tools
+refuse it for you, but do not go looking for a way around.
+
+Scale down before scaling up. Fan out when the slices are genuinely independent
+and each has its own worktree; otherwise one thread working in order beats
+reconciling three that edited the same files.
