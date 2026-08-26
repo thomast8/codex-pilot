@@ -477,7 +477,16 @@ await vet(r, a, s);        // persists exactly this list
 So adding one follow-up means reading the current queue and sending the whole
 list back. `thread-queued-followups-changed` (v1) is broadcast on success.
 
-`thread/revert` takes `{threadId, beforeTurnId}`.
+`thread/revert` takes `{threadId, beforeTurnId}` — but has no `thread-follower-*`
+wrapper, so the follower surface cannot reach it at all.
+
+**The queue is write-only from a follower, which makes it unusable.**
+`thread-follower-set-queued-follow-ups-state` replaces the whole queue, and the
+current contents are reachable from neither side: `conversationState` carries no
+queued-follow-ups field, and `thread-queued-followups-changed` is not broadcast
+unsolicited (verified — 20s of listening on a followed thread produced nothing).
+So a follower can only blind-write, destroying anything queued in the app. Until
+the queue becomes readable, this method is not safely usable.
 
 ## Drift
 

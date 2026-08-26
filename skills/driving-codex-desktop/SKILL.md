@@ -34,10 +34,13 @@ Codex allows one writer per thread, and `send_message` picks accordingly:
   poll the log. An archived thread is unarchived first, reported as
   `unarchived: true`.
 
-Never try to defeat the lock. Two writers on one rollout corrupt it. If a tool
-reports a `DriftError` — lock held but no window claims the thread — that is a
-Codex Desktop update having moved a protocol version, not a thread you can grab.
-Run `scripts/extract_registry.py --check` and re-pin.
+- **App holds it but is not *showing* it** → neither route works. The app locks
+  every thread it has open but only answers for the one a window is rendering,
+  so this is common. `UnclaimedThreadError` says so; call `focus_thread`, wait a
+  couple of seconds, and retry. If focusing does not help, then suspect protocol
+  drift after an app update and run `scripts/extract_registry.py --check`.
+
+Never try to defeat the lock. Two writers on one rollout corrupt it.
 
 ## Approvals
 
@@ -104,6 +107,23 @@ even when it stopped nothing, both for an already-idle thread and for an
 Each install has its own `CODEX_HOME`, and **thread ids are unique only within
 one**. `list_threads` tags every thread with its instance. If a name exists in
 two, the tool refuses rather than guessing — pass `instance` to choose.
+
+## Waiting for a thread
+
+`follow_thread` then `collect_events(wait_seconds=60)` is how you learn a thread
+finished without polling. `turn_completed` is the signal that it is free for more
+work. Pass the previous `cursor` to get only what is new; a non-zero `dropped`
+means the buffer overflowed.
+
+A follow only streams while the app has the thread **mounted**. If a follow stays
+silent, `focus_thread` and retry.
+
+## Queued follow-ups are not available
+
+The only follower method replaces the entire queue, and its contents cannot be
+read. Using it would blind-overwrite follow-ups queued in the app. To hand work
+to a busy thread, either `steer_turn` it now or wait for `turn_completed` and
+`send_message` then.
 
 ## Starting new threads
 
