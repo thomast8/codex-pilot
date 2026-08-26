@@ -287,6 +287,10 @@ Consequences, all verified:
 - `codex mcp-server`'s `codex-reply` cannot resume *any* thread it did not create
   in its own process — it is not a route to existing threads.
 
+`codex archive <id>` also needs the lock free: run against a thread the app has
+open it fails with `Error: failed to archive session`. Archiving from inside the
+app works, because the app releases the thread as it archives it.
+
 **Never delete a lock file to get around this.** A second process would flock a
 fresh inode and both would write one rollout. The IPC path is the sanctioned way
 to write to a thread the app owns — that is the whole point of it.
@@ -327,6 +331,32 @@ the work was actually carried out.
 `/goal` and `/new` are the only composer slash commands. `/plan` is not one —
 plan mode is the `collaborationMode` setting above. `/compact` is not needed
 either: `thread-follower-compact-thread` (v1) is a direct method.
+
+## The detached route — verified
+
+For a thread no window owns, `codex exec resume <id> "<text>"` continues it in
+place under the same id. Three details matter:
+
+- **Use the instance's own `codex`**, from
+  `<App>.app/Contents/Resources/codex`, not the one on PATH. That binary wrote
+  the rollout store and here it is ahead of PATH (0.149.0-alpha.4.3 vs 0.147.0).
+- **Set `CODEX_HOME` explicitly** to the instance's home, or the turn lands in
+  whichever instance the ambient environment points at.
+- **Set the approval policy explicitly.** A detached run has no TTY, so an
+  inherited `on-request` policy stalls until it times out.
+
+Global flags must precede the subcommand: `codex exec --sandbox X resume <id>`
+works, `codex exec resume <id> --sandbox X` is rejected.
+
+Verified live: an unowned thread ran the turn in its own cwd and produced the
+file it was asked for; an archived thread was unarchived automatically, resumed,
+appended to the same file, and was left unarchived afterwards.
+
+Routing is decided entirely by the writer lock, and the two routes are mutually
+exclusive by construction — app-owned means IPC only, unowned means detached
+only. The one combination that must never route is *lock held but no window
+claims the thread*: that is version drift, and running detached there would
+collide with a lock somebody is holding.
 
 ## Divergences
 

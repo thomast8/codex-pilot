@@ -22,6 +22,7 @@ from typing import Any
 from . import payloads
 from .instances import Instance, discover_instances
 from .ipc import IpcClient, IpcUnavailable, RouterError
+from .resume import DetachedRunner
 from .threads import AmbiguousThreadError, ThreadInfo, ThreadStore, UnknownThreadError
 
 OWNER_DISCOVERY = "thread-owner-discovery"
@@ -72,6 +73,7 @@ class Session:
         self._instances = instances if instances is not None else discover_instances()
         self._clients: dict[str, IpcClient] = {}
         self._stores: dict[str, ThreadStore] = {}
+        self._runners: dict[str, DetachedRunner] = {}
 
     @property
     def instances(self) -> list[Instance]:
@@ -81,6 +83,11 @@ class Session:
         if instance.slug not in self._stores:
             self._stores[instance.slug] = ThreadStore(instance.codex_home)
         return self._stores[instance.slug]
+
+    def runner(self, instance: Instance) -> DetachedRunner:
+        if instance.slug not in self._runners:
+            self._runners[instance.slug] = DetachedRunner(instance, self.store(instance))
+        return self._runners[instance.slug]
 
     def client(self, instance: Instance) -> IpcClient:
         existing = self._clients.get(instance.slug)
@@ -173,20 +180,45 @@ class Session:
         result = response.get("result")
         return result if isinstance(result, dict) else {}
 
-    def send_message(self, ref: str, text: str, instance: str | None = None) -> dict[str, Any]:
+    def send_message(
+        self,
+        ref: str,
+        text: str,
+        instance: str | None = None,
+        sandbox: str | None = None,
+        approval: str | None = None,
+    ) -> dict[str, Any]:
+        """Start a turn, by whichever route the thread's lock state permits.
+
+        A thread the app has open can only be driven over IPC; one nothing holds
+        can only be driven detached. The writer lock decides, and it is never
+        worked around -- if the app owns the thread but no window claims it,
+        that is drift, and running detached would collide with a held lock.
+        """
         resolved = self.resolve(ref, instance)
-        result = self._follower_request(
-            resolved,
-            "thread-follower-start-turn",
-            payloads.start_turn(resolved.thread_id, text),
+        if resolved.info.app_owned:
+            result = self._follower_request(
+                resolved,
+                "thread-follower-start-turn",
+                payloads.start_turn(resolved.thread_id, text),
+            )
+            return {
+                "route": "desktop",
+                "instance": resolved.instance.slug,
+                "thread": resolved.thread_id,
+                "name": resolved.name,
+                "result": result,
+            }
+
+        run = self.runner(resolved.instance).run(
+            resolved.thread_id,
+            text,
+            sandbox=sandbox or "workspace-write",
+            approval=approval or "never",
         )
-        return {
-            "route": "desktop",
-            "instance": resolved.instance.slug,
-            "thread": resolved.thread_id,
-            "name": resolved.name,
-            "result": result,
-        }
+        out = run.as_dict()
+        out["name"] = resolved.name
+        return out
 
     def steer_turn(self, ref: str, text: str, instance: str | None = None) -> dict[str, Any]:
         resolved = self.resolve(ref, instance)
