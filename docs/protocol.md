@@ -170,6 +170,25 @@ From the renderer's dispatch switch (function `Kot`):
 `"descendant-cleanup"` (used when tearing down subagents). On a goal-pause the
 handler returns `{interruptedTurnId, goalPauseError, ok}` instead of throwing.
 
+> **`ok` is not the result of an interrupt** — verified live. The app answers
+> `{"ok": true, "interruptedTurnId": null}` both when the thread was already
+> idle and when an `expectedTurnId` precondition did not match the running turn;
+> in the latter case the turn keeps running. `interruptedTurnId` is the only
+> signal that something was actually stopped. The precondition fails softly:
+> there is no error to catch.
+
+`steer` needs `restoreMessage` — also verified live, by its absence. The renderer
+reads `restoreMessage.cwd` and `restoreMessage.context.workspaceRoots` with no
+guard, so omitting it surfaces as `Cannot read properties of undefined (reading
+'cwd')` from inside the app rather than as a protocol error. `cwd` may be null
+(the app falls back to the conversation's own); the object and its `context` may
+not be absent.
+
+`start-turn`'s `request` must repeat the conversation id as `threadId`: the
+renderer throws `Turn request thread does not match the conversation` otherwise.
+It returns the new `{turn: {id, status}}`, so the turn id needed for a later
+`expectedTurnId` comes back from the send itself — no need to read the rollout.
+
 `steer` `input` is an **array** of `UserInput`; the text variant is
 `{"type":"text","text":"...","text_elements":[]}`. Two independent sources agree:
 the app-server schema types `TurnSteerParams.input` as an array, and remodex
@@ -232,9 +251,17 @@ Owners then send `thread-stream-state-changed` carrying
 Broadcasting `thread-stream-following-status-requested` (v1) prompts owners to
 re-announce. Set `following: false` to stop.
 
-**Verified:** an unsolicited `thread-stream-following-changed` broadcast for a
-live thread arrives on a bare connected client, so reception works. The follow
-handshake itself is decoded, not yet executed.
+**Verified:** the follow handshake works. Broadcasting `following: true` yields a
+`change: {type: "snapshot", revision: 1, conversationState: {...}}` frame
+(~118KB for a short thread). The fields that matter in `conversationState`:
+
+| Field | Use |
+| --- | --- |
+| `threadRuntimeStatus` | `{"type": "active"\|"idle", "activeFlags": []}` — busy/idle |
+| `requests` | pending approval/input requests, each `{id, method}` |
+| `turnHistory.history.entitiesByKey` | turns, keyed `tail:N:local:<uuid>` |
+| `currentPermissions` | `approvalPolicy`, `approvalsReviewer`, `sandboxPolicy.writableRoots` |
+| `cwd`, `rolloutPath`, `id` | thread identity and location |
 
 ## The single-writer lock
 

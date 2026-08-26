@@ -106,6 +106,10 @@ class IpcClient:
             raise IpcUnavailable(f"cannot connect to {self._path}: {exc}") from exc
         return s
 
+    @property
+    def is_closed(self) -> bool:
+        return self._closed.is_set()
+
     def close(self) -> None:
         self._closed.set()
         with contextlib.suppress(OSError):
