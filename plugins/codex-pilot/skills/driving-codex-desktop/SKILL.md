@@ -21,6 +21,8 @@ stop discards what a turn had in flight; an approval runs a command. Read
 | Change model, reasoning, plan mode, fast mode, sandbox | `edit_thread` (`update_settings`) |
 | Give it a standing objective across turns | `set_goal` |
 | Context is getting long | `edit_thread` (`compact`) |
+| Read what a thread said, any thread | `read_thread` |
+| Find out which threads are reachable | `sync_threads` |
 
 `send_message` on a busy thread queues behind the running turn rather than
 interrupting it. To change what the *current* turn is doing, steer.
@@ -218,6 +220,32 @@ read. Using it would blind-overwrite follow-ups queued in the app. To hand work
 to a busy thread, either `steer_turn` it now or wait for `turn_completed` and
 `send_message` then.
 
+## Getting state for every thread
+
+Three sources, and only the middle one can be silenced. Reach for the cheapest
+that answers your question.
+
+| Want | Use | Works for |
+| --- | --- | --- |
+| What a thread said, did, or decided | `read_thread` | **every** thread: mounted or not, running or idle, app-owned or detached |
+| Live state now: busy, turn id, pending approvals | `follow_thread` + `collect_events` | only threads the app has **mounted** |
+| Which threads are even reachable | `sync_threads` | app-owned threads |
+
+**`read_thread` is the one that always works**, because it reads the rollout off
+disk and never touches the app. Harvest with it. Re-running an agent to find out
+what it already did is the mistake it exists to prevent.
+
+**Mounting is a set, not a spotlight.** The app keeps a bounded set of threads
+mounted and answers only for those; a thread it holds without rendering sends no
+stream state at all, so a follow on one is silently empty. `sync_threads` tells
+you which are mounted, and with `mount=true` brings the rest forward.
+
+**Do not cycle through threads to "check" them.** Mounting is additive —
+bringing one forward evicts none of the others — so `sync_threads` is a one-off
+warm-up for the threads you intend to watch, and then their events simply
+arrive. Rotating focus would also drag the app to the foreground each time, and
+probing an unmounted thread costs the router's full discovery timeout.
+
 ## Parallel work: which worktree, and who makes it
 
 Codex has worktree support of its own, and it is the better mechanism when you
@@ -233,9 +261,12 @@ creates the branch, tracks the worktree, and cleans it up later.
 
 **codex-pilot cannot start that.** There is no IPC method that creates a thread,
 and a thread `start_thread` created does not hold the app-control tools that fork
-into a worktree — those belong to threads Codex Desktop made itself. Asked in
-prose to fork itself into a worktree, such a thread instead spawns *subagents*,
-which share its working directory. That is the opposite of isolation.
+into a worktree — those belong to threads Codex Desktop made itself. Asking one in
+prose does not substitute: measured, such a thread spawned a *subagent* which
+hand-rolled a `git worktree add` into `/tmp` on a **detached HEAD**, leaving
+Codex's managed root untouched. You get a directory, not a managed worktree: no
+branch to push, nothing Codex tracks or restores, and nothing the handoff flow
+can bring back.
 
 So:
 
@@ -261,10 +292,11 @@ The loop is start, follow, wait once, harvest.
    thread ids; they are your handle on the work. If the slices should instead run
    in Codex's own worktrees, that is the user's move in the app, and you drive the
    threads it produces.
-2. **`follow_thread` the ones the app has mounted.** A follow is a subscription
-   to the app's stream, so it only streams for a thread Codex Desktop is
-   rendering. You do *not* need it for `start_thread` runs: those are watched as
-   processes and report on their own.
+2. **`follow_thread` the ones the app has mounted** — `sync_threads` tells you
+   which those are, and mounts the rest if you ask. A follow is a subscription to
+   the app's stream, so it only streams for a thread Codex Desktop is rendering.
+   You do *not* need it for `start_thread` runs: those are watched as processes
+   and report on their own.
 3. **Wait once, not per thread.** One `collect_events(wait_seconds=60)` covers
    every followed thread and every detached run, across every instance. Pass the
    previous `cursor` so you only see what is new; a non-zero `dropped` means
@@ -273,9 +305,10 @@ The loop is start, follow, wait once, harvest.
    carries `route: "detached"` and the exit code; `run_failed` means it exited
    non-zero, so read `log_path` before assuming the work happened — unless its
    `stopped` is true, which means you stopped it yourself.
-5. **Harvest by reading**, not by re-running the agent. `rollout` from
-   `thread_status`/`list_threads` is the transcript; `log_path` is the JSONL for
-   a run started here.
+5. **Harvest with `read_thread`**, not by re-running the agent. It works
+   whether or not the app ever mounted the thread. (`rollout` from
+   `thread_status`/`list_threads` is the same file if you want it raw, and
+   `log_path` is the JSONL for a run started here.)
 
 Do not poll `thread_status` in a loop. Nothing pushes into a Claude Code
 session, so you do have to *call* `collect_events` — but events accumulate while

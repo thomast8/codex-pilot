@@ -31,6 +31,8 @@ EXPECTED_TOOLS = {
     "edit_thread",
     "set_goal",
     "focus_thread",
+    "sync_threads",
+    "read_thread",
     "follow_thread",
     "collect_events",
 }

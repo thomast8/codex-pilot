@@ -77,6 +77,11 @@ class IpcClient:
         self._path = socket_path or default_socket_path()
         self._timeout = timeout
         self._lock = threading.Lock()
+        # sendall is not atomic across threads, and there are several
+        # senders: the follow pump broadcasts while tool calls send
+        # requests. Interleaved frames would desync the length-prefixed
+        # stream, which the reader answers by destroying the socket.
+        self._send_lock = threading.Lock()
         self._pending: dict[str, queue.Queue[dict[str, Any]]] = {}
         self._broadcasts: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=BROADCAST_QUEUE_MAX)
         self._sent: list[dict[str, Any]] = []
@@ -198,8 +203,10 @@ class IpcClient:
                     pass
 
     def _send(self, message: dict[str, Any]) -> None:
+        frame = encode_frame(message)
         try:
-            self._sock.sendall(encode_frame(message))
+            with self._send_lock:
+                self._sock.sendall(frame)
         except OSError as exc:
             raise IpcError(f"send failed: {exc}") from exc
         with self._sent_event:

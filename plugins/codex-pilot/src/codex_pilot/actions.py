@@ -16,6 +16,7 @@ directly means we never rely on the router's broadcast fallback picking right.
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import os
 import queue
@@ -32,7 +33,13 @@ from .follow import EVENT_RUN_FAILED, EVENT_TURN_COMPLETED, FollowManager, SeqCo
 from .instances import Instance, discover_instances
 from .ipc import IpcClient, IpcError, IpcUnavailable, RouterError
 from .resume import DetachedRun, DetachedRunner, scan_for_thread_id
-from .threads import AmbiguousThreadError, ThreadInfo, ThreadStore, UnknownThreadError
+from .threads import (
+    AmbiguousThreadError,
+    ThreadError,
+    ThreadInfo,
+    ThreadStore,
+    UnknownThreadError,
+)
 
 OWNER_DISCOVERY = "thread-owner-discovery"
 FOLLOWING_CHANGED = "thread-stream-following-changed"
@@ -48,6 +55,12 @@ MAX_TRACKED_RUNS = 200
 ROUTE_DESKTOP = "desktop"
 ROUTE_DETACHED = "detached"
 ROUTE_RUNNING = "detached_running"
+
+# An unmounted thread costs the router's full discovery timeout (~10s
+# measured) before it answers no-client-found, while a mounted one
+# answers in ~0.4s. Probing serially is therefore unusable on a real
+# instance; requests are multiplexed by id, so they go concurrently.
+CENSUS_WORKERS = 8
 
 
 class ActionError(Exception):
@@ -486,6 +499,108 @@ class Session:
             raise ActionError(f"owner discovery returned no client id: {response}")
         return owner
 
+    def probe_mounted(self, resolved: ResolvedThread) -> str | None:
+        """The owning client id if the app is mounted on this thread, else None."""
+        try:
+            return self.owner_of(resolved)
+        except (UnclaimedThreadError, NoOwnerError):
+            return None
+        except (ActionError, IpcError):
+            return None
+
+    def census(
+        self,
+        threads: list[str] | None = None,
+        instance: str | None = None,
+        workers: int = CENSUS_WORKERS,
+    ) -> dict[str, Any]:
+        """Which threads the app will actually answer for, right now.
+
+        Holding a writer lock and being reachable are different states, and only
+        a probe distinguishes them. Mounting is additive rather than exclusive:
+        several threads answer at once, and mounting another does not evict
+        them, so this is a census of a set and not of a single visible thread.
+        """
+        rows = self.list_threads(instance)
+        if threads:
+            wanted = {t for t in threads}
+            rows = [r for r in rows if r["thread"] in wanted]
+
+        targets: list[tuple[dict[str, Any], ResolvedThread | None]] = []
+        for row in rows:
+            try:
+                targets.append((row, self.resolve(row["thread"], row["instance"])))
+            except ThreadError:
+                targets.append((row, None))
+
+        results: dict[str, str | None] = {}
+        probeable = [(r, res) for r, res in targets if res is not None and r["route"] == "desktop"]
+        if probeable:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, min(workers, len(probeable)))
+            ) as pool:
+                futures = {
+                    pool.submit(self.probe_mounted, res): row["thread"] for row, res in probeable
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    results[futures[future]] = future.result()
+
+        out = []
+        for row, _ in targets:
+            owner = results.get(row["thread"])
+            entry = dict(row)
+            entry["mounted"] = owner is not None
+            entry["owner"] = owner
+            if row["route"] != "desktop":
+                # Only an app-owned thread can be mounted; the rest are not
+                # silent, they are simply not the app's to answer for.
+                entry["mounted"] = False
+                entry["owner"] = None
+            out.append(entry)
+        mounted = [e["thread"] for e in out if e["mounted"]]
+        return {
+            "threads": out,
+            "mounted": mounted,
+            "unmounted": [e["thread"] for e in out if not e["mounted"] and e["route"] == "desktop"],
+            "clients": sorted({e["owner"] for e in out if e["owner"]}),
+        }
+
+    def sync_threads(
+        self,
+        threads: list[str] | None = None,
+        mount: bool = True,
+        instance: str | None = None,
+        settle_seconds: float = 6.0,
+    ) -> dict[str, Any]:
+        """Census, and optionally bring unmounted threads forward so they stream.
+
+        A follow only streams while the app has the thread mounted, so a thread
+        it holds without rendering reports nothing at all. Focusing is additive
+        (measured: mounting a fifth evicted none of four), which makes this a
+        one-off warm-up rather than a rotation -- do not cycle through threads,
+        mount the ones you intend to watch and leave them mounted.
+
+        Threads being written by one of our own detached runs are skipped: they
+        are not the app's to mount, and focusing one would put a second writer
+        on the rollout.
+        """
+        before = self.census(threads, instance)
+        if not mount or not before["unmounted"]:
+            return {**before, "focused": [], "mounted_by_sync": []}
+
+        focused = []
+        for thread_id in before["unmounted"]:
+            resolved = self.resolve(thread_id)
+            if self.live_run(resolved.thread_id) is not None:
+                continue
+            self.focus_thread(thread_id)
+            focused.append(thread_id)
+        if focused:
+            self._stop.wait(settle_seconds)
+        after = self.census(threads, instance)
+        gained = sorted(set(after["mounted"]) - set(before["mounted"]))
+        return {**after, "focused": focused, "mounted_by_sync": gained}
+
     def focus_thread(self, ref: str, instance: str | None = None) -> dict[str, Any]:
         """Bring a thread forward in the app so a window claims it.
 
@@ -909,6 +1024,34 @@ class Session:
             "log_path": str(run.log_path),
             "returncode": run.returncode,
         }
+
+    def read_thread(
+        self,
+        ref: str,
+        limit: int = 40,
+        include_reasoning: bool = False,
+        instance: str | None = None,
+    ) -> dict[str, Any]:
+        """What a thread actually said, read from its rollout.
+
+        Works for every thread, including ones the app is not mounted on and so
+        has no live state for.
+        """
+        from . import transcript
+
+        resolved = self.resolve(ref, instance)
+        if resolved.info.rollout is None:
+            raise UnknownThreadError(
+                f"no rollout on disk for {resolved.thread_id}; nothing to read"
+            )
+        out = transcript.read(
+            resolved.info.rollout, limit=limit, include_reasoning=include_reasoning
+        )
+        out["instance"] = resolved.instance.slug
+        out["thread"] = resolved.thread_id
+        out["name"] = resolved.name
+        out["route"] = self.route_for(resolved.info)
+        return out
 
     def list_threads(self, instance: str | None = None) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []

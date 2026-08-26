@@ -449,6 +449,61 @@ def collect_events(
 
 @server.tool(
     description=(
+        "Find out which threads Codex Desktop will actually answer for, and "
+        "optionally bring the rest forward so they stream. Holding a writer lock "
+        "and being reachable are different states: the app keeps threads open "
+        "without rendering them, and an unrendered one sends no stream state at "
+        "all, so a follow on it is silently empty. With mount=true this focuses "
+        "the unmounted ones and re-checks. Mounting is additive, not a swap -- "
+        "bringing one forward does not evict the others -- so treat this as a "
+        "one-off warm-up for the threads you intend to watch, NOT something to "
+        "cycle through repeatedly. Threads one of our own detached runs is "
+        "writing are skipped rather than focused. Returns each thread with "
+        "`mounted` and its owning client, plus `mounted_by_sync` for the ones "
+        "this call gained."
+    )
+)
+def sync_threads(
+    threads: list[str] | None = None,
+    mount: bool = True,
+    instance: str | None = None,
+) -> dict[str, Any]:
+    try:
+        return {"ok": True, **session().sync_threads(threads, mount=mount, instance=instance)}
+    except (ActionError, IpcError, ThreadError) as exc:
+        return _fail(exc)
+
+
+@server.tool(
+    description=(
+        "Read what a thread actually said, from its rollout on disk. This is the "
+        "way to harvest a result, and it works for EVERY thread -- mounted or "
+        "not, running or idle, app-owned or detached -- because it does not go "
+        "through the app at all. Prefer it over re-running an agent to find out "
+        "what happened. Returns the last `limit` entries newest-last: messages, "
+        "tool calls and tool output. Reasoning traces are excluded unless you "
+        "ask for them, as they dominate a rollout and are rarely what you want."
+    )
+)
+def read_thread(
+    thread: str,
+    limit: int = 40,
+    include_reasoning: bool = False,
+    instance: str | None = None,
+) -> dict[str, Any]:
+    try:
+        return {
+            "ok": True,
+            **session().read_thread(
+                thread, limit=limit, include_reasoning=include_reasoning, instance=instance
+            ),
+        }
+    except (ActionError, IpcError, ThreadError) as exc:
+        return _fail(exc)
+
+
+@server.tool(
+    description=(
         "Bring a thread forward in Codex Desktop so a window claims it. Use this "
         "when a tool reports that a thread holds a writer lock but no window "
         "claims it: the app keeps threads open in the background without "
