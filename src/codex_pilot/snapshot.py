@@ -113,6 +113,37 @@ def parse_pending(requests: list[Any]) -> list[PendingRequest]:
     return out
 
 
+def _turn_id_from_pending(pending: list[PendingRequest]) -> str | None:
+    for req in pending:
+        raw = req.params.get("turnId")
+        if isinstance(raw, str) and raw:
+            return raw
+    return None
+
+
+def _active_turn_id(state: dict[str, Any]) -> str | None:
+    """The id of the turn currently in progress, if the app has assigned one.
+
+    Turn history is keyed two ways: `turn:<turnId>` once the server has
+    confirmed a turn, and `tail:<n>:local:<uuid>` for one the window created
+    optimistically and has no id for yet. An in-progress turn can legitimately
+    have no id, so a null here means "not yet assigned", not "no turn".
+    """
+    history = (state.get("turnHistory") or {}).get("history") or {}
+    entities = history.get("entitiesByKey")
+    if not isinstance(entities, dict):
+        return None
+    for key, entity in entities.items():
+        if not isinstance(entity, dict) or entity.get("status") != "inProgress":
+            continue
+        raw = entity.get("turnId")
+        if isinstance(raw, str) and raw:
+            return raw
+        if isinstance(key, str) and key.startswith("turn:"):
+            return key.split(":", 1)[1]
+    return None
+
+
 def project(frame: dict[str, Any] | None) -> ThreadState | None:
     """Turn a `thread-stream-state-changed` frame into a ThreadState.
 
@@ -132,11 +163,7 @@ def project(frame: dict[str, Any] | None) -> ThreadState | None:
     runtime = (state.get("threadRuntimeStatus") or {}).get("type")
     pending = parse_pending(state.get("requests") or [])
 
-    turn_id = None
-    for req in pending:
-        if req.params.get("turnId"):
-            turn_id = str(req.params["turnId"])
-            break
+    turn_id = _active_turn_id(state) or _turn_id_from_pending(pending)
 
     return ThreadState(
         runtime=runtime,
@@ -150,4 +177,67 @@ def project(frame: dict[str, Any] | None) -> ThreadState | None:
         service_tier=settings.get("serviceTier"),
         approvals_reviewer=permissions.get("approvalsReviewer"),
         goal=state.get("threadGoal") or state.get("completedThreadGoal"),
+    )
+
+
+class PatchError(Exception):
+    """A patch could not be applied to the state we hold."""
+
+
+def apply_patches(state: dict[str, Any], patches: list[dict[str, Any]]) -> dict[str, Any]:
+    """Apply the app's patch ops to a conversationState.
+
+    Ops are `add`, `replace` and `remove`, and `path` is a list of keys rather
+    than a JSON-Pointer string. Mutates a copy, so a failed patch leaves the
+    caller's state untouched -- half-applied state is worse than stale state,
+    because it looks current.
+    """
+    import copy
+
+    updated = copy.deepcopy(state)
+    for patch in patches:
+        path = patch.get("path")
+        op = patch.get("op")
+        if not isinstance(path, list) or not path:
+            raise PatchError(f"patch has no usable path: {patch!r}")
+        target: Any = updated
+        for key in path[:-1]:
+            if isinstance(target, dict):
+                target = target.setdefault(key, {})
+            elif isinstance(target, list) and isinstance(key, int):
+                target = target[key]
+            else:
+                raise PatchError(f"cannot walk {path} at {key!r}")
+        leaf = path[-1]
+        try:
+            if op in ("add", "replace"):
+                if isinstance(target, list) and isinstance(leaf, int):
+                    if op == "add":
+                        target.insert(leaf, patch.get("value"))
+                    else:
+                        target[leaf] = patch.get("value")
+                else:
+                    target[leaf] = patch.get("value")
+            elif op == "remove":
+                if isinstance(target, dict):
+                    target.pop(leaf, None)
+                elif isinstance(target, list) and isinstance(leaf, int):
+                    del target[leaf]
+            else:
+                raise PatchError(f"unknown patch op {op!r}")
+        except (KeyError, IndexError, TypeError) as exc:
+            raise PatchError(f"could not apply {op} at {path}: {exc}") from exc
+    return updated
+
+
+def state_from_frame(frame: dict[str, Any]) -> tuple[str | None, int | None, int | None, Any]:
+    """(change type, baseRevision, revision, payload) for a stream-state frame."""
+    change = (frame.get("params") or {}).get("change") or {}
+    return (
+        change.get("type"),
+        change.get("baseRevision"),
+        change.get("revision"),
+        change.get("conversationState")
+        if change.get("type") == "snapshot"
+        else change.get("patches"),
     )

@@ -17,12 +17,14 @@ directly means we never rely on the router's broadcast fallback picking right.
 from __future__ import annotations
 
 import subprocess
+import threading
 from dataclasses import dataclass
 from typing import Any
 
 from . import payloads
+from .follow import FollowManager
 from .instances import Instance, discover_instances
-from .ipc import IpcClient, IpcUnavailable, RouterError
+from .ipc import IpcClient, IpcError, IpcUnavailable, RouterError
 from .resume import DetachedRunner
 from .threads import AmbiguousThreadError, ThreadInfo, ThreadStore, UnknownThreadError
 
@@ -82,6 +84,9 @@ class Session:
         self._clients: dict[str, IpcClient] = {}
         self._stores: dict[str, ThreadStore] = {}
         self._runners: dict[str, DetachedRunner] = {}
+        self._follow: dict[str, FollowManager] = {}
+        self._pumps: dict[str, threading.Thread] = {}
+        self._stop = threading.Event()
 
     @property
     def instances(self) -> list[Instance]:
@@ -91,6 +96,103 @@ class Session:
         if instance.slug not in self._stores:
             self._stores[instance.slug] = ThreadStore(instance.codex_home)
         return self._stores[instance.slug]
+
+    def follow_manager(self, instance: Instance) -> FollowManager:
+        if instance.slug not in self._follow:
+            self._follow[instance.slug] = FollowManager(instance.slug)
+        return self._follow[instance.slug]
+
+    def _ensure_pump(self, instance: Instance) -> None:
+        """Drain this instance's broadcasts into its FollowManager.
+
+        A background pump rather than draining on demand: events have to
+        accumulate while nothing is polling, which is the entire point of a
+        persistent follow.
+        """
+        existing = self._pumps.get(instance.slug)
+        if existing is not None and existing.is_alive():
+            return
+
+        def pump() -> None:
+            manager = self.follow_manager(instance)
+            while not self._stop.is_set():
+                try:
+                    client = self.client(instance)
+                except IpcError:
+                    for thread_id in manager.followed:
+                        manager.lost(thread_id, "Codex Desktop is not reachable")
+                    self._stop.wait(5.0)
+                    continue
+                frame = client.next_broadcast(timeout=1.0)
+                if frame is None:
+                    if client.is_closed:
+                        for thread_id in manager.followed:
+                            manager.lost(thread_id, "IPC connection closed")
+                        self._stop.wait(2.0)
+                    continue
+                if frame.get("method") == STREAM_STATE_CHANGED:
+                    manager.handle_frame(frame)
+
+        thread = threading.Thread(
+            target=pump, name=f"codex-pilot-pump-{instance.slug}", daemon=True
+        )
+        self._pumps[instance.slug] = thread
+        thread.start()
+
+    def follow_thread(
+        self, ref: str, follow: bool = True, instance: str | None = None
+    ) -> dict[str, Any]:
+        """Start or stop a persistent follow.
+
+        Only works while the app has the thread mounted -- an unmounted thread
+        sends no stream state at all, so a follow on one is silently empty.
+        """
+        resolved = self.resolve(ref, instance)
+        manager = self.follow_manager(resolved.instance)
+        client = self.client(resolved.instance)
+        client.broadcast(FOLLOWING_CHANGED, payloads.follow(resolved.thread_id, follow))
+        if follow:
+            manager.follow(resolved.thread_id)
+            self._ensure_pump(resolved.instance)
+        else:
+            manager.unfollow(resolved.thread_id)
+        return {
+            "instance": resolved.instance.slug,
+            "thread": resolved.thread_id,
+            "name": resolved.name,
+            "following": follow,
+            "followed": manager.followed,
+        }
+
+    def collect_events(
+        self,
+        threads: list[str] | None = None,
+        after: int = 0,
+        wait_seconds: float = 0.0,
+        instance: str | None = None,
+    ) -> dict[str, Any]:
+        managers = [
+            self.follow_manager(i)
+            for i in self._instances
+            if instance is None or i.slug == instance
+        ]
+        if len(managers) == 1:
+            return managers[0].collect(threads, after=after, wait_seconds=wait_seconds)
+        merged: list[dict[str, Any]] = []
+        dropped = 0
+        following: list[str] = []
+        for manager in managers:
+            got = manager.collect(threads, after=after, wait_seconds=0.0)
+            merged.extend(got["events"])
+            dropped += got["dropped"]
+            following.extend(got["following"])
+        merged.sort(key=lambda e: e["seq"])
+        return {
+            "events": merged,
+            "cursor": merged[-1]["seq"] if merged else after,
+            "dropped": dropped,
+            "following": following,
+        }
 
     def runner(self, instance: Instance) -> DetachedRunner:
         if instance.slug not in self._runners:
@@ -113,6 +215,7 @@ class Session:
         return client
 
     def close(self) -> None:
+        self._stop.set()
         for client in self._clients.values():
             client.close()
         self._clients.clear()

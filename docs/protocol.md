@@ -393,6 +393,31 @@ installed renderer:
 
 Where they disagree, the installed bundle wins.
 
+## Stream patches — verified
+
+After the initial snapshot the app sends incremental patches:
+
+```json
+{"type": "patches", "baseRevision": 5, "revision": 6,
+ "patches": [{"op": "replace", "path": ["threadRuntimeStatus"], "value": {...}}]}
+```
+
+- `op` is `add`, `replace` or `remove`; `path` is a **list of keys**, not a
+  JSON-Pointer string.
+- The revision chain is contiguous — each frame's `baseRevision` equals the
+  previous frame's `revision`. A mismatch means a frame was missed; re-seed from
+  a snapshot rather than applying, since a patch on the wrong baseline produces
+  state that looks current and is not.
+- Captured over one turn: 2 snapshots, 23 patch frames, 25 `replace` and 9 `add`
+  ops. Almost all traffic is `turnHistory/history`; `threadRuntimeStatus`,
+  `requests`, `latestThreadSettings` and `currentPermissions` change rarely.
+
+**Turn history is keyed two ways.** `turn:<turnId>` for a turn the server has
+confirmed, and `tail:<n>:local:<uuid>` for one the window created optimistically
+and has no id for yet. So an in-progress turn can legitimately have no turn id —
+that means "not yet assigned", not "no turn running". `thread-follower-start-turn`
+returns the id directly, which is more reliable than reading it back out of state.
+
 ## Approvals — verified
 
 **Nothing surfaces while `approvalsReviewer` is `auto_review`.** That is the

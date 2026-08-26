@@ -108,3 +108,59 @@ def test_unknown_request_method_is_listed_but_not_answerable():
 
 def test_request_without_an_id_is_skipped():
     assert snapshot.project(frame(requests=[{"method": "x", "params": {}}])).pending == []
+
+
+# -- active turn id -----------------------------------------------------------
+
+
+def test_turn_id_from_a_confirmed_turn_key():
+    st = snapshot.project(
+        frame(
+            turnHistory={
+                "history": {
+                    "entitiesByKey": {
+                        "turn:01a03e33-76e3-7142-a99b-e3cccf85e540": {"status": "inProgress"}
+                    }
+                }
+            }
+        )
+    )
+    assert st.turn_id == "01a03e33-76e3-7142-a99b-e3cccf85e540"
+
+
+def test_turn_id_field_beats_the_key():
+    st = snapshot.project(
+        frame(
+            turnHistory={
+                "history": {
+                    "entitiesByKey": {"turn:stale": {"status": "inProgress", "turnId": "real-id"}}
+                }
+            }
+        )
+    )
+    assert st.turn_id == "real-id"
+
+
+def test_optimistic_local_turn_has_no_id_yet():
+    # A `tail:` entry is a turn the window created before the server assigned
+    # an id; null means "not yet", not "no turn".
+    st = snapshot.project(
+        frame(
+            turnHistory={
+                "history": {
+                    "entitiesByKey": {
+                        "tail:3:local:074b5755": {"status": "inProgress", "turnId": None}
+                    }
+                }
+            }
+        )
+    )
+    assert st.turn_id is None
+    assert st.busy is True
+
+
+def test_completed_turns_are_not_reported_as_active():
+    st = snapshot.project(
+        frame(turnHistory={"history": {"entitiesByKey": {"turn:done": {"status": "completed"}}}})
+    )
+    assert st.turn_id is None

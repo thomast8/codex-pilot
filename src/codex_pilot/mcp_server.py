@@ -276,6 +276,53 @@ def edit_thread(
 
 @server.tool(
     description=(
+        "Start or stop following a thread. A follow keeps its state current in "
+        "the background and records what changed, so collect_events can tell you "
+        "when a turn finished or an approval appeared without you polling "
+        "thread_status. Only works while the app has the thread mounted -- "
+        "focus_thread first if a follow stays silent."
+    )
+)
+def follow_thread(thread: str, follow: bool = True, instance: str | None = None) -> dict[str, Any]:
+    try:
+        return {"ok": True, **session().follow_thread(thread, follow=follow, instance=instance)}
+    except (ActionError, IpcError, ThreadError) as exc:
+        return _fail(exc)
+
+
+@server.tool(
+    description=(
+        "Drain events from followed threads: turn_started, turn_completed (a "
+        "thread went idle and is free for work), request_pending, "
+        "request_resolved, resync, follow_lost. Pass the previous `cursor` to "
+        "get only what is new. wait_seconds>0 blocks until something happens or "
+        "the time runs out, which is how to wait for a thread to finish without "
+        "a polling loop. A non-zero `dropped` means the buffer overflowed and "
+        "some events were lost."
+    )
+)
+def collect_events(
+    threads: list[str] | None = None,
+    after: int = 0,
+    wait_seconds: float = 0.0,
+    instance: str | None = None,
+) -> dict[str, Any]:
+    try:
+        return {
+            "ok": True,
+            **session().collect_events(
+                threads,
+                after=after,
+                wait_seconds=min(120.0, max(0.0, wait_seconds)),
+                instance=instance,
+            ),
+        }
+    except (ActionError, IpcError, ThreadError) as exc:
+        return _fail(exc)
+
+
+@server.tool(
+    description=(
         "Bring a thread forward in Codex Desktop so a window claims it. Use this "
         "when a tool reports that a thread holds a writer lock but no window "
         "claims it: the app keeps threads open in the background without "
