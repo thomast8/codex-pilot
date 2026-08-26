@@ -177,10 +177,26 @@ class ThreadStore:
                     latest = (name, ts)
         return latest[0] if latest else None
 
+    def exists(self, thread_id: str) -> bool:
+        """Whether this instance actually holds the thread.
+
+        Needed because a well-formed uuid looks valid against every instance.
+        Without checking, a bare id appears to resolve everywhere, so the caller
+        cannot tell which instance owns it -- and if only one instance happens to
+        be live, the id binds to that one regardless of where it really lives.
+        """
+        rollout, _ = self._find_rollout(thread_id)
+        if rollout is not None:
+            return True
+        return thread_id in self.names().values()
+
     def resolve(self, ref: str) -> str:
         """Turn a thread id, exact name, or unique substring into a thread id."""
         if UUID_RE.match(ref.lower()):
-            return ref.lower()
+            thread_id = ref.lower()
+            if not self.exists(thread_id):
+                raise UnknownThreadError(f"no thread {thread_id} in {self.home}")
+            return thread_id
         names = self.names()
         if ref in names:
             return names[ref]

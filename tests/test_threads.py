@@ -61,11 +61,13 @@ def test_resolves_exact_name(home):
     assert store(home).resolve("Session A") == A
 
 
-def test_uuid_passes_through_without_index_lookup(home):
+def test_uuid_resolves_when_the_instance_holds_it(home):
+    write_index(home, [(A, "Session A", "2026-08-26T09:00:00Z")])
     assert store(home).resolve(A) == A
 
 
 def test_uuid_is_case_normalised(home):
+    write_index(home, [(A, "Session A", "2026-08-26T09:00:00Z")])
     assert store(home).resolve(A.upper()) == A
 
 
@@ -228,3 +230,39 @@ def test_two_codex_homes_are_independent(tmp_path):
     # Same display name, different instance, different thread.
     assert store(tmp_path / "primary").resolve("Session A") == A
     assert store(tmp_path / "secondary").resolve("Session A") == B
+
+
+# -- existence ----------------------------------------------------------------
+
+
+def test_known_thread_exists(home):
+    write_index(home, [(A, "Session A", "2026-08-26T09:00:00Z")])
+    assert store(home).exists(A) is True
+
+
+def test_thread_with_only_a_rollout_exists(home):
+    # A CLI-created thread may not be in the session index yet.
+    write_rollout(home, A, "/w", "t1")
+    assert store(home).exists(A) is True
+
+
+def test_archived_thread_exists(home):
+    write_rollout(home, A, "/w", "t1", archived=True)
+    assert store(home).exists(A) is True
+
+
+def test_unknown_id_does_not_exist(home):
+    assert store(home).exists(B) is False
+
+
+def test_resolve_rejects_a_uuid_that_is_not_in_this_instance(home):
+    # Without this, a bare id "resolves" in every instance, so the caller cannot
+    # tell which one owns it -- and with one instance live it would bind to the
+    # wrong store entirely.
+    with pytest.raises(UnknownThreadError):
+        store(home).resolve(B)
+
+
+def test_resolve_accepts_a_uuid_present_in_this_instance(home):
+    write_rollout(home, A, "/w", "t1")
+    assert store(home).resolve(A) == A
