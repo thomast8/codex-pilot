@@ -16,6 +16,7 @@ directly means we never rely on the router's broadcast fallback picking right.
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,13 +46,20 @@ class NoOwnerError(ActionError):
     """
 
 
-class DriftError(ActionError):
-    """Owner discovery failed while a writer lock is held.
+class UnclaimedThreadError(ActionError):
+    """A writer lock is held, but no window will answer for the thread.
 
-    That combination cannot mean "nobody owns this thread": something holds the
-    lock. The likely cause is version-registry drift after an app update.
-    Falling back to `codex exec resume` here would try to take a lock that is
-    already held, so refuse instead.
+    Holding the lock and claiming ownership are different states, which is not
+    obvious: the app holds a writer lock on every thread it has open -- including
+    subagent threads and ones it is no longer rendering -- but only answers
+    owner discovery for a thread a window is actually showing. Verified by
+    probing: of 12 lock-holding threads, only 5 answered, and an unanswered one
+    started answering as soon as it was opened in the app.
+
+    So this is neither "free to resume" (the lock is held) nor a protocol
+    problem. Bringing the thread forward in the app fixes it -- `focus_thread`
+    does that. Version drift produces the same symptom, so it stays a secondary
+    suspect if focusing does not help.
     """
 
 
@@ -152,12 +160,12 @@ class Session:
         except RouterError as exc:
             if exc.error == "no-client-found":
                 if resolved.info.app_owned:
-                    raise DriftError(
-                        f"{resolved.thread_id} has a writer lock held by "
-                        f"{resolved.info.holder} but no window claims it. This usually means a "
-                        "Codex Desktop update bumped a protocol version -- re-extract the "
-                        "version map (`b_`) from app.asar. Refusing to run detached, because "
-                        "the lock is taken."
+                    raise UnclaimedThreadError(
+                        f"{resolved.thread_id} holds a writer lock ({resolved.info.holder}) but "
+                        "no window claims it: the app has the thread open without showing it. "
+                        "Bring it forward with focus_thread and retry. It cannot be resumed "
+                        "detached either, because the lock is taken. If focusing does not help, "
+                        "suspect version drift and run scripts/extract_registry.py --check."
                     ) from exc
                 raise NoOwnerError(
                     f"no window owns {resolved.thread_id} in instance "
@@ -168,6 +176,25 @@ class Session:
         if not isinstance(owner, str):
             raise ActionError(f"owner discovery returned no client id: {response}")
         return owner
+
+    def focus_thread(self, ref: str, instance: str | None = None) -> dict[str, Any]:
+        """Bring a thread forward in the app so a window claims it.
+
+        The app answers owner discovery only for a thread it is rendering, so a
+        thread it holds open in the background is undriveable until something
+        surfaces it. The `codex://threads/<id>` deep link is how the app itself
+        navigates, and it takes effect in a couple of seconds.
+        """
+        resolved = self.resolve(ref, instance)
+        url = f"codex://threads/{resolved.thread_id}"
+        subprocess.run(["open", url], check=False, capture_output=True)
+        return {
+            "instance": resolved.instance.slug,
+            "thread": resolved.thread_id,
+            "name": resolved.name,
+            "opened": url,
+            "note": "give the app a moment, then retry the call that failed",
+        }
 
     # -- mutating verbs -----------------------------------------------------
 

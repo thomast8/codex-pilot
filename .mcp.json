@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "codex-pilot": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/launch-mcp.sh"
+    }
+  }
+}

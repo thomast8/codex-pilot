@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "codex-pilot",
+  "displayName": "Codex Pilot",
+  "version": "0.1.0",
+  "description": "Drive Codex Desktop threads from Claude Code: send, steer, stop, answer approvals, and change model/reasoning/plan mode. Works across multiple Codex instances.",
+  "author": { "name": "Thomas Tiotto" },
+  "license": "MIT",
+  "keywords": ["codex", "orchestration", "macos", "ipc"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}

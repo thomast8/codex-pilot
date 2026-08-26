@@ -3,13 +3,19 @@ name = "codex-pilot"
 version = "0.1.0"
 description = "Drive Codex Desktop threads from Claude Code over the app's local IPC socket"
 requires-python = ">=3.11"
-dependencies = ["mcp>=1.2"]
+dependencies = ["mcp>=2.1"]
 
 [project.scripts]
-codex-drive = "codex_pilot.cli:main"
+codex-pilot-mcp = "codex_pilot.mcp_server:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "anyio>=4.14.2",
+    "pytest-anyio>=0.0.0",
+]
 
 [build-system]
 requires = ["hatchling"]

@@ -332,6 +332,27 @@ the work was actually carried out.
 plan mode is the `collaborationMode` setting above. `/compact` is not needed
 either: `thread-follower-compact-thread` (v1) is a direct method.
 
+## Holding the lock is not the same as claiming the thread — verified
+
+The app holds a writer lock on **every** thread it has open, but answers
+`thread-owner-discovery` only for a thread a window is actually rendering. The
+two states are independent, and confusing them produces a thread that neither
+route can drive: IPC gets `no-client-found`, and detached resume is blocked by a
+lock that really is held.
+
+Measured by probing 12 lock-holding threads: **5 answered, 7 did not.** The
+unanswered ones were mostly unnamed (subagent threads, which hold locks but are
+never rendered as conversations) plus real threads the app had open in the
+background. A thread that did not answer began answering within seconds of
+`open codex://threads/<id>`, and its snapshot then arrived normally.
+
+So `no-client-found` on a lock-holding thread means "open but not shown", not
+"protocol drift" — surface it and retry. Drift produces the same symptom, so it
+remains the second thing to check, not the first.
+
+The same rule governs stream state: a follow on an unrendered thread yields
+nothing at all, not even after `thread-stream-following-status-requested`.
+
 ## The detached route — verified
 
 For a thread no window owns, `codex exec resume <id> "<text>"` continues it in
