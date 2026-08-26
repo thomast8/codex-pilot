@@ -21,7 +21,7 @@ in [`docs/protocol.md`](docs/protocol.md).
 
 | Tool | |
 | --- | --- |
-| `start_thread` | create a thread in a repo or worktree you name and start its first turn |
+| `start_thread` | create a thread, optionally making it a worktree and branch, and start its first turn |
 | `list_threads` | every thread across every installed Codex instance, with its route |
 | `thread_status` | busy/idle, current turn, settings, and anything the thread is waiting on |
 | `send_message` | start a turn on an existing thread; routes itself over IPC or a detached resume |
@@ -96,8 +96,12 @@ thread in its own git worktree and fork a conversation into one, but that is an
 app-side affordance: no IPC method creates a thread, and a thread started from
 here does not hold the app-control tools that do it — asked to fork itself into a
 worktree it delegates to a subagent that hand-rolls `git worktree add` into /tmp
-on a detached HEAD, which is a directory rather than a managed worktree. So
-parallel work
+on a detached HEAD, which is a directory rather than a managed worktree.
+
+So `start_thread` makes them itself, in the same place and layout Codex uses
+(`<CODEX_HOME>/worktrees/<id>/<repo>`, overridable with
+`CODEX_PILOT_WORKTREE_ROOT`), on a branch the caller names, refusing one that
+already exists. Parallel work
 either starts in the app (and codex-pilot drives the threads it produces) or uses
 worktrees you made yourself, kept out of Codex's own worktree root, which it
 garbage-collects.
@@ -176,7 +180,7 @@ lighter, no contention, but bounded by what the app will surface.
 ## Development
 
 ```sh
-uv run pytest                                    # 226 tests
+uv run pytest                                    # 235 tests
 uv run ruff check src tests scripts
 uv run mypy
 uv run python scripts/extract_registry.py --check  # protocol drift

@@ -721,20 +721,42 @@ class Session:
     def start_thread(
         self,
         text: str,
-        cwd: str,
+        cwd: str | None = None,
+        repo: str | None = None,
+        branch: str | None = None,
+        base: str | None = None,
         instance: str | None = None,
         sandbox: str | None = None,
         approval: str | None = None,
         model: str | None = None,
     ) -> dict[str, Any]:
-        """Create a new thread in a directory you name, and start its first turn.
+        """Create a new thread and start its first turn, in a place you name.
 
         Returns as soon as the thread has an id; the agent keeps working in the
-        background. `cwd` is required because that is the whole failure this
-        exists to prevent -- a thread started from wherever the caller happened
-        to be, rather than in the worktree the work belongs to.
+        background. Where it works is never inferred: either `cwd` names an
+        existing directory, or `repo` plus `branch` makes a worktree for it,
+        laid out the way Codex lays one out. A thread started from wherever the
+        caller happened to be is the failure this exists to prevent.
         """
+        from . import worktrees
+
         inst = self.instance_for(instance)
+        worktree: worktrees.Worktree | None = None
+        if branch or repo:
+            if not (branch and repo):
+                raise ActionError("making a worktree needs both `repo` and `branch`")
+            if cwd:
+                raise ActionError("pass `cwd`, or `repo` plus `branch`, not both")
+            worktree = worktrees.create(
+                Path(repo).expanduser(),
+                branch,
+                root=worktrees.default_root(inst.codex_home),
+                base=base,
+            )
+            cwd = str(worktree.path)
+        if not cwd:
+            raise ActionError("start_thread needs `cwd`, or `repo` plus `branch`")
+
         run = self.runner(inst).start(
             text,
             cwd=Path(cwd).expanduser(),
@@ -743,6 +765,8 @@ class Session:
             model=model,
         )
         out = run.as_dict()
+        if worktree is not None:
+            out["worktree"] = worktree.as_dict()
         self._register_run(run)
         if run.thread_id is None:
             out["note"] = (

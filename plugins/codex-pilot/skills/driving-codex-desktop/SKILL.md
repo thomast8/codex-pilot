@@ -333,15 +333,16 @@ So:
 | You want | Do |
 | --- | --- |
 | Parallel work in Codex's own worktrees | Ask the user to start it in Codex Desktop (worktree mode, or `/fork` into a worktree). codex-pilot then drives the resulting threads normally — they are app-owned and list with the worktree as their `cwd`. |
-| Parallel work you drive yourself | Make the worktree first, then `start_thread(cwd=<worktree>)`. |
+| Parallel work you drive yourself | `start_thread(repo=..., branch=...)` per slice: it makes the worktree in Codex's own root and starts the thread in it. |
 
 Two rules that follow:
 
-- **Never put your own worktrees under Codex's worktree root.** That directory is
-  Codex's to name and to delete — it garbage-collects worktrees to reclaim space,
-  and it would take yours with them. Use the repo's own convention instead.
-- **Do not park unmerged work in a Codex worktree.** Same reason. Bring it back
-  through the app's handoff, or commit and push the branch.
+- **Do not park unmerged work in a worktree**, whoever made it. Codex clears that
+  root to reclaim space and says so only afterwards. Commit and push the branch,
+  or bring the changes back through the app's handoff.
+- **Do not hand-roll `git worktree add`** when `start_thread` will do it. The
+  hand-rolled attempt observed here landed in `/tmp` on a detached HEAD, which is
+  work with no branch to push.
 
 ## Orchestrating several threads
 

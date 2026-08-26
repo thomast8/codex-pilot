@@ -217,9 +217,16 @@ def send_message(
         "immediately with the new thread id -- it never waits for Codex to "
         "finish -- and the thread is then drivable by every other tool here "
         "(follow_thread, steer_turn, thread_status, focus_thread). "
-        "`cwd` is REQUIRED and is where the agent works: pass the repo or "
-        "worktree the work belongs to, never the directory you happen to be in. "
-        "Create the worktree first if the work needs one. "
+        "Where it works is never guessed, so say which: either `cwd` for an "
+        "existing directory, or `repo` plus `branch` to get a worktree made for "
+        "it. The worktree goes where Codex puts its own, "
+        "<CODEX_HOME>/worktrees/<id>/<repo> (override with "
+        "CODEX_PILOT_WORKTREE_ROOT), on the new branch you name, off `base` if "
+        "given. Prefer this for a slice of work that should not share a checkout "
+        "with anything else. An existing branch is refused rather than reused, "
+        "so an agent is never set loose on one that already carries other work. "
+        "Note Codex clears old worktrees out of that root to save space, so "
+        "commit and push the branch rather than parking work there. "
         "Defaults are consequential and worth setting deliberately: "
         "`sandbox` defaults to 'workspace-write' (the agent writes anywhere under "
         "cwd, no network) and may be 'read-only'; `approval` defaults to 'never' "
@@ -238,7 +245,10 @@ def send_message(
 )
 def start_thread(
     text: str,
-    cwd: str,
+    cwd: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    base: str | None = None,
     instance: str | None = None,
     sandbox: str | None = None,
     approval: str | None = None,
@@ -247,7 +257,10 @@ def start_thread(
     try:
         result = session().start_thread(
             text,
-            cwd,
+            cwd=cwd,
+            repo=repo,
+            branch=branch,
+            base=base,
             instance=instance,
             sandbox=sandbox,
             approval=approval,
