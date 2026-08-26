@@ -181,6 +181,82 @@ def respond(
     return method, params
 
 
+# Fields of `latestThreadSettings` that the app itself round-trips. Confirmed
+# against a live snapshot; `collaborationMode.mode` is plan mode, and
+# `serviceTier` is the fast/priority lever.
+THREAD_SETTING_FIELDS = frozenset(
+    {
+        "cwd",
+        "model",
+        "effort",
+        "summary",
+        "personality",
+        "serviceTier",
+        "collaborationMode",
+        "multiAgentMode",
+        "approvalPolicy",
+        "approvalsReviewer",
+        "sandboxPolicy",
+        "permissions",
+    }
+)
+
+COLLABORATION_MODES = frozenset({"default", "plan"})
+SERVICE_TIERS = frozenset({"default", "flex", "priority", "scale"})
+
+
+def collaboration_mode(
+    mode: str, model: str, reasoning_effort: str | None = None, instructions: str | None = None
+) -> dict[str, Any]:
+    """A `collaborationMode` value -- this is how plan mode is turned on.
+
+    Both halves are required by the app-server: `{mode, settings}` where
+    `settings.model` is mandatory. Sending `{"mode": "plan"}` alone is rejected
+    with `Invalid request: missing field 'settings'`, which reads like the
+    *outer* settings object is missing rather than this nested one.
+    """
+    if mode not in COLLABORATION_MODES:
+        raise ValueError(f"mode must be one of {sorted(COLLABORATION_MODES)}")
+    settings: dict[str, Any] = {"model": model}
+    if reasoning_effort is not None:
+        settings["reasoning_effort"] = reasoning_effort
+    if instructions is not None:
+        settings["developer_instructions"] = instructions
+    return {"mode": mode, "settings": settings}
+
+
+def update_thread_settings(conversation_id: str, settings: dict[str, Any]) -> dict[str, Any]:
+    """`thread-follower-update-thread-settings` params (v1).
+
+    Applies to the *next* turn -- the renderer calls
+    `updateThreadSettingsForNextTurn`, so a running turn keeps the settings it
+    started with.
+    """
+    unknown = set(settings) - THREAD_SETTING_FIELDS
+    if unknown:
+        known = ", ".join(sorted(THREAD_SETTING_FIELDS))
+        raise ValueError(f"unknown thread settings {sorted(unknown)}; known fields: {known}")
+    collab = settings.get("collaborationMode")
+    if collab is not None:
+        mode = collab.get("mode")
+        if mode not in COLLABORATION_MODES:
+            raise ValueError(f"collaborationMode.mode must be one of {sorted(COLLABORATION_MODES)}")
+        if not (collab.get("settings") or {}).get("model"):
+            raise ValueError(
+                "collaborationMode needs settings.model -- build it with "
+                "payloads.collaboration_mode(mode, model)"
+            )
+    tier = settings.get("serviceTier")
+    if tier is not None and tier not in SERVICE_TIERS:
+        raise ValueError(f"serviceTier must be one of {sorted(SERVICE_TIERS)}")
+    return {"conversationId": conversation_id, "threadSettings": settings}
+
+
+def compact_thread(conversation_id: str) -> dict[str, Any]:
+    """`thread-follower-compact-thread` params (v1)."""
+    return {"conversationId": conversation_id}
+
+
 def follow(conversation_id: str, following: bool = True) -> dict[str, Any]:
     """`thread-stream-following-changed` broadcast params (v1)."""
     return {"conversationId": conversation_id, "hostId": "local", "following": following}

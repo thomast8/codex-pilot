@@ -195,3 +195,48 @@ def test_follow_literal_shape():
 
 def test_owner_discovery_literal_shape():
     assert payloads.owner_discovery(CONV) == {"hostId": "local", "conversationId": CONV}
+
+
+# -- thread settings ----------------------------------------------------------
+
+
+def test_collaboration_mode_carries_required_settings():
+    # The app-server requires {mode, settings} with settings.model; sending
+    # {"mode": "plan"} alone is rejected as `missing field 'settings'`.
+    got = payloads.collaboration_mode("plan", model="gpt-5.6-terra", reasoning_effort="high")
+    assert got == {
+        "mode": "plan",
+        "settings": {"model": "gpt-5.6-terra", "reasoning_effort": "high"},
+    }
+
+
+def test_collaboration_mode_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="mode must be one of"):
+        payloads.collaboration_mode("turbo", model="m")
+
+
+def test_update_thread_settings_literal_shape():
+    got = payloads.update_thread_settings(CONV, {"effort": "high", "serviceTier": "priority"})
+    assert got == {
+        "conversationId": CONV,
+        "threadSettings": {"effort": "high", "serviceTier": "priority"},
+    }
+
+
+def test_update_thread_settings_rejects_unknown_fields():
+    with pytest.raises(ValueError, match="unknown thread settings"):
+        payloads.update_thread_settings(CONV, {"nonsense": 1})
+
+
+def test_update_thread_settings_rejects_bare_collaboration_mode():
+    with pytest.raises(ValueError, match="settings.model"):
+        payloads.update_thread_settings(CONV, {"collaborationMode": {"mode": "plan"}})
+
+
+def test_update_thread_settings_rejects_unknown_service_tier():
+    with pytest.raises(ValueError, match="serviceTier must be one of"):
+        payloads.update_thread_settings(CONV, {"serviceTier": "ludicrous"})
+
+
+def test_compact_thread_literal_shape():
+    assert payloads.compact_thread(CONV) == {"conversationId": CONV}

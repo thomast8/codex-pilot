@@ -3,6 +3,12 @@
 Decoded from the installed app, not from documentation. Two sources, in order of
 authority:
 
+> **Use the app's own codex binary as the schema source, not the CLI on your
+> PATH.** They are different builds — here `/Applications/ChatGPT.app/Contents/
+> Resources/codex` is `0.149.0-alpha.4.3` while `codex` on PATH is `0.147.0`.
+> The newer build adds a whole queue API (`thread/queue/add|delete|list|reorder|
+> start|update`) and `thread/revert` that the CLI's schema does not mention.
+
 1. **The installed app bundle** — `/Applications/ChatGPT.app/Contents/Resources/app.asar`.
    Two files inside it matter: `/.vite/build/src-DlBR1tzg.js` (Electron main
    process, contains the router and the framing) and
@@ -284,6 +290,43 @@ Consequences, all verified:
 **Never delete a lock file to get around this.** A second process would flock a
 fresh inode and both would write one rollout. The IPC path is the sanctioned way
 to write to a thread the app owns — that is the whole point of it.
+
+## Thread settings — verified
+
+`thread-follower-update-thread-settings` (v1) takes
+`{conversationId, threadSettings}` and applies to the *next* turn
+(`updateThreadSettingsForNextTurn`), so a running turn keeps what it started
+with. The settable fields, per the app-server's `ThreadSettingsUpdateParams`:
+
+`cwd`, `model`, `effort`, `summary`, `personality`, `serviceTier`,
+`collaborationMode`, `multiAgentMode`, `approvalPolicy`, `approvalsReviewer`,
+`sandboxPolicy`, `permissions`.
+
+Verified live in one call: `effort` low→high, `collaborationMode` default→**plan**,
+`serviceTier` default→**priority**.
+
+- **Plan mode** is `collaborationMode`. It requires **both** halves —
+  `{mode, settings}` with `settings.model` mandatory (`mode` is `plan` or
+  `default`). Sending `{"mode": "plan"}` alone fails with
+  `Invalid request: missing field 'settings'`, which reads as though the outer
+  settings object were missing rather than this nested one.
+- **Fast mode** is `serviceTier`: `default`, `flex`, `priority`, `scale`.
+- `modelProvider` and `activePermissionProfile` appear in a snapshot's
+  `latestThreadSettings` but are **not** accepted as update params.
+
+## Goals and slash commands — verified
+
+`thread/goal/set|clear|get` are app-server methods with no `thread-follower-*`
+wrapper, so the follower protocol cannot set a goal directly. But the renderer
+parses `/goal` out of ordinary message text (`/^\/goal(?=$| )/`), and that
+parsing happens on the received input — so **sending `/goal <objective>` through
+`thread-follower-start-turn` does set a real goal**. Verified: the objective
+appeared in `completedThreadGoal` with `tokensUsed` and `timeUsedSeconds`, and
+the work was actually carried out.
+
+`/goal` and `/new` are the only composer slash commands. `/plan` is not one —
+plan mode is the `collaborationMode` setting above. `/compact` is not needed
+either: `thread-follower-compact-thread` (v1) is a direct method.
 
 ## Divergences
 

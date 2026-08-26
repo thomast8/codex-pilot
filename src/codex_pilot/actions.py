@@ -256,6 +256,33 @@ class Session:
             "result": result,
         }
 
+    def update_settings(
+        self, ref: str, settings: dict[str, Any], instance: str | None = None
+    ) -> dict[str, Any]:
+        """Change model, reasoning effort, plan mode, service tier, sandbox, etc.
+
+        Takes effect on the next turn, not the running one.
+        """
+        resolved = self.resolve(ref, instance)
+        result = self._follower_request(
+            resolved,
+            "thread-follower-update-thread-settings",
+            payloads.update_thread_settings(resolved.thread_id, settings),
+        )
+        return {
+            "instance": resolved.instance.slug,
+            "thread": resolved.thread_id,
+            "applied": settings,
+            "result": result,
+        }
+
+    def compact(self, ref: str, instance: str | None = None) -> dict[str, Any]:
+        resolved = self.resolve(ref, instance)
+        result = self._follower_request(
+            resolved, "thread-follower-compact-thread", payloads.compact_thread(resolved.thread_id)
+        )
+        return {"instance": resolved.instance.slug, "thread": resolved.thread_id, "result": result}
+
     # -- reading ------------------------------------------------------------
 
     def snapshot(self, resolved: ResolvedThread, wait: float = SNAPSHOT_WAIT_SECONDS) -> Any:
