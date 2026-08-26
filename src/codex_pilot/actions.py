@@ -231,11 +231,12 @@ class Session:
     def respond(
         self,
         ref: str,
-        request_id: str,
+        request_id: int | str,
         kind: str,
         decision: Any = None,
         response: Any = None,
         instance: str | None = None,
+        available_decisions: list[Any] | None = None,
     ) -> dict[str, Any]:
         """Answer one pending request. Sends exactly once; never retries.
 
@@ -245,7 +246,12 @@ class Session:
         """
         resolved = self.resolve(ref, instance)
         method, params = payloads.respond(
-            resolved.thread_id, request_id, kind, decision=decision, response=response
+            resolved.thread_id,
+            request_id,
+            kind,
+            decision=decision,
+            response=response,
+            available_decisions=available_decisions,
         )
         result = self._follower_request(resolved, method, params)
         return {

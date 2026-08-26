@@ -52,6 +52,19 @@ CANCEL = "cancel"  # denies *and* interrupts the turn
 PERSISTENT_GRANTS = frozenset({"acceptForSession"})
 
 
+def _decision_label(decision: Any) -> str:
+    """Name a decision that may be a bare string or a single-key object."""
+    if isinstance(decision, str):
+        return decision
+    if isinstance(decision, dict) and len(decision) == 1:
+        return str(next(iter(decision)))
+    return repr(decision)
+
+
+def _decision_offered(decision: Any, available: list[Any]) -> bool:
+    return _decision_label(decision) in {_decision_label(d) for d in available}
+
+
 def text_input(text: str) -> list[dict[str, Any]]:
     """`input` is an array of UserInput; this is the text variant.
 
@@ -153,15 +166,25 @@ def interrupt_turn(
 
 def respond(
     conversation_id: str,
-    request_id: str,
+    request_id: int | str,
     kind: str,
     decision: Any = None,
     response: Any = None,
+    available_decisions: list[Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """(method, params) for answering one pending request.
 
     Returns the method as well because each kind routes to a different
     `thread-follower-*` method, all v1, all `(conversationId, requestId, ...)`.
+
+    `request_id` keeps whatever type the app gave it -- ids arrive as integers
+    and are echoed straight back, so stringifying breaks the match.
+
+    `available_decisions` is the request's own list of acceptable answers. It
+    varies per request (a blocked-network command offers accept /
+    acceptWithExecpolicyAmendment / cancel but no decline), and an answer the
+    app did not offer is ignored rather than refused, so check against it when
+    it is known.
     """
     try:
         method = RESPOND_METHODS[kind]
@@ -173,6 +196,11 @@ def respond(
     if kind in DECISION_KINDS:
         if decision is None:
             raise ValueError(f"{kind!r} requests need a `decision`")
+        if available_decisions and not _decision_offered(decision, available_decisions):
+            offered = ", ".join(_decision_label(d) for d in available_decisions)
+            raise ValueError(
+                f"{_decision_label(decision)} is not offered for this request; available: {offered}"
+            )
         params["decision"] = decision
     else:
         if response is None:

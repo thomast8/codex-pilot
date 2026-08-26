@@ -342,6 +342,48 @@ installed renderer:
 
 Where they disagree, the installed bundle wins.
 
+## Approvals — verified
+
+**Nothing surfaces while `approvalsReviewer` is `auto_review`.** That is the
+default on these threads and it routes escalations to a subagent that decides
+on its own, so a blocked-network command completed with no pending request at
+all. Set `approvalsReviewer: "user"` (values: `user`, `auto_review`,
+`guardian_subagent`) to route approvals to a human — or to us.
+
+A pending request lives in `conversationState.requests` and looks like:
+
+```json
+{
+  "method": "item/commandExecution/requestApproval",
+  "id": 1865,
+  "params": {
+    "threadId": "...", "turnId": "...", "itemId": "exec-...",
+    "reason": "May I rerun the exact requested curl command with network access?",
+    "command": "/bin/zsh -lc \"curl -sS -o /dev/null -w '%{http_code}' https://example.com\"",
+    "cwd": "/Users/.../codex-pilot-phaseb",
+    "proposedExecpolicyAmendment": ["curl", "-sS", "-o", "/dev/null", "-w"],
+    "availableDecisions": [
+      "accept",
+      {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["curl", "-sS", "..."]}},
+      "cancel"
+    ]
+  }
+}
+```
+
+Two details that bite:
+
+- **`id` is an integer**, and it is echoed straight back as `requestId`.
+  Stringifying it silently fails to match.
+- **`availableDecisions` is per-request, and it is the authority.** This
+  network-blocked command offers `accept`, `acceptWithExecpolicyAmendment` and
+  `cancel` — but *not* `decline`. The static enums in the schema are a
+  vocabulary; this list is what the request will actually accept.
+
+Verified live, both halves: `cancel` on a pending request cleared it and took
+the thread `active` → `idle`; `accept` let the command run, which reached the
+network and wrote its `200` to a file.
+
 ## Queued follow-ups — decoded
 
 The app's build exposes a full queue API (`thread/queue/add | delete | list |
