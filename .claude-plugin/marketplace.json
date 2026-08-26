@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "codex-pilot",
+  "version": "0.1.0",
+  "description": "Drive Codex Desktop threads from Claude Code: send work, steer a running turn, stop one, answer approval requests, change model/reasoning/plan mode, and get told when a thread goes idle.",
+  "owner": {
+    "name": "Thomas Tiotto"
+  },
+  "plugins": [
+    {
+      "name": "codex-pilot",
+      "description": "Supervise Codex agents from Claude Code. Sends work to a thread, steers a turn already running, stops one, answers its approval and permission requests, and changes model, reasoning effort, plan mode or sandbox. Follows threads so you learn when a turn finished without polling. Works across several Codex Desktop installs, and falls back to resuming a thread detached when the app does not have it open.",
+      "source": "./plugins/codex-pilot",
+      "category": "productivity"
+    }
+  ]
+}
