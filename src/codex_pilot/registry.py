@@ -7,12 +7,17 @@ client-discovery round and the caller gets `no-client-found` -- which looks like
 live: `thread-owner-discovery` with no version returned no-client-found, and the
 identical request with `version: 1` returned success from the real owner.
 
-Sources, which agree and serve as each other's drift check:
-  - the installed app bundle's `b_` object (app.asar, `src-DlBR1tzg.js`)
-  - remodex's DESKTOP_IPC_METHOD_VERSIONS (phodex-bridge/src/desktop-ipc-shared.js)
+Source of truth is the `b_` object in the installed app's own Electron bundle
+(`app.asar`, `src-DlBR1tzg.js`) -- not the `codex` CLI on PATH, which is a
+different build. Here the app ships 0.149.0-alpha.4.3 while the CLI is 0.147.0.
+remodex's DESKTOP_IPC_METHOD_VERSIONS agrees with this map and is a secondary
+cross-check only.
 
 If a Codex Desktop update bumps a version, calls to that method start failing
-with no-client-found on a thread the app visibly owns. Re-extract `b_` and diff.
+with no-client-found on a thread the app visibly owns. Run
+`scripts/extract_registry.py` to diff every installed bundle against this map;
+`tests/test_registry_drift.py` runs the same check as part of the suite. Doppel
+clones carry a patched app.asar, so each bundle is verified separately.
 """
 
 from __future__ import annotations

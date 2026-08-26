@@ -342,9 +342,37 @@ installed renderer:
 
 Where they disagree, the installed bundle wins.
 
+## Queued follow-ups — decoded
+
+The app's build exposes a full queue API (`thread/queue/add | delete | list |
+reorder | start | update`, plus `thread/revert`) that the older CLI build does
+not have at all. Those are app-server methods; the only follower wrapper is
+`thread-follower-set-queued-follow-ups-state` (v1), and it is a **whole-queue
+replace**, not an append:
+
+```js
+let {conversationId: a, state: o} = t.params;
+let s = o[a] ?? [];        // state is keyed by conversationId
+await vet(r, a, s);        // persists exactly this list
+```
+
+So adding one follow-up means reading the current queue and sending the whole
+list back. `thread-queued-followups-changed` (v1) is broadcast on success.
+
+`thread/revert` takes `{threadId, beforeTurnId}`.
+
 ## Drift
 
 A Codex Desktop update can bump any pinned version. The symptom is
 `no-client-found` on a thread the app visibly owns — the same error as "nobody
 owns this thread". If owner discovery succeeds but a follower request fails that
-way, suspect version drift and re-extract `b_` from `app.asar`.
+way, suspect version drift.
+
+    uv run python scripts/extract_registry.py           # diff every installed bundle
+    uv run python scripts/extract_registry.py --check   # exit 1 on drift
+
+`tests/test_registry_drift.py` runs the same check in the suite, per bundle —
+Doppel clones ship a patched `app.asar`, so a clone can drift while the stock app
+does not. Verified today: all three installed bundles (stock, Personal, Veridue)
+carry identical 22-method maps, so Doppel's patching does not touch the
+protocol.
