@@ -32,6 +32,7 @@ from mcp.server.mcpserver import MCPServer
 
 from .actions import ActionError, Session
 from .ipc import IpcError
+from .resume import DetachedError
 from .threads import ThreadError
 
 server = MCPServer(
@@ -87,10 +88,12 @@ def _fail(exc: Exception) -> dict[str, Any]:
 
 @server.tool(
     description=(
-        "List Codex Desktop threads across every installed instance. Shows which "
-        "instance each belongs to, whether the app currently owns it (route "
-        "'desktop') or it is free to resume detached (route 'detached'), its "
-        "working directory, and how recently it did anything."
+        "List Codex threads across every installed instance: which instance each "
+        "belongs to, whether the app owns it (route 'desktop') or it is free to "
+        "resume detached (route 'detached'), its working directory, how recently "
+        "it did anything, and its `rollout` path -- read that file to see what the "
+        "thread actually said. Threads started by start_thread stay listed after "
+        "they go idle, marked `started_here`."
     )
 )
 def list_threads(instance: str | None = None) -> dict[str, Any]:
@@ -112,24 +115,35 @@ def list_threads(instance: str | None = None) -> dict[str, Any]:
     description=(
         "Inspect one thread: whether a turn is running, the current turn id, the "
         "model/reasoning/plan-mode settings in force, and anything the thread is "
-        "waiting on an answer for. Read this before steering, stopping or "
-        "responding. A null state means the read failed -- it does NOT mean "
-        "nothing is pending."
+        "waiting on an answer for, plus the `rollout` path to read its transcript. "
+        "Read this before steering, stopping or responding. A null state means "
+        "the read failed -- it does NOT mean nothing is pending."
     )
 )
 def thread_status(thread: str, instance: str | None = None) -> dict[str, Any]:
     try:
         sess = session()
         resolved = sess.resolve(thread, instance)
+        rollout = resolved.info.rollout
         out: dict[str, Any] = {
             "ok": True,
             "instance": resolved.instance.slug,
             "thread": resolved.thread_id,
             "name": resolved.name,
-            "route": "desktop" if resolved.info.app_owned else "detached",
+            "route": sess.route_for(resolved.info),
             "cwd": resolved.info.cwd,
             "archived": resolved.info.archived,
+            "rollout": str(rollout) if rollout is not None else None,
         }
+        out.update(sess.own_run_fields(resolved.thread_id))
+        if sess.live_run(resolved.thread_id) is not None:
+            # Our own CLI holds the lock, so the app has no live state for it.
+            out["state"] = None
+            out["note"] = (
+                "a detached run started here is still going: read log_path, wait for "
+                "turn_completed from collect_events, or stop_turn to terminate it"
+            )
+            return out
         if not resolved.info.app_owned:
             out["state"] = None
             out["note"] = "not open in the app; no live state to read"
@@ -170,11 +184,14 @@ def thread_status(thread: str, instance: str | None = None) -> dict[str, Any]:
 
 @server.tool(
     description=(
-        "Start a new turn on a thread. Routes itself: over IPC when Codex Desktop "
-        "has the thread open, otherwise by resuming it detached (unarchiving it "
-        "first if needed) and returning a pid and log path. A detached run "
-        "returns immediately -- poll the log, it is not streamed. Use steer_turn "
-        "instead when a turn is already running."
+        "Start a new turn on an EXISTING thread. Returns as soon as the turn is "
+        "accepted -- typically under a second, with the turn id and status "
+        "'inProgress' -- and never waits for Codex to finish; use follow_thread "
+        "plus collect_events to learn when it does. Routes itself: over IPC when "
+        "Codex Desktop has the thread open, otherwise by resuming it detached "
+        "(unarchiving first if needed) and returning a pid and log path. Use "
+        "steer_turn instead when a turn is already running, and start_thread for "
+        "work that needs a new thread."
     )
 )
 def send_message(
@@ -195,6 +212,54 @@ def send_message(
 
 @server.tool(
     description=(
+        "Create a NEW Codex thread in a directory you name and start its first "
+        "turn. Use this instead of running `codex exec` in a shell: it returns "
+        "immediately with the new thread id -- it never waits for Codex to "
+        "finish -- and the thread is then drivable by every other tool here "
+        "(follow_thread, steer_turn, thread_status, focus_thread). "
+        "`cwd` is REQUIRED and is where the agent works: pass the repo or "
+        "worktree the work belongs to, never the directory you happen to be in. "
+        "Create the worktree first if the work needs one. "
+        "Defaults are consequential and worth setting deliberately: "
+        "`sandbox` defaults to 'workspace-write' (the agent writes anywhere under "
+        "cwd, no network) and may be 'read-only'; `approval` defaults to 'never' "
+        "(nothing is asked of a human, because a detached run has no way to be "
+        "asked) and may be 'untrusted', 'on-failure' or 'on-request' -- but those "
+        "will stall a detached run, so use them only on a thread you intend to "
+        "focus into the app. 'danger-full-access' is refused unless the server "
+        "was started with CODEX_PILOT_ALLOW_FULL_ACCESS. "
+        "While the run goes it holds the thread's writer lock, so route reads "
+        "'detached_running' and the thread cannot be steered or driven over IPC; "
+        "stop_turn terminates it, and collect_events reports turn_completed (or "
+        "run_failed) when it exits. Do NOT focus_thread it while it runs. Once "
+        "it is idle, focus_thread brings it into Codex Desktop for IPC. Read "
+        "`log_path` for streamed JSONL, or `rollout` for the transcript."
+    )
+)
+def start_thread(
+    text: str,
+    cwd: str,
+    instance: str | None = None,
+    sandbox: str | None = None,
+    approval: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    try:
+        result = session().start_thread(
+            text,
+            cwd,
+            instance=instance,
+            sandbox=sandbox,
+            approval=approval,
+            model=model,
+        )
+    except (ActionError, IpcError, ThreadError, DetachedError) as exc:
+        return _fail(exc)
+    return {"ok": True, **result}
+
+
+@server.tool(
+    description=(
         "Inject text into a turn that is already running, without restarting it. "
         "This is the correction channel: the running turn sees the new input and "
         "adjusts. Requires the app to have the thread open."
@@ -209,7 +274,10 @@ def steer_turn(thread: str, text: str, instance: str | None = None) -> dict[str,
 
 @server.tool(
     description=(
-        "Interrupt the running turn. Pass expected_turn_id (from thread_status) to "
+        "Interrupt the running turn. On a thread one of our own detached runs is "
+        "writing (route 'detached_running') this terminates that run and its "
+        "whole process group, and `stopped` says whether it was still alive. "
+        "Otherwise it interrupts over IPC: pass expected_turn_id (from thread_status) to "
         "refuse stopping a turn that started after you looked. Read `stopped` in "
         "the result, not `ok`: the app answers ok:true even when it stopped "
         "nothing, both for an already-idle thread and for a precondition that "

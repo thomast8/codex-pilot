@@ -23,6 +23,7 @@ Three things this gets right that a bare subprocess call would not:
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -35,7 +36,48 @@ from .threads import ThreadStore
 
 DEFAULT_SANDBOX = "workspace-write"
 DEFAULT_APPROVAL = "never"
+
+# Both reach the CLI as security controls -- `--sandbox <v>` and
+# `-c approval_policy=<v>` -- so they are allowlisted rather than passed
+# through. The caller is a model, and "danger-full-access" plus an
+# approval policy of "never" is an unsupervised agent with no sandbox.
+# Opt into that deliberately via CODEX_PILOT_ALLOW_FULL_ACCESS, not by
+# choosing a string.
+SANDBOX_MODES = frozenset({"read-only", "workspace-write"})
+PRIVILEGED_SANDBOX = "danger-full-access"
+FULL_ACCESS_ENV = "CODEX_PILOT_ALLOW_FULL_ACCESS"
+APPROVAL_POLICIES = frozenset({"untrusted", "on-failure", "on-request", "never"})
 LOG_DIR_NAME = "codex-pilot-logs"
+
+# `codex exec --json` announces the thread it created as its first JSON line.
+THREAD_STARTED_EVENT = "thread.started"
+THREAD_ID_WAIT = 15.0
+ID_POLL_INTERVAL = 0.05
+
+
+def scan_for_thread_id(log_path: Path) -> str | None:
+    """First `thread.started` id in a `codex exec --json` log, if it is there yet.
+
+    Tolerates partial and non-JSON lines: the CLI prints a human preamble before
+    the JSONL stream, and a line can be half-written when we look.
+    """
+    try:
+        with log_path.open(errors="replace") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped.startswith("{"):
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict) and record.get("type") == THREAD_STARTED_EVENT:
+                    thread_id = record.get("thread_id")
+                    if isinstance(thread_id, str):
+                        return thread_id
+    except OSError:
+        return None
+    return None
 
 
 class DetachedError(Exception):
@@ -51,16 +93,58 @@ class LockedError(DetachedError):
     """
 
 
+def check_sandbox(sandbox: str) -> str:
+    """Allowlist the sandbox mode; gate full access behind an env opt-in."""
+    if sandbox in SANDBOX_MODES:
+        return sandbox
+    if sandbox == PRIVILEGED_SANDBOX:
+        if os.environ.get(FULL_ACCESS_ENV):
+            return sandbox
+        raise DetachedError(
+            f"sandbox {PRIVILEGED_SANDBOX!r} runs an agent with no sandbox at all; "
+            f"it is refused unless {FULL_ACCESS_ENV} is set in the server's environment"
+        )
+    raise DetachedError(f"sandbox must be one of {sorted(SANDBOX_MODES)}, got {sandbox!r}")
+
+
+def check_approval(approval: str) -> str:
+    """Allowlist the approval policy reaching `-c approval_policy=`."""
+    if approval not in APPROVAL_POLICIES:
+        raise DetachedError(
+            f"approval must be one of {sorted(APPROVAL_POLICIES)}, got {approval!r}"
+        )
+    return approval
+
+
+def check_prompt(text: str) -> str:
+    """Refuse a prompt the CLI would read as something other than a prompt.
+
+    A bare `-` means "read the prompt from stdin", and stdin is DEVNULL here, so
+    it would silently start a thread with no prompt at all.
+    """
+    if text.strip() == "-":
+        raise DetachedError(
+            "a prompt of '-' means 'read from stdin', which a detached run has none of"
+        )
+    return text
+
+
 @dataclass
 class DetachedRun:
     """A `codex exec resume` running in the background."""
 
-    thread_id: str
+    thread_id: str | None
     instance: str
     cwd: Path
     log_path: Path
     process: subprocess.Popen[bytes]
     unarchived: bool = False
+    # Set once this run's exit has been turned into an event, so the pump
+    # announces each run exactly once.
+    reported: bool = False
+    # Set when we terminated it ourselves, so its non-zero exit is not
+    # reported as though the agent had failed on its own.
+    stopped: bool = False
 
     @property
     def pid(self) -> int:
@@ -170,14 +254,86 @@ class DetachedRunner:
             str(self.codex_binary),
             "exec",
             "--sandbox",
-            sandbox,
+            check_sandbox(sandbox),
             "-c",
-            f"approval_policy={approval}",
+            f"approval_policy={check_approval(approval)}",
         ]
         if model is not None:
             argv += ["--model", model]
-        argv += ["--skip-git-repo-check", "resume", thread_id, text]
+        # `--` so a prompt starting with `-` is a prompt and not a flag: without
+        # it the CLI parses `--help` (or any typo) as an option and the turn
+        # never runs.
+        argv += ["--skip-git-repo-check", "resume", thread_id, "--", check_prompt(text)]
 
+        process = self._spawn(argv, cwd, log_path)
+        return DetachedRun(
+            thread_id=thread_id,
+            instance=self.instance.slug,
+            cwd=cwd,
+            log_path=log_path,
+            process=process,
+            unarchived=unarchived,
+        )
+
+    def start(
+        self,
+        text: str,
+        cwd: Path,
+        sandbox: str = DEFAULT_SANDBOX,
+        approval: str = DEFAULT_APPROVAL,
+        model: str | None = None,
+        wait_for_id: float = THREAD_ID_WAIT,
+    ) -> DetachedRun:
+        """Create a brand-new thread and run its first turn in `cwd`.
+
+        There is no IPC method for this -- the app's follower surface can only
+        drive threads that already exist -- so a new thread has to come from the
+        CLI. Spawning it detached rather than waiting on it is the whole point:
+        the call returns as soon as the thread has an id, while the agent keeps
+        working.
+
+        `cwd` is required and passed as `--cd`. A new thread otherwise inherits
+        whatever directory the caller happened to be in, which is how work ends
+        up in the wrong repo or outside the worktree it was meant for.
+        """
+        check_sandbox(sandbox)
+        check_approval(approval)
+        check_prompt(text)
+        cwd = cwd.expanduser().resolve()
+        if not cwd.is_dir():
+            raise DetachedError(
+                f"cwd {str(cwd)!r} is not a directory -- create the worktree or "
+                "directory first, then start the thread in it"
+            )
+
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self.log_dir / f"new-{uuid.uuid4().hex[:8]}.log"
+
+        argv = [
+            str(self.codex_binary),
+            "exec",
+            # JSONL on stdout is the only way to learn the id of the thread the
+            # CLI just created; without it the thread is unreachable afterwards.
+            "--json",
+            "--sandbox",
+            check_sandbox(sandbox),
+            "-c",
+            f"approval_policy={check_approval(approval)}",
+        ]
+        if model is not None:
+            argv += ["--model", model]
+        argv += ["--cd", str(cwd), "--skip-git-repo-check", "--", check_prompt(text)]
+
+        process = self._spawn(argv, cwd, log_path)
+        return DetachedRun(
+            thread_id=self._await_thread_id(log_path, process, wait_for_id),
+            instance=self.instance.slug,
+            cwd=cwd,
+            log_path=log_path,
+            process=process,
+        )
+
+    def _spawn(self, argv: list[str], cwd: Path, log_path: Path) -> subprocess.Popen[bytes]:
         log = log_path.open("wb")
         try:
             process = subprocess.Popen(
@@ -196,15 +352,29 @@ class DetachedRunner:
             # copy still lets the log fill. Relying on refcounting to do it
             # emits a ResourceWarning and would genuinely leak elsewhere.
             log.close()
+        return process
 
-        return DetachedRun(
-            thread_id=thread_id,
-            instance=self.instance.slug,
-            cwd=cwd,
-            log_path=log_path,
-            process=process,
-            unarchived=unarchived,
-        )
+    @staticmethod
+    def _await_thread_id(
+        log_path: Path, process: subprocess.Popen[bytes], timeout: float
+    ) -> str | None:
+        """Poll the log for the `thread.started` event, briefly.
+
+        Returns None rather than raising when it does not arrive: the run is
+        already spawned, so the caller still needs its pid and log path to find
+        out what went wrong.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            found = scan_for_thread_id(log_path)
+            if found is not None:
+                return found
+            if process.poll() is not None:
+                # Exited: stdout went straight to the fd, so nothing more is coming.
+                return scan_for_thread_id(log_path)
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(ID_POLL_INTERVAL)
 
     def wait_for_completion(self, run: DetachedRun, timeout: float = 300.0) -> int | None:
         deadline = time.monotonic() + timeout

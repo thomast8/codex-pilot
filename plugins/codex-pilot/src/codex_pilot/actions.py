@@ -17,24 +17,37 @@ directly means we never rely on the router's broadcast fallback picking right.
 from __future__ import annotations
 
 import contextlib
+import os
 import queue
+import signal
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from . import payloads
-from .follow import FollowManager, SeqCounter
+from .follow import EVENT_RUN_FAILED, EVENT_TURN_COMPLETED, FollowManager, SeqCounter
 from .instances import Instance, discover_instances
 from .ipc import IpcClient, IpcError, IpcUnavailable, RouterError
-from .resume import DetachedRunner
+from .resume import DetachedRun, DetachedRunner, scan_for_thread_id
 from .threads import AmbiguousThreadError, ThreadInfo, ThreadStore, UnknownThreadError
 
 OWNER_DISCOVERY = "thread-owner-discovery"
 FOLLOWING_CHANGED = "thread-stream-following-changed"
 STREAM_STATE_CHANGED = "thread-stream-state-changed"
 SNAPSHOT_WAIT_SECONDS = 3.0
+# Finished runs stay listed so threads we started remain visible; the cap
+# keeps a long orchestration session from growing the map without end.
+MAX_TRACKED_RUNS = 200
+
+# Route values. `detached_running` is the state that did not exist before
+# start_thread: a lock held by one of our own children, so neither route
+# works until it exits.
+ROUTE_DESKTOP = "desktop"
+ROUTE_DETACHED = "detached"
+ROUTE_RUNNING = "detached_running"
 
 
 class ActionError(Exception):
@@ -87,6 +100,13 @@ class Session:
         self._clients: dict[str, IpcClient] = {}
         self._stores: dict[str, ThreadStore] = {}
         self._runners: dict[str, DetachedRunner] = {}
+        # Runs we spawned ourselves. Needed for two things nothing else can
+        # tell us: that a lock holder is our own CLI rather than the app, and
+        # that a thread we created still exists once it goes idle and drops
+        # out of the lock listing.
+        self._runs: dict[str, DetachedRun] = {}
+        # Spawned, but their thread id had not appeared yet.
+        self._untracked: list[DetachedRun] = []
         self._follow: dict[str, FollowManager] = {}
         self._pumps: dict[str, threading.Thread] = {}
         self._connecting: dict[str, threading.Lock] = {}
@@ -134,6 +154,10 @@ class Session:
                 """
                 manager = self.follow_manager(instance)
                 while not self._stop.is_set():
+                    # First, and before anything that needs the app: a detached
+                    # run finishing is news even when Codex Desktop is not running.
+                    self._adopt_late_ids(instance)
+                    self._reap_runs(instance)
                     try:
                         # Reconnects are noticed inside client(), which queues
                         # the re-subscribe this loop then broadcasts.
@@ -141,7 +165,9 @@ class Session:
                     except IpcError:
                         for thread_id in manager.followed:
                             manager.lost(thread_id, "Codex Desktop is not reachable")
-                        self._stop.wait(5.0)
+                        # Detached runs do not need the app, so keep checking on
+                        # them promptly even while it is unreachable.
+                        self._stop.wait(0.5 if self._has_pending_runs(instance) else 5.0)
                         continue
                     try:
                         pending = manager.take_resync_requests()
@@ -177,6 +203,62 @@ class Session:
             )
             self._pumps[instance.slug] = thread
             thread.start()
+
+    def _has_pending_runs(self, instance: Instance) -> bool:
+        with self._guard:
+            return any(r.instance == instance.slug and not r.reported for r in self._runs.values())
+
+    def _adopt_late_ids(self, instance: Instance) -> None:
+        """Pick up a thread id that landed after start_thread stopped waiting.
+
+        Otherwise a slow start leaves the run untracked for good: its lock is
+        read as the app's, no completion is ever reported, and the child is
+        never reaped.
+        """
+        with self._guard:
+            pending = [
+                r for r in self._untracked if r.instance == instance.slug and r.thread_id is None
+            ]
+        for run in pending:
+            found = scan_for_thread_id(run.log_path)
+            if found is None:
+                if not run.running:
+                    with self._guard:
+                        if run in self._untracked:
+                            self._untracked.remove(run)
+                continue
+            run.thread_id = found
+            with self._guard:
+                if run in self._untracked:
+                    self._untracked.remove(run)
+            self._register_run(run)
+
+    def _reap_runs(self, instance: Instance) -> None:
+        """Turn each finished detached run into a `turn_completed`, once.
+
+        Polling the child is also what reaps it, so this doubles as the reaper.
+        """
+        finished: list[tuple[str, DetachedRun]] = []
+        with self._guard:
+            for thread_id, run in self._runs.items():
+                if run.instance != instance.slug or run.reported or run.running:
+                    continue
+                run.reported = True
+                finished.append((thread_id, run))
+        manager = self.follow_manager(instance)
+        for thread_id, run in finished:
+            code = run.returncode
+            manager.emit_external(
+                thread_id,
+                EVENT_TURN_COMPLETED if code == 0 else EVENT_RUN_FAILED,
+                {
+                    "route": "detached",
+                    "returncode": code,
+                    "pid": run.pid,
+                    "log_path": str(run.log_path),
+                    "stopped": run.stopped,
+                },
+            )
 
     def follow_thread(
         self, ref: str, follow: bool = True, instance: str | None = None
@@ -413,6 +495,7 @@ class Session:
         navigates, and it takes effect in a couple of seconds.
         """
         resolved = self.resolve(ref, instance)
+        self._refuse_if_ours(resolved)
         url = f"codex://threads/{resolved.thread_id}"
         subprocess.run(["open", url], check=False, capture_output=True)
         return {
@@ -425,14 +508,133 @@ class Session:
 
     # -- mutating verbs -----------------------------------------------------
 
+    def _refuse_if_ours(self, resolved: ResolvedThread) -> None:
+        """Stop before any verb that assumes the app holds the lock.
+
+        `app_owned` only means *someone* holds the writer lock, and since
+        start_thread that someone can be one of our own `codex exec` children.
+        Without this check `owner_of` reports no-client-found, the caller is
+        told the app has the thread open without showing it, and the suggested
+        remedy -- focus_thread -- asks Codex Desktop to open a thread our own
+        writer is still holding. That is the two-writer case the lock exists to
+        prevent, reached by following our own error message.
+        """
+        own = self.live_run(resolved.thread_id)
+        if own is None:
+            return
+        raise ActionError(
+            f"a detached run codex-pilot started (pid {own.pid}) still holds the writer "
+            f"lock on {resolved.thread_id}, so it cannot be driven through the app. "
+            f"Wait for it (collect_events reports turn_completed when it exits), read "
+            f"{own.log_path}, or stop_turn to terminate it. Do not focus it in the app "
+            "while it is running -- that would put a second writer on the rollout."
+        )
+
     def _follower_request(
         self, resolved: ResolvedThread, method: str, params: dict[str, Any]
     ) -> dict[str, Any]:
+        self._refuse_if_ours(resolved)
         owner = self.owner_of(resolved)
         client = self.client(resolved.instance)
         response = client.request(method, params, target_client_id=owner)
         result = response.get("result")
         return result if isinstance(result, dict) else {}
+
+    def instance_for(self, slug: str | None) -> Instance:
+        """Pick an instance by slug, defaulting to the primary one."""
+        if slug is None:
+            # discover_instances() sorts the default first.
+            return self._instances[0]
+        for inst in self._instances:
+            if inst.slug == slug:
+                return inst
+        known = ", ".join(i.slug for i in self._instances)
+        raise UnknownThreadError(f"no instance named {slug!r}; known: {known}")
+
+    def _register_run(self, run: DetachedRun) -> None:
+        """Track a run we spawned, replacing any earlier one for that thread.
+
+        Replacing matters: a finished run left in place shadows a newer live one
+        on the same thread, so an orchestrator reading `running` would conclude
+        the work was done while a different process was still writing.
+
+        Finished runs are kept on purpose -- they are how a thread we started
+        stays listed once it drops its lock -- but only up to a bound, or a long
+        orchestration session grows this map forever.
+        """
+        if run.thread_id is None:
+            # Keep it in sight: the id may still show up in the log, and an
+            # unwatched child is one nothing will ever reap or report.
+            with self._guard:
+                self._untracked.append(run)
+            inst = next((i for i in self._instances if i.slug == run.instance), None)
+            if inst is not None:
+                self._ensure_pump(inst)
+            return
+        with self._guard:
+            self._runs.pop(run.thread_id, None)
+            self._runs[run.thread_id] = run
+            if len(self._runs) > MAX_TRACKED_RUNS:
+                finished = [t for t, r in self._runs.items() if not r.running]
+                for thread_id in finished[: len(self._runs) - MAX_TRACKED_RUNS]:
+                    del self._runs[thread_id]
+        # The pump is what notices this run finishing and reports it, so a
+        # detached spawn has to start it -- a caller may never call follow_thread.
+        inst = next((i for i in self._instances if i.slug == run.instance), None)
+        if inst is not None:
+            self._ensure_pump(inst)
+
+    def live_run(self, thread_id: str) -> DetachedRun | None:
+        """Our own detached run on this thread, if one is still going."""
+        with self._guard:
+            run = self._runs.get(thread_id)
+        return run if run is not None and run.running else None
+
+    def route_for(self, info: ThreadInfo) -> str:
+        """Which route this thread can be driven by right now.
+
+        Three states, not two. A lock holder is not necessarily the app: while
+        one of our own detached runs is going it holds the lock too. Calling
+        that 'desktop' would send callers to an IPC route that cannot work, and
+        calling it 'detached' would promise it is free to resume when it is
+        not -- so it gets its own value.
+        """
+        if self.live_run(info.thread_id) is not None:
+            return ROUTE_RUNNING
+        return ROUTE_DESKTOP if info.app_owned else ROUTE_DETACHED
+
+    def start_thread(
+        self,
+        text: str,
+        cwd: str,
+        instance: str | None = None,
+        sandbox: str | None = None,
+        approval: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a new thread in a directory you name, and start its first turn.
+
+        Returns as soon as the thread has an id; the agent keeps working in the
+        background. `cwd` is required because that is the whole failure this
+        exists to prevent -- a thread started from wherever the caller happened
+        to be, rather than in the worktree the work belongs to.
+        """
+        inst = self.instance_for(instance)
+        run = self.runner(inst).start(
+            text,
+            cwd=Path(cwd).expanduser(),
+            sandbox=sandbox or "workspace-write",
+            approval=approval or "never",
+            model=model,
+        )
+        out = run.as_dict()
+        self._register_run(run)
+        if run.thread_id is None:
+            out["note"] = (
+                "the run started but reported no thread id in time -- read log_path "
+                "to see what happened; the thread may not have been created"
+            )
+        return out
 
     def send_message(
         self,
@@ -450,6 +652,7 @@ class Session:
         that is drift, and running detached would collide with a held lock.
         """
         resolved = self.resolve(ref, instance)
+        self._refuse_if_ours(resolved)
         if resolved.info.app_owned:
             result = self._follower_request(
                 resolved,
@@ -470,6 +673,10 @@ class Session:
             sandbox=sandbox or "workspace-write",
             approval=approval or "never",
         )
+        # Registered for the same reason start_thread's is: while this runs, it
+        # and not the app holds the writer lock, and every other verb needs to
+        # know that.
+        self._register_run(run)
         out = run.as_dict()
         out["name"] = resolved.name
         return out
@@ -501,6 +708,13 @@ class Session:
         the only real signal.
         """
         resolved = self.resolve(ref, instance)
+        own = self.live_run(resolved.thread_id)
+        if own is not None:
+            # The only way to stop a detached run: it is not in the app, so
+            # there is no turn to interrupt over IPC. Without this, a thread
+            # start_thread launched -- autonomous, and by default unattended --
+            # could not be stopped from here at all.
+            return self._stop_detached(resolved, own)
         params = payloads.interrupt_turn(resolved.thread_id, expected_turn_id=expected_turn_id)
         result = self._follower_request(resolved, "thread-follower-interrupt-turn", params)
         interrupted = result.get("interruptedTurnId")
@@ -512,6 +726,38 @@ class Session:
             "expected_turn_id": expected_turn_id,
             "interrupted_turn_id": interrupted,
             "goal_pause_error": result.get("goalPauseError"),
+        }
+
+    def _stop_detached(self, resolved: ResolvedThread, run: DetachedRun) -> dict[str, Any]:
+        """Terminate one of our own detached runs, and its whole process group.
+
+        The group, not just the pid: the run is spawned with
+        `start_new_session=True`, so the agent's own children (a build, a test
+        run) are in that group and would otherwise outlive it holding the lock.
+        """
+        stopped = True
+        run.stopped = True
+        try:
+            os.killpg(run.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            stopped = False  # already gone; the pump will report it
+        except OSError as exc:
+            raise ActionError(f"could not stop pid {run.pid}: {exc}") from exc
+        else:
+            try:
+                run.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    os.killpg(run.pid, signal.SIGKILL)
+        return {
+            "instance": resolved.instance.slug,
+            "thread": resolved.thread_id,
+            "name": resolved.name,
+            "route": "detached",
+            "stopped": stopped,
+            "pid": run.pid,
+            "returncode": run.returncode,
+            "log_path": str(run.log_path),
         }
 
     def respond(
@@ -626,21 +872,67 @@ class Session:
             if not already_following:
                 client.broadcast(FOLLOWING_CHANGED, payloads.follow(resolved.thread_id, False))
 
+    def thread_row(self, inst: Instance, info: ThreadInfo) -> dict[str, Any]:
+        """One thread as the MCP surface reports it.
+
+        `rollout` is included because it is the only way to read what a thread
+        actually said: a finished turn on an app-owned thread has no result
+        anywhere else, and without it callers fall back to shelling out.
+        """
+        row: dict[str, Any] = {
+            "instance": inst.slug,
+            "thread": info.thread_id,
+            "name": info.name,
+            "cwd": info.cwd,
+            "route": self.route_for(info),
+            "age_seconds": info.age_seconds,
+            "turn_id": info.turn_id,
+            "rollout": str(info.rollout) if info.rollout is not None else None,
+        }
+        row.update(self.own_run_fields(info.thread_id))
+        return row
+
+    def own_run_fields(self, thread_id: str) -> dict[str, Any]:
+        """How a run of ours is described, in one place.
+
+        thread_status and list_threads both need it; two hand-rolled copies had
+        already drifted apart.
+        """
+        with self._guard:
+            run = self._runs.get(thread_id)
+        if run is None:
+            return {}
+        return {
+            "started_here": True,
+            "running": run.running,
+            "pid": run.pid,
+            "log_path": str(run.log_path),
+            "returncode": run.returncode,
+        }
+
     def list_threads(self, instance: str | None = None) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for inst in self._instances:
             if instance is not None and inst.slug != instance:
                 continue
-            for info in self.store(inst).list_open():
-                out.append(
-                    {
-                        "instance": inst.slug,
-                        "thread": info.thread_id,
-                        "name": info.name,
-                        "cwd": info.cwd,
-                        "route": "desktop" if info.app_owned else "detached",
-                        "age_seconds": info.age_seconds,
-                        "turn_id": info.turn_id,
-                    }
-                )
+            store = self.store(inst)
+            held = store.lock_holders()
+            seen: set[str] = set()
+            # Same one lsof sweep feeds both loops, and the same newest-activity
+            # ordering list_open() used.
+            lock_held = sorted(
+                store.describe_many(held),
+                key=lambda i: (i.age_seconds is None, i.age_seconds or 0.0),
+            )
+            for info in lock_held:
+                seen.add(info.thread_id)
+                out.append(self.thread_row(inst, info))
+            # Threads we started hold no lock once idle, so nothing else would
+            # list them -- and an orchestrator needs to see the work it launched.
+            with self._guard:
+                ours = [tid for tid, run in self._runs.items() if run.instance == inst.slug]
+            for thread_id in ours:
+                if thread_id in seen:
+                    continue
+                out.append(self.thread_row(inst, store.describe(thread_id, holders=held)))
         return out

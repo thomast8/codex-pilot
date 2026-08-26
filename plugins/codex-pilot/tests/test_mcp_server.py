@@ -24,6 +24,7 @@ EXPECTED_TOOLS = {
     "list_threads",
     "thread_status",
     "send_message",
+    "start_thread",
     "steer_turn",
     "stop_turn",
     "respond",

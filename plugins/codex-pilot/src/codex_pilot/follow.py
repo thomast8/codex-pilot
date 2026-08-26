@@ -58,6 +58,10 @@ EVENT_REQUEST_PENDING = "request_pending"
 EVENT_REQUEST_RESOLVED = "request_resolved"
 EVENT_RESYNC = "resync"
 EVENT_FOLLOW_LOST = "follow_lost"
+# A detached run has no stream to follow, so its completion is reported by
+# watching the process instead. Same event name as a streamed turn ending,
+# so one wait loop covers both routes.
+EVENT_RUN_FAILED = "run_failed"
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,10 @@ class FollowedThread:
     awaiting_snapshot: bool = False
     lost_reason: str | None = None
     collected_dropped: int = 0
+    # True for a thread we only report *about* (a detached run) rather than
+    # subscribe to. It buffers events but is not a live follow, so it must
+    # not be resynced, marked lost, or counted as followed.
+    external: bool = False
 
     @property
     def projected(self) -> ThreadState | None:
@@ -136,11 +144,12 @@ class FollowManager:
     @property
     def followed(self) -> list[str]:
         with self._lock:
-            return sorted(self._threads)
+            return sorted(t for t, v in self._threads.items() if not v.external)
 
     def is_following(self, thread_id: str) -> bool:
         with self._lock:
-            return thread_id in self._threads
+            tracked = self._threads.get(thread_id)
+            return tracked is not None and not tracked.external
 
     def state_of(self, thread_id: str) -> ThreadState | None:
         with self._lock:
@@ -275,6 +284,23 @@ class FollowManager:
             self._emit(tracked, EVENT_FOLLOW_LOST, {"reason": reason})
             self._wake.notify_all()
 
+    def emit_external(self, thread_id: str, kind: str, data: dict[str, Any]) -> None:
+        """Record an event for a thread that has no stream to follow.
+
+        A detached run is invisible to the app's broadcasts -- it is not mounted
+        there -- so its completion would otherwise never reach `collect_events`,
+        and an orchestrator waiting on a fan-out would wait forever for threads
+        it started itself. Buffering it here is what lets one wait loop cover
+        both routes.
+        """
+        with self._lock:
+            tracked = self._threads.get(thread_id)
+            if tracked is None:
+                tracked = FollowedThread(instance=self.instance, thread_id=thread_id, external=True)
+                self._threads[thread_id] = tracked
+            self._emit(tracked, kind, data)
+            self._wake.notify_all()
+
     # -- event derivation ---------------------------------------------------
 
     def _emit(self, tracked: FollowedThread, kind: str, data: dict[str, Any]) -> Event:
@@ -343,7 +369,7 @@ class FollowManager:
                         "events": [e.as_dict() for e in events],
                         "cursor": events[-1].seq if events else after,
                         "dropped": dropped,
-                        "following": sorted(self._threads),
+                        "following": sorted(t for t, v in self._threads.items() if not v.external),
                     }
                 self._wake.wait(timeout=min(1.0, max(0.05, deadline - time.monotonic())))
 

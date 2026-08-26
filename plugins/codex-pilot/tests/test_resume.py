@@ -191,3 +191,205 @@ def test_env_is_inherited_apart_from_codex_home(home, tmp_path, monkeypatch):
     run.wait(timeout=15)
     assert json.loads(rec.read_text())["codex_home"] == str(home)
     assert os.environ["CODEX_HOME"] == "/somewhere/else"
+
+
+# -- creating a new thread ----------------------------------------------------
+
+
+def json_stub(tmp_path: Path, record: Path, lines: list[str], exit_code: int = 0) -> Path:
+    """A stub that records its invocation and emits `lines` on stdout as the CLI would."""
+    stub = tmp_path / "codex-json-stub"
+    emit = "\n".join(f"printf '%s\\n' '{line}'" for line in lines)
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'python3 -c "\n'
+        "import json,os,sys\n"
+        f"json.dump({{'argv': sys.argv[1:], 'cwd': os.getcwd(), "
+        f"'codex_home': os.environ.get('CODEX_HOME')}}, open('{record}','w'))\n"
+        '" "$@"\n'
+        f"{emit}\n"
+        f"exit {exit_code}\n"
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+STARTED = '{"type": "thread.started", "thread_id": "01a03f10-e3e1-7b30-9dfc-7c659c4d7434"}'
+NEW_TID = "01a03f10-e3e1-7b30-9dfc-7c659c4d7434"
+
+
+def new_runner(home: Path, tmp_path: Path, record: Path, lines: list[str]) -> DetachedRunner:
+    inst = Instance(slug="default", codex_home=home, app_path=None, is_default=True)
+    store = ThreadStore(home, lock_holder_probe=lambda paths: {})
+    return DetachedRunner(inst, store, codex_binary=json_stub(tmp_path, record, lines))
+
+
+def test_start_reports_the_new_thread_id(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    run = new_runner(home, tmp_path, rec, [STARTED]).start("build it", cwd=work)
+    run.wait(timeout=15)
+    # Without the id the caller cannot follow, steer or harvest the thread.
+    assert run.thread_id == NEW_TID
+
+
+def test_start_runs_in_the_directory_it_was_given(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    run = new_runner(home, tmp_path, rec, [STARTED]).start("build it", cwd=work)
+    run.wait(timeout=15)
+    argv = json.loads(rec.read_text())["argv"]
+    # The whole point: a new thread must not inherit the caller's cwd.
+    assert argv[argv.index("--cd") + 1] == str(work)
+    assert Path(json.loads(rec.read_text())["cwd"]).resolve() == work.resolve()
+
+
+def test_start_asks_for_json_so_the_id_can_be_read(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    run = new_runner(home, tmp_path, rec, [STARTED]).start("x", cwd=work)
+    run.wait(timeout=15)
+    assert "--json" in json.loads(rec.read_text())["argv"]
+
+
+def test_start_refuses_a_directory_that_does_not_exist(home, tmp_path):
+    rec = tmp_path / "rec.json"
+    r = new_runner(home, tmp_path, rec, [STARTED])
+    with pytest.raises(DetachedError, match="not a directory"):
+        r.start("x", cwd=tmp_path / "nope")
+
+
+def test_start_survives_a_run_that_never_reports_an_id(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    run = new_runner(home, tmp_path, rec, ["boom: could not start"]).start(
+        "x", cwd=work, wait_for_id=2.0
+    )
+    run.wait(timeout=15)
+    # A failed start must still hand back the log rather than raising blind.
+    assert run.thread_id is None
+    assert run.log_path.exists()
+
+
+def test_start_skips_non_json_preamble_on_stdout(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    lines = ["Reading additional input from stdin...", STARTED]
+    run = new_runner(home, tmp_path, rec, lines).start("x", cwd=work)
+    run.wait(timeout=15)
+    # The real CLI prints a human line before the JSONL stream.
+    assert run.thread_id == NEW_TID
+
+
+def test_start_passes_model_through(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    run = new_runner(home, tmp_path, rec, [STARTED]).start("x", cwd=work, model="gpt-5.4-codex")
+    run.wait(timeout=15)
+    argv = json.loads(rec.read_text())["argv"]
+    assert argv[argv.index("--model") + 1] == "gpt-5.4-codex"
+
+
+def test_start_ignores_a_decoy_id_on_an_earlier_event(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    # A real `codex exec --json` stream carries ids on later events too, so
+    # matching "first JSON object with a thread_id" would take the wrong one.
+    decoy = '{"type": "turn.started", "thread_id": "00000000-dead-beef-0000-000000000000"}'
+    run = new_runner(home, tmp_path, rec, [decoy, STARTED]).start("x", cwd=work)
+    run.wait(timeout=15)
+    assert run.thread_id == NEW_TID
+
+
+def test_start_gives_up_on_a_run_that_hangs_without_reporting(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    # Still alive and silent: the deadline is the only thing that ends this,
+    # unlike a stub that exits and returns via the process-exited branch.
+    runner_ = new_runner(home, tmp_path, rec, ["still working..."])
+    stub = runner_.codex_binary
+    stub.write_text(stub.read_text().replace("exit 0", "sleep 30\nexit 0"))
+    run = runner_.start("x", cwd=work, wait_for_id=0.3)
+    try:
+        assert run.thread_id is None
+        assert run.running is True
+    finally:
+        run.process.terminate()
+        run.wait(timeout=15)
+
+
+def test_start_puts_the_prompt_after_a_double_dash(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    run = new_runner(home, tmp_path, rec, [STARTED]).start("--help", cwd=work)
+    run.wait(timeout=15)
+    argv = json.loads(rec.read_text())["argv"]
+    # Without `--` the CLI parses a leading-dash prompt as a flag and the turn
+    # never runs.
+    assert argv[-2:] == ["--", "--help"]
+
+
+def test_resume_also_puts_the_prompt_after_a_double_dash(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    write_rollout(home, work)
+    rec = tmp_path / "rec.json"
+    run = runner(home, tmp_path, rec).run(TID, "--version")
+    run.wait(timeout=15)
+    argv = json.loads(rec.read_text())["argv"]
+    assert argv[-3:] == [TID, "--", "--version"]
+
+
+def test_a_bare_dash_prompt_is_refused(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    r = new_runner(home, tmp_path, tmp_path / "rec.json", [STARTED])
+    # `-` means "read the prompt from stdin", and stdin is DEVNULL here, so it
+    # would start a thread with no prompt at all.
+    with pytest.raises(DetachedError, match="stdin"):
+        r.start("-", cwd=work)
+
+
+def test_sandbox_and_approval_reach_the_cli_as_given(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    run = new_runner(home, tmp_path, rec, [STARTED]).start(
+        "x", cwd=work, sandbox="read-only", approval="on-request"
+    )
+    run.wait(timeout=15)
+    argv = json.loads(rec.read_text())["argv"]
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert "approval_policy=on-request" in argv
+
+
+def test_an_unknown_sandbox_is_refused_before_spawning(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    r = new_runner(home, tmp_path, tmp_path / "rec.json", [STARTED])
+    with pytest.raises(DetachedError, match="sandbox must be one of"):
+        r.start("x", cwd=work, sandbox="workspace-write --dangerously-bypass-approvals-and-sandbox")
+
+
+def test_full_access_needs_an_explicit_env_opt_in(home, tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    r = new_runner(home, tmp_path, rec, [STARTED])
+    monkeypatch.delenv("CODEX_PILOT_ALLOW_FULL_ACCESS", raising=False)
+    with pytest.raises(DetachedError, match="danger-full-access"):
+        r.start("x", cwd=work, sandbox="danger-full-access")
+    monkeypatch.setenv("CODEX_PILOT_ALLOW_FULL_ACCESS", "1")
+    run = r.start("x", cwd=work, sandbox="danger-full-access")
+    run.wait(timeout=15)
+    argv = json.loads(rec.read_text())["argv"]
+    assert argv[argv.index("--sandbox") + 1] == "danger-full-access"
