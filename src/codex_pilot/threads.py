@@ -30,6 +30,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 CWD_RE = re.compile(r'"cwd"\s*:\s*"([^"]+)"')
@@ -227,7 +228,7 @@ class ThreadStore:
         return None
 
     @staticmethod
-    def _read_tail(path: Path) -> dict:
+    def _read_tail(path: Path) -> dict[str, Any]:
         """Last parseable record. Rollouts reach tens of MB, so read the tail."""
         try:
             with path.open("rb") as fh:
@@ -239,9 +240,11 @@ class ThreadStore:
             return {}
         for raw in reversed(lines):
             try:
-                return json.loads(raw)
+                record = json.loads(raw)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
+            if isinstance(record, dict):
+                return record
         return {}
 
     # -- description --------------------------------------------------------
