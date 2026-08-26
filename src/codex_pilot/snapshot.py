@@ -113,6 +113,10 @@ def parse_pending(requests: list[Any]) -> list[PendingRequest]:
     return out
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def _turn_id_from_pending(pending: list[PendingRequest]) -> str | None:
     for req in pending:
         raw = req.params.get("turnId")
@@ -129,7 +133,7 @@ def _active_turn_id(state: dict[str, Any]) -> str | None:
     optimistically and has no id for yet. An in-progress turn can legitimately
     have no id, so a null here means "not yet assigned", not "no turn".
     """
-    history = (state.get("turnHistory") or {}).get("history") or {}
+    history = _as_dict(_as_dict(state.get("turnHistory")).get("history"))
     entities = history.get("entitiesByKey")
     if not isinstance(entities, dict):
         return None
@@ -158,25 +162,29 @@ def project(frame: dict[str, Any] | None) -> ThreadState | None:
     if not isinstance(state, dict):
         return None
 
-    settings = state.get("latestThreadSettings") or {}
-    permissions = state.get("currentPermissions") or {}
-    runtime = (state.get("threadRuntimeStatus") or {}).get("type")
+    # Every sub-object is checked rather than assumed: a patch can replace any
+    # key with any value, and an AttributeError here would kill the reader.
+    settings = _as_dict(state.get("latestThreadSettings"))
+    permissions = _as_dict(state.get("currentPermissions"))
+    runtime = _as_dict(state.get("threadRuntimeStatus")).get("type")
     pending = parse_pending(state.get("requests") or [])
 
     turn_id = _active_turn_id(state) or _turn_id_from_pending(pending)
 
     return ThreadState(
-        runtime=runtime,
+        runtime=runtime if isinstance(runtime, str) else None,
         turn_id=turn_id,
         pending=pending,
         revision=change.get("revision"),
         cwd=state.get("cwd"),
         model=settings.get("model"),
         effort=settings.get("effort"),
-        collaboration_mode=(settings.get("collaborationMode") or {}).get("mode"),
+        collaboration_mode=_as_dict(settings.get("collaborationMode")).get("mode"),
         service_tier=settings.get("serviceTier"),
         approvals_reviewer=permissions.get("approvalsReviewer"),
-        goal=state.get("threadGoal") or state.get("completedThreadGoal"),
+        goal=_as_dict(state.get("threadGoal"))
+        or _as_dict(state.get("completedThreadGoal"))
+        or None,
     )
 
 
@@ -201,11 +209,22 @@ def apply_patches(state: dict[str, Any], patches: list[dict[str, Any]]) -> dict[
         if not isinstance(path, list) or not path:
             raise PatchError(f"patch has no usable path: {patch!r}")
         target: Any = updated
-        for key in path[:-1]:
+        for index, key in enumerate(path[:-1]):
             if isinstance(target, dict):
-                target = target.setdefault(key, {})
-            elif isinstance(target, list) and isinstance(key, int):
+                if key not in target:
+                    if op != "add":
+                        # Only `add` may create a path. Fabricating one for a
+                        # replace or remove invents keys the app never sent, and
+                        # our state diverges from the app's with nothing to
+                        # notice it.
+                        raise PatchError(f"{op} at {path}: no key {key!r} at depth {index}")
+                    target[key] = {}
                 target = target[key]
+            elif isinstance(target, list) and isinstance(key, int):
+                try:
+                    target = target[key]
+                except IndexError as exc:
+                    raise PatchError(f"{op} at {path}: index {key} out of range") from exc
             else:
                 raise PatchError(f"cannot walk {path} at {key!r}")
         leaf = path[-1]
@@ -223,6 +242,12 @@ def apply_patches(state: dict[str, Any], patches: list[dict[str, Any]]) -> dict[
                     target.pop(leaf, None)
                 elif isinstance(target, list) and isinstance(leaf, int):
                     del target[leaf]
+                else:
+                    # Silently succeeding here would let our state drift from
+                    # the app's with no resync to correct it.
+                    raise PatchError(
+                        f"remove at {path}: cannot address {leaf!r} on {type(target).__name__}"
+                    )
             else:
                 raise PatchError(f"unknown patch op {op!r}")
         except (KeyError, IndexError, TypeError) as exc:

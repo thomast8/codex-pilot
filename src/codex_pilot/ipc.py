@@ -82,6 +82,8 @@ class IpcClient:
         self._sent: list[dict[str, Any]] = []
         self._sent_event = threading.Condition()
         self._reader = FrameReader()
+        self._listeners: list[Callable[[dict[str, Any]], None]] = []
+        self.dropped_broadcasts = 0
         self._closed = threading.Event()
         self._fatal: BaseException | None = None
         self.client_id: str | None = None
@@ -112,31 +114,52 @@ class IpcClient:
 
     def close(self) -> None:
         self._closed.set()
+        # Shut the socket down before closing it: closing an fd another thread
+        # is blocked in recv() on does not reliably wake it on macOS.
+        with contextlib.suppress(OSError):
+            self._sock.shutdown(socket.SHUT_RDWR)
         with contextlib.suppress(OSError):
             self._sock.close()
 
     # -- read pump ----------------------------------------------------------
 
-    def _read_loop(self) -> None:
-        while not self._closed.is_set():
-            try:
-                chunk = self._sock.recv(65536)
-            except OSError:
-                break
-            if not chunk:
-                break
-            try:
-                for msg in self._reader.feed(chunk):
-                    self._dispatch(msg)
-            except FrameError as exc:
-                self._fatal = exc
-                break
-        self._closed.set()
-        # Unblock anyone waiting on a response.
+    def add_broadcast_listener(self, listener: Callable[[dict[str, Any]], None]) -> None:
+        """Register a consumer that sees every broadcast.
+
+        Listeners exist because a single shared queue makes consumers compete:
+        whoever polls first takes the frame and everyone else never sees it. A
+        persistent follow and a one-off status read need the same frames.
+        """
         with self._lock:
-            waiters = list(self._pending.values())
-        for w in waiters:
-            w.put({"__disconnected__": True})
+            self._listeners.append(listener)
+
+    def _read_loop(self) -> None:
+        try:
+            while not self._closed.is_set():
+                try:
+                    chunk = self._sock.recv(65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                try:
+                    for msg in self._reader.feed(chunk):
+                        self._dispatch(msg)
+                except FrameError as exc:
+                    self._fatal = exc
+                    break
+                except Exception as exc:  # noqa: BLE001 - the pump must not die silently
+                    self._fatal = exc
+                    break
+        finally:
+            # Whatever happened, the connection is finished: mark it closed and
+            # release every waiter, or callers keep using a dead client and each
+            # request burns its full timeout.
+            self._closed.set()
+            with self._lock:
+                waiters = list(self._pending.values())
+            for w in waiters:
+                w.put({"__disconnected__": True})
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
         kind = msg.get("type")
@@ -158,6 +181,11 @@ class IpcClient:
             )
             return
         if kind == "broadcast":
+            with self._lock:
+                listeners = list(self._listeners)
+            for listener in listeners:
+                with contextlib.suppress(Exception):  # one bad listener must not kill the pump
+                    listener(msg)
             try:
                 self._broadcasts.put_nowait(msg)
             except queue.Full:
@@ -165,6 +193,7 @@ class IpcClient:
                 try:
                     self._broadcasts.get_nowait()
                     self._broadcasts.put_nowait(msg)
+                    self.dropped_broadcasts += 1
                 except queue.Empty:
                     pass
 

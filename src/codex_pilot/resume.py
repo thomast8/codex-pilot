@@ -190,8 +190,12 @@ class DetachedRunner:
                 start_new_session=True,
             )
         except OSError as exc:
-            log.close()
             raise DetachedError(f"could not start {self.codex_binary}: {exc}") from exc
+        finally:
+            # The child holds its own dup of this fd, so closing the parent's
+            # copy still lets the log fill. Relying on refcounting to do it
+            # emits a ResourceWarning and would genuinely leak elsewhere.
+            log.close()
 
         return DetachedRun(
             thread_id=thread_id,

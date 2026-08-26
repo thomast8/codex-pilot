@@ -16,13 +16,16 @@ directly means we never rely on the router's broadcast fallback picking right.
 
 from __future__ import annotations
 
+import contextlib
+import queue
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
 from . import payloads
-from .follow import FollowManager
+from .follow import FollowManager, SeqCounter
 from .instances import Instance, discover_instances
 from .ipc import IpcClient, IpcError, IpcUnavailable, RouterError
 from .resume import DetachedRunner
@@ -87,20 +90,25 @@ class Session:
         self._follow: dict[str, FollowManager] = {}
         self._pumps: dict[str, threading.Thread] = {}
         self._stop = threading.Event()
+        self._seq = SeqCounter()
+        self._guard = threading.RLock()
+        self._snapshot_waiters: dict[str, list[queue.Queue[dict[str, Any]]]] = {}
 
     @property
     def instances(self) -> list[Instance]:
         return self._instances
 
     def store(self, instance: Instance) -> ThreadStore:
-        if instance.slug not in self._stores:
-            self._stores[instance.slug] = ThreadStore(instance.codex_home)
-        return self._stores[instance.slug]
+        with self._guard:
+            if instance.slug not in self._stores:
+                self._stores[instance.slug] = ThreadStore(instance.codex_home)
+            return self._stores[instance.slug]
 
     def follow_manager(self, instance: Instance) -> FollowManager:
-        if instance.slug not in self._follow:
-            self._follow[instance.slug] = FollowManager(instance.slug)
-        return self._follow[instance.slug]
+        with self._guard:
+            if instance.slug not in self._follow:
+                self._follow[instance.slug] = FollowManager(instance.slug, seq=self._seq)
+            return self._follow[instance.slug]
 
     def _ensure_pump(self, instance: Instance) -> None:
         """Drain this instance's broadcasts into its FollowManager.
@@ -114,6 +122,14 @@ class Session:
             return
 
         def pump() -> None:
+            """Keep the connection alive and re-request snapshots after a gap.
+
+            Frames reach the manager through the client's broadcast listener, so
+            this loop exists for the two things a listener cannot do: notice the
+            connection died, and re-subscribe a thread whose stream desynced. A
+            gap is otherwise unrecoverable -- nothing would ever ask for a fresh
+            snapshot and the follow would sit silent forever.
+            """
             manager = self.follow_manager(instance)
             while not self._stop.is_set():
                 try:
@@ -123,15 +139,25 @@ class Session:
                         manager.lost(thread_id, "Codex Desktop is not reachable")
                     self._stop.wait(5.0)
                     continue
-                frame = client.next_broadcast(timeout=1.0)
-                if frame is None:
+                try:
+                    for thread_id in manager.take_resync_requests():
+                        client.broadcast(FOLLOWING_CHANGED, payloads.follow(thread_id, True))
+                        client.broadcast(
+                            "thread-stream-following-status-requested",
+                            {"conversationId": thread_id, "hostId": "local"},
+                        )
                     if client.is_closed:
                         for thread_id in manager.followed:
                             manager.lost(thread_id, "IPC connection closed")
                         self._stop.wait(2.0)
+                        continue
+                except IpcError:
+                    self._stop.wait(2.0)
                     continue
-                if frame.get("method") == STREAM_STATE_CHANGED:
-                    manager.handle_frame(frame)
+                except Exception:  # noqa: BLE001 - a bad frame must not kill the pump
+                    self._stop.wait(1.0)
+                    continue
+                self._stop.wait(0.5)
 
         thread = threading.Thread(
             target=pump, name=f"codex-pilot-pump-{instance.slug}", daemon=True
@@ -171,54 +197,101 @@ class Session:
         wait_seconds: float = 0.0,
         instance: str | None = None,
     ) -> dict[str, Any]:
+        """Drain events across instances, waiting if asked.
+
+        Sequence numbers are shared across managers, so one cursor is meaningful
+        for all of them. Waiting is done by re-polling to a deadline rather than
+        blocking on a single manager, or a second instance's events would only
+        surface once the first happened to produce something.
+        """
+        if instance is not None and not any(i.slug == instance for i in self._instances):
+            known = ", ".join(i.slug for i in self._instances)
+            raise UnknownThreadError(f"no instance named {instance!r}; known: {known}")
+
         managers = [
             self.follow_manager(i)
             for i in self._instances
             if instance is None or i.slug == instance
         ]
-        if len(managers) == 1:
-            return managers[0].collect(threads, after=after, wait_seconds=wait_seconds)
-        merged: list[dict[str, Any]] = []
-        dropped = 0
-        following: list[str] = []
-        for manager in managers:
-            got = manager.collect(threads, after=after, wait_seconds=0.0)
-            merged.extend(got["events"])
-            dropped += got["dropped"]
-            following.extend(got["following"])
-        merged.sort(key=lambda e: e["seq"])
-        return {
-            "events": merged,
-            "cursor": merged[-1]["seq"] if merged else after,
-            "dropped": dropped,
-            "following": following,
-        }
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        while True:
+            merged: list[dict[str, Any]] = []
+            dropped = 0
+            following: list[str] = []
+            for manager in managers:
+                got = manager.collect(threads, after=after, wait_seconds=0.0)
+                merged.extend(got["events"])
+                dropped += got["dropped"]
+                following.extend(got["following"])
+            if merged or time.monotonic() >= deadline:
+                merged.sort(key=lambda e: e["seq"])
+                return {
+                    "events": merged,
+                    "cursor": merged[-1]["seq"] if merged else after,
+                    "dropped": dropped,
+                    "following": sorted(set(following)),
+                }
+            self._stop.wait(min(0.25, max(0.05, deadline - time.monotonic())))
 
     def runner(self, instance: Instance) -> DetachedRunner:
-        if instance.slug not in self._runners:
-            self._runners[instance.slug] = DetachedRunner(instance, self.store(instance))
-        return self._runners[instance.slug]
+        with self._guard:
+            if instance.slug not in self._runners:
+                self._runners[instance.slug] = DetachedRunner(instance, self.store(instance))
+            return self._runners[instance.slug]
 
     def client(self, instance: Instance) -> IpcClient:
-        existing = self._clients.get(instance.slug)
-        if existing is not None and not existing.is_closed:
-            return existing
-        socket_path = instance.socket_path()
-        if socket_path is None:
-            raise IpcUnavailable(
-                f"Codex Desktop instance {instance.slug!r} is not running "
-                f"(no socket under {instance.codex_home})"
-            )
-        client = IpcClient(socket_path=socket_path)
-        client.initialize()
-        self._clients[instance.slug] = client
-        return client
+        # Locked check-then-create: the follow pump and an MCP call can both
+        # notice a dropped connection at once, and two clients would mean two
+        # handshakes with one of them orphaned and unread.
+        with self._guard:
+            if self._stop.is_set():
+                raise IpcUnavailable("session is closed")
+            existing = self._clients.get(instance.slug)
+            if existing is not None and not existing.is_closed:
+                return existing
+            socket_path = instance.socket_path()
+            if socket_path is None:
+                raise IpcUnavailable(
+                    f"Codex Desktop instance {instance.slug!r} is not running "
+                    f"(no socket under {instance.codex_home})"
+                )
+            client = IpcClient(socket_path=socket_path)
+            client.initialize()
+            client.add_broadcast_listener(self._make_listener(instance))
+            self._clients[instance.slug] = client
+            return client
+
+    def _make_listener(self, instance: Instance) -> Any:
+        """Fan stream-state frames to the follow manager and to any waiter.
+
+        Both need the same frames. Draining a shared queue instead would let
+        whichever consumer polls first swallow events the other was waiting for.
+        """
+
+        def listener(frame: dict[str, Any]) -> None:
+            if frame.get("method") != STREAM_STATE_CHANGED:
+                return
+            thread_id = (frame.get("params") or {}).get("conversationId")
+            manager = self.follow_manager(instance)
+            if manager.is_following(str(thread_id)):
+                manager.handle_frame(frame)
+            with self._guard:
+                waiters = list(self._snapshot_waiters.get(str(thread_id), []))
+            for waiter in waiters:
+                with contextlib.suppress(queue.Full):
+                    waiter.put_nowait(frame)
+
+        return listener
 
     def close(self) -> None:
         self._stop.set()
-        for client in self._clients.values():
-            client.close()
-        self._clients.clear()
+        for pump in list(self._pumps.values()):
+            pump.join(timeout=3.0)
+        self._pumps.clear()
+        with self._guard:
+            for client in self._clients.values():
+                client.close()
+            self._clients.clear()
 
     # -- resolution ---------------------------------------------------------
 
@@ -453,29 +526,54 @@ class Session:
 
     # -- reading ------------------------------------------------------------
 
-    def snapshot(self, resolved: ResolvedThread, wait: float = SNAPSHOT_WAIT_SECONDS) -> Any:
-        """Transient follow: subscribe, take one stream-state frame, unsubscribe.
+    def thread_state(self, resolved: ResolvedThread, wait: float = SNAPSHOT_WAIT_SECONDS) -> Any:
+        """Current projected state for a thread, however it can be had.
 
-        Stream state is broadcast only to registered followers, so there is no
-        way to read it without briefly becoming one.
+        A followed thread already has state kept current by its stream, and the
+        app will not resend a snapshot just because we asked -- so read what the
+        follow holds rather than waiting for a frame that is not coming.
         """
+        manager = self.follow_manager(resolved.instance)
+        if manager.is_following(resolved.thread_id):
+            held = manager.state_of(resolved.thread_id)
+            if held is not None:
+                return held
+        from . import snapshot as projection
+
+        return projection.project(self.snapshot(resolved, wait=wait))
+
+    def snapshot(self, resolved: ResolvedThread, wait: float = SNAPSHOT_WAIT_SECONDS) -> Any:
+        """Take one stream-state frame for a thread.
+
+        Stream state only reaches registered followers, so reading it means
+        subscribing. When a persistent follow is already running we must not
+        subscribe and unsubscribe around it: the unsubscribe would deregister
+        the live follow while our bookkeeping still called it active, leaving a
+        follow that silently receives nothing.
+        """
+        manager = self.follow_manager(resolved.instance)
         client = self.client(resolved.instance)
-        client.broadcast(FOLLOWING_CHANGED, payloads.follow(resolved.thread_id, True))
+        already_following = manager.is_following(resolved.thread_id)
+
+        waiter: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=4)
+        with self._guard:
+            self._snapshot_waiters.setdefault(resolved.thread_id, []).append(waiter)
         try:
-            deadline_frames: list[Any] = []
-            while True:
-                frame = client.next_broadcast(timeout=wait)
-                if frame is None:
-                    return None
-                if frame.get("method") != STREAM_STATE_CHANGED:
-                    continue
-                params = frame.get("params") or {}
-                if params.get("conversationId") != resolved.thread_id:
-                    continue
-                deadline_frames.append(frame)
-                return frame
+            if not already_following:
+                client.broadcast(FOLLOWING_CHANGED, payloads.follow(resolved.thread_id, True))
+            try:
+                return waiter.get(timeout=wait)
+            except queue.Empty:
+                return None
         finally:
-            client.broadcast(FOLLOWING_CHANGED, payloads.follow(resolved.thread_id, False))
+            with self._guard:
+                waiters = self._snapshot_waiters.get(resolved.thread_id, [])
+                if waiter in waiters:
+                    waiters.remove(waiter)
+                if not waiters:
+                    self._snapshot_waiters.pop(resolved.thread_id, None)
+            if not already_following:
+                client.broadcast(FOLLOWING_CHANGED, payloads.follow(resolved.thread_id, False))
 
     def list_threads(self, instance: str | None = None) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []

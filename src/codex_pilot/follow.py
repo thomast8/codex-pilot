@@ -38,6 +38,20 @@ from .snapshot import PatchError, ThreadState
 
 BUFFER_SIZE = 200
 
+
+class SeqCounter:
+    """Monotonic event sequence shared across every instance's manager."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._value = 0
+
+    def next(self) -> int:
+        with self._lock:
+            self._value += 1
+            return self._value
+
+
 EVENT_TURN_STARTED = "turn_started"
 EVENT_TURN_COMPLETED = "turn_completed"
 EVENT_REQUEST_PENDING = "request_pending"
@@ -74,25 +88,38 @@ class FollowedThread:
     dropped: int = 0
     last_runtime: str | None = None
     last_requests: frozenset[Any] = frozenset()
+    awaiting_snapshot: bool = False
+    lost_reason: str | None = None
+    collected_dropped: int = 0
 
     @property
     def projected(self) -> ThreadState | None:
         if self.state is None:
             return None
         return projection.project(
-            {"params": {"change": {"type": "snapshot", "conversationState": self.state}}}
+            {
+                "params": {
+                    "change": {
+                        "type": "snapshot",
+                        "revision": self.revision,
+                        "conversationState": self.state,
+                    }
+                }
+            }
         )
 
 
 class FollowManager:
     """Tracks followed threads for one instance and derives events from them."""
 
-    def __init__(self, instance: str) -> None:
+    def __init__(self, instance: str, seq: SeqCounter | None = None) -> None:
         self.instance = instance
+        self._shared_seq = seq
         self._threads: dict[str, FollowedThread] = {}
         self._lock = threading.Lock()
         self._wake = threading.Condition(self._lock)
         self._seq = 0
+        self._resync_requests: list[str] = []
 
     # -- registration -------------------------------------------------------
 
@@ -142,16 +169,16 @@ class FollowManager:
                 if isinstance(payload, dict):
                     tracked.state = payload
                     tracked.revision = revision
+                    tracked.awaiting_snapshot = False
+                    tracked.lost_reason = None
             elif kind == "patches":
-                if tracked.state is None or (base is not None and base != tracked.revision):
-                    # A patch against a baseline we do not hold cannot be
-                    # applied; drop what we have and wait for a fresh snapshot.
-                    tracked.state = None
-                    tracked.revision = None
-                    produced.append(
-                        self._emit(
+                # A missing baseRevision is treated as a gap: without it there is
+                # no way to know the patch belongs to the state we hold.
+                mismatched = base is None or base != tracked.revision
+                if tracked.state is None or mismatched:
+                    produced.extend(
+                        self._begin_resync(
                             tracked,
-                            EVENT_RESYNC,
                             {"reason": "revision gap", "expected": base, "held": tracked.revision},
                         )
                     )
@@ -161,9 +188,7 @@ class FollowManager:
                     tracked.state = projection.apply_patches(tracked.state, payload or [])
                     tracked.revision = revision
                 except PatchError as exc:
-                    tracked.state = None
-                    tracked.revision = None
-                    produced.append(self._emit(tracked, EVENT_RESYNC, {"reason": str(exc)}))
+                    produced.extend(self._begin_resync(tracked, {"reason": str(exc)}))
                     self._wake.notify_all()
                     return produced
             else:
@@ -174,22 +199,59 @@ class FollowManager:
                 self._wake.notify_all()
             return produced
 
+    def _begin_resync(self, tracked: FollowedThread, data: dict[str, Any]) -> list[Event]:
+        """Drop the state and ask for a fresh snapshot, exactly once per gap.
+
+        `held` is captured before clearing, or the diagnostic always reads None —
+        which is precisely the value you do not want when debugging a gap. The
+        `awaiting_snapshot` flag stops a broken stream turning into resync spam
+        that evicts every real event from the buffer.
+        """
+        data = {**data, "held": tracked.revision} if "held" in data else data
+        already = tracked.awaiting_snapshot
+        tracked.state = None
+        tracked.revision = None
+        tracked.awaiting_snapshot = True
+        if already:
+            return []
+        self._resync_requests.append(tracked.thread_id)
+        return [self._emit(tracked, EVENT_RESYNC, data)]
+
+    def take_resync_requests(self) -> list[str]:
+        """Threads that need a fresh snapshot re-requested from the app.
+
+        A gap is only recoverable if somebody re-subscribes; without this the
+        follow stays wedged forever, silently reporting nothing.
+        """
+        with self._lock:
+            pending, self._resync_requests = self._resync_requests, []
+            return pending
+
     def lost(self, thread_id: str, reason: str) -> None:
         with self._lock:
             tracked = self._threads.get(thread_id)
-            if tracked is None:
+            if tracked is None or tracked.lost_reason == reason:
+                # Emit once per transition; a retry loop would otherwise evict
+                # the whole buffer with duplicates.
                 return
             tracked.state = None
             tracked.revision = None
+            tracked.lost_reason = reason
             self._emit(tracked, EVENT_FOLLOW_LOST, {"reason": reason})
             self._wake.notify_all()
 
     # -- event derivation ---------------------------------------------------
 
     def _emit(self, tracked: FollowedThread, kind: str, data: dict[str, Any]) -> Event:
-        self._seq += 1
+        # A shared counter across instances keeps one cursor meaningful; with
+        # per-manager sequences the busier instance masks the quieter one.
+        if self._shared_seq is not None:
+            seq = self._shared_seq.next()
+        else:
+            self._seq += 1
+            seq = self._seq
         event = Event(
-            seq=self._seq, instance=tracked.instance, thread=tracked.thread_id, type=kind, data=data
+            seq=seq, instance=tracked.instance, thread=tracked.thread_id, type=kind, data=data
         )
         if len(tracked.events) == tracked.events.maxlen:
             tracked.dropped += 1
@@ -257,7 +319,10 @@ class FollowManager:
         for thread_id, tracked in self._threads.items():
             if wanted is not None and thread_id not in wanted:
                 continue
-            dropped += tracked.dropped
+            # Report the drops since the caller last looked, not a lifetime
+            # total that would re-alarm on every poll forever.
+            dropped += max(0, tracked.dropped - tracked.collected_dropped)
+            tracked.collected_dropped = tracked.dropped
             events.extend(e for e in tracked.events if e.seq > after)
         events.sort(key=lambda e: e.seq)
         return events, dropped

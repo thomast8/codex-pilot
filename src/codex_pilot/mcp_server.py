@@ -29,7 +29,6 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from . import snapshot
 from .actions import ActionError, Session
 from .ipc import IpcError
 from .threads import ThreadError
@@ -104,11 +103,12 @@ def thread_status(thread: str, instance: str | None = None) -> dict[str, Any]:
             out["state"] = None
             out["note"] = "not open in the app; no live state to read"
             return out
-        state = snapshot.project(sess.snapshot(resolved))
+        state = sess.thread_state(resolved)
         if state is None:
             out["state"] = None
             out["note"] = "could not read stream state -- check the app UI"
             return out
+        out["following"] = sess.follow_manager(resolved.instance).is_following(resolved.thread_id)
         out["state"] = {
             "runtime": state.runtime,
             "busy": state.busy,
