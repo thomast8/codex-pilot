@@ -240,3 +240,35 @@ def test_update_thread_settings_rejects_unknown_service_tier():
 
 def test_compact_thread_literal_shape():
     assert payloads.compact_thread(CONV) == {"conversationId": CONV}
+
+
+# -- sandbox and permissions --------------------------------------------------
+
+
+def test_network_access_rides_on_the_sandbox_policy():
+    params = payloads.update_thread_settings(
+        CONV, {"sandboxPolicy": {"type": "workspaceWrite", "networkAccess": True}}
+    )
+    # Verified live: the same thread that could not resolve a host answered
+    # HTTP:200 on the next turn after this.
+    assert params["threadSettings"]["sandboxPolicy"]["networkAccess"] is True
+
+
+def test_permissions_as_an_object_is_refused_with_the_real_advice():
+    # The app answers this one with "invalid type: map, expected a string",
+    # which does not hint that a profile id was wanted.
+    with pytest.raises(ValueError, match="named profile id"):
+        payloads.update_thread_settings(CONV, {"permissions": {"network": {"enabled": True}}})
+
+
+def test_permissions_and_sandbox_policy_cannot_be_combined():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        payloads.update_thread_settings(
+            CONV, {"permissions": "some-profile", "sandboxPolicy": {"type": "readOnly"}}
+        )
+
+
+def test_the_cli_spelling_of_a_sandbox_mode_is_refused():
+    # `workspace-write` is the CLI's spelling; the IPC layer wants camelCase.
+    with pytest.raises(ValueError, match="camelCase"):
+        payloads.update_thread_settings(CONV, {"sandboxPolicy": {"type": "workspace-write"}})

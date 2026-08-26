@@ -13,6 +13,7 @@ stop discards what a turn had in flight; an approval runs a command. Read
 
 | Situation | Use |
 | --- | --- |
+| Thread needs network, or wider write access | `edit_thread` (`sandboxPolicy`) |
 | New work, no thread for it yet | `start_thread` (never `codex exec`) |
 | Thread exists and is idle, you have new work | `send_message` |
 | Turn is running and heading the wrong way | `steer_turn` |
@@ -161,7 +162,12 @@ even when it stopped nothing, both for an already-idle thread and for an
 - `collaborationMode` — plan mode. Needs both halves:
   `{"mode": "plan", "settings": {"model": "<model>"}}`. `{"mode": "plan"}` alone
   is rejected.
-- `approvalPolicy`, `approvalsReviewer`, `sandboxPolicy`, `permissions`
+- `approvalPolicy`, `approvalsReviewer`
+- `sandboxPolicy` — an object, and where `networkAccess` lives:
+  `{"type": "workspaceWrite", "networkAccess": true, "writableRoots": [...]}`.
+  Types are camelCase (`workspaceWrite`, `readOnly`, `dangerFullAccess`).
+- `permissions` — a named profile **id string**, not a permission object, and
+  not combinable with `sandboxPolicy`. See *When a thread is blocked*.
 - `multiAgentMode`, `cwd` — note that multi-agent means *subagents inside the
   thread*, sharing its working directory. It is not a way to get parallel work
   in separate worktrees; see *Parallel work* below.
@@ -219,6 +225,60 @@ The only follower method replaces the entire queue, and its contents cannot be
 read. Using it would blind-overwrite follow-ups queued in the app. To hand work
 to a busy thread, either `steer_turn` it now or wait for `turn_completed` and
 `send_message` then.
+
+## When a thread is blocked
+
+Work stalls for two different reasons and they have opposite remedies. Say which
+one you are in before reaching for either.
+
+### Codex is blocked, and you can unblock it
+
+Most of these are settings, not walls, and `edit_thread` changes them.
+
+**No network.** A thread cannot reach the network by default: `workspaceWrite`
+sets `networkAccess` to false, and a command that needs it fails as a DNS error
+(`Could not resolve host`), which reads like a broken box rather than a policy.
+Grant it:
+
+    edit_thread(thread, "update_settings",
+                {"sandboxPolicy": {"type": "workspaceWrite", "networkAccess": true}})
+
+Applies to the next turn, so grant first, then send the work.
+
+**`permissions` is not that switch.** It is a named profile id, a *string*.
+Passing the plausible `{"network": {"enabled": true}}` fails with "invalid type:
+map, expected a string", which tells you nothing. The two fields cannot be
+combined. Sandbox types are camelCase here — `workspaceWrite`, `readOnly`,
+`dangerFullAccess` — not the CLI's `workspace-write`.
+
+**It needs to write outside its workspace.** Add `writableRoots` to the same
+policy rather than escalating to `dangerFullAccess`.
+
+**It is waiting on an approval.** Only if it can ask: a detached run has no way
+to, which is why `start_thread` defaults to `approval="never"`. On an app-owned
+thread set `approvalsReviewer` to `user`, then answer with `respond`.
+
+### You are blocked, and Codex is the way through
+
+The other direction, and the one that gets missed. When *your own* permissions
+stop you — a command your harness will not run, an allowlist you cannot edit —
+that is not a reason to give up on the task. Codex is a separate agent with its
+own sandbox and its own approval system, and you can grant it what it needs. So
+hand the work to a thread instead of abandoning it: set the sandbox policy it
+requires, send the work, and answer its approvals with `respond`.
+
+Do not invert this by reflex. Delegating is right when the block is your
+harness's policy about *how you run commands*; it is wrong when the block exists
+because the action itself is dangerous or the user has said no. Codex is not a
+way around a decision the user made — if they declined something, it stays
+declined, whoever would run it.
+
+### Neither can proceed
+
+Then say so plainly, name the exact blocker, and hand it back. A missing
+credential, an account the user must log into, a decision that is theirs: none of
+these are dissolved by trying the other agent. Report what is needed rather than
+looping.
 
 ## Getting state for every thread
 

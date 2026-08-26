@@ -64,6 +64,13 @@ driven by neither route until something surfaces it — that is what `focus_thre
 is for. Remodex documents the same boundary: *"Codex Desktop only accepts an
 external stream after that thread's route is mounted."*
 
+**A blocked thread is usually a settings problem.** A thread has no network by
+default, and a command needing one fails as a DNS error rather than as a policy
+refusal. `edit_thread` grants it: `sandboxPolicy` carries `networkAccess` and
+`writableRoots`. Verified live, a thread that could not resolve a host answered
+HTTP 200 on the next turn after the grant. Note `permissions` is a named profile
+id string, not a permission object, and the two cannot be combined.
+
 **Approvals only appear when the thread asks a human.** With `approvalsReviewer`
 set to `auto_review` (the default) a subagent silently decides escalations and
 `thread_status` shows nothing pending — indistinguishable from a thread that
@@ -169,7 +176,7 @@ lighter, no contention, but bounded by what the app will surface.
 ## Development
 
 ```sh
-uv run pytest                                    # 222 tests
+uv run pytest                                    # 226 tests
 uv run ruff check src tests scripts
 uv run mypy
 uv run python scripts/extract_registry.py --check  # protocol drift

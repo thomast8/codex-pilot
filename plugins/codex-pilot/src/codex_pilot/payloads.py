@@ -229,6 +229,13 @@ THREAD_SETTING_FIELDS = frozenset(
     }
 )
 
+# The four SandboxPolicy variants, from the app-server schema. `networkAccess`
+# lives here, and it is the switch that decides whether a thread can reach
+# the network at all: workspaceWrite defaults it to false.
+SANDBOX_POLICY_TYPES = frozenset(
+    {"workspaceWrite", "readOnly", "dangerFullAccess", "externalSandbox"}
+)
+
 COLLABORATION_MODES = frozenset({"default", "plan"})
 SERVICE_TIERS = frozenset({"default", "flex", "priority", "scale"})
 
@@ -277,7 +284,42 @@ def update_thread_settings(conversation_id: str, settings: dict[str, Any]) -> di
     tier = settings.get("serviceTier")
     if tier is not None and tier not in SERVICE_TIERS:
         raise ValueError(f"serviceTier must be one of {sorted(SERVICE_TIERS)}")
+    _check_sandbox_settings(settings)
     return {"conversationId": conversation_id, "threadSettings": settings}
+
+
+def _check_sandbox_settings(settings: dict[str, Any]) -> None:
+    """Catch the two sandbox mistakes the app answers unhelpfully.
+
+    `permissions` is a *named profile id*, not a permission object: passing the
+    obvious `{"network": {"enabled": true}}` fails with "invalid type: map,
+    expected a string", which says nothing about what was wanted. And the two
+    fields are mutually exclusive per the schema.
+    """
+    policy = settings.get("sandboxPolicy")
+    permissions = settings.get("permissions")
+
+    if permissions is not None and not isinstance(permissions, str):
+        raise ValueError(
+            "permissions is a named profile id (a string), not a permission object. "
+            "To grant network access use sandboxPolicy, e.g. "
+            '{"type": "workspaceWrite", "networkAccess": true}'
+        )
+    if permissions is not None and policy is not None:
+        raise ValueError("permissions and sandboxPolicy cannot be combined; pass one")
+    if policy is None:
+        return
+    if not isinstance(policy, dict):
+        raise ValueError(
+            'sandboxPolicy is an object, e.g. {"type": "workspaceWrite", "networkAccess": true}'
+        )
+    kind = policy.get("type")
+    if kind not in SANDBOX_POLICY_TYPES:
+        raise ValueError(
+            f"sandboxPolicy.type must be one of {sorted(SANDBOX_POLICY_TYPES)}; "
+            f"got {kind!r}. Note these are camelCase, not the CLI's "
+            "'workspace-write' spelling."
+        )
 
 
 def compact_thread(conversation_id: str) -> dict[str, Any]:
