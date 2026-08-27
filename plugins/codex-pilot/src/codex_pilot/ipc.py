@@ -72,6 +72,15 @@ def default_socket_path() -> Path:
     return base / "ipc" / "ipc.sock"
 
 
+def _stat_identity(path: Path) -> tuple[int, int] | None:
+    """(st_dev, st_ino) of a socket, or None when it is not there right now."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
 class IpcClient:
     """Connection to the Codex Desktop IPC router.
 
@@ -111,12 +120,26 @@ class IpcClient:
         # which matters because `initialize` is itself the first exchange.
         self._last_frame = 0.0
         self._strikes = 0
+        # Start of the most recent counted stall, so several requests waiting
+        # on one silence score it once between them.
+        self._last_strike_at = 0.0
 
         self._sock = sock if sock is not None else self._connect()
         self._pump = threading.Thread(target=self._read_loop, daemon=True)
         self._pump.start()
 
     # -- connection ---------------------------------------------------------
+
+    def matches_socket(self) -> bool:
+        """Whether the socket at our path is still the one we connected through.
+
+        The path is stable across an app restart; the inode is not, because the
+        app unlinks and re-binds. A client built without connecting (a test
+        double over a socketpair) has no identity and is never called stale.
+        """
+        if self.socket_identity is None:
+            return True
+        return _stat_identity(self._path) == self.socket_identity
 
     def _connect(self) -> socket.socket:
         if not self._path.exists():
@@ -130,6 +153,10 @@ class IpcClient:
         except OSError as exc:
             s.close()
             raise IpcUnavailable(f"cannot connect to {self._path}: {exc}") from exc
+        # Stamped here rather than by the caller: a stat afterwards can catch a
+        # re-bind that happened during connect and record the new inode against
+        # the old connection, which would mask the staleness forever.
+        self.socket_identity = _stat_identity(self._path)
         return s
 
     @property
@@ -284,13 +311,23 @@ class IpcClient:
         it -- nothing is re-sent, so a request whose outcome is unknown stays
         unknown, and the replacement connection is built lazily by the caller.
         """
-        if self._last_frame >= sent_at:
-            self._strikes = 0
-            return False
-        self._strikes += 1
-        if self._strikes < STALE_STRIKE_LIMIT:
-            return False
-        self._fatal = IpcError(f"no frames received across {self._strikes} consecutive timeouts")
+        with self._lock:
+            if self._last_frame >= sent_at:
+                self._strikes = 0
+                return False
+            # Count stall *windows*, not requests. Several calls can be waiting
+            # on one silent connection, and scoring each of them separately made
+            # the limit effectively one -- a single stall under load would retire
+            # a connection that was about to recover.
+            if sent_at <= self._last_strike_at:
+                return False
+            self._last_strike_at = time.monotonic()
+            self._strikes += 1
+            if self._strikes < STALE_STRIKE_LIMIT:
+                return False
+            self._fatal = IpcError(
+                f"no frames received across {self._strikes} consecutive timeouts"
+            )
         self.close()
         return True
 
@@ -320,7 +357,8 @@ class IpcClient:
                 raise IpcError(f"connection closed while awaiting {envelope['method']}")
             # An answer of any kind, including a router error, proves the far end
             # is talking to us. Only silence counts against the connection.
-            self._strikes = 0
+            with self._lock:
+                self._strikes = 0
             return resp
         finally:
             with self._lock:

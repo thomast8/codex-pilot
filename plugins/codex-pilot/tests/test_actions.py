@@ -370,6 +370,19 @@ class FakeApp:
         self._srv = srv
         threading.Thread(target=self._accept, args=(srv,), daemon=True).start()
 
+    def rebind_keeping_clients(self) -> None:
+        """Re-bind without closing what is already connected.
+
+        This is what production looks like: the old connection stays open and
+        silent, so `is_closed` never trips and only the inode tells you.
+        `rebind()` closes first, which is a politer restart than the one that
+        caused the incident.
+        """
+        if self._srv is not None:
+            with contextlib.suppress(OSError):
+                self._srv.close()
+        self.bind()
+
     def rebind(self) -> None:
         self.close_clients()
         if self._srv is not None:
@@ -604,6 +617,15 @@ def test_a_lost_follow_still_resubscribes_when_state_is_read(app):
         resolved = ResolvedThread(instance=inst, thread_id=TID, info=sess.store(inst).describe(TID))
         sess.snapshot(resolved, wait=0.2)
 
+        # Frames cross a real socket and are appended by the server thread, so
+        # reading immediately would miss an unsubscribe that IS being sent --
+        # the assertion below would then pass on the regression it guards.
+        settled = time.monotonic() + 2.0
+        seen = -1
+        while time.monotonic() < settled and seen != len(app.frames):
+            seen = len(app.frames)
+            time.sleep(0.1)
+
         follows = [f for f in app.frames if f.get("method") == "thread-stream-following-changed"]
         assert len(follows) > before, "an unhealthy follow was never re-subscribed"
         # The registration survives, so it must not be torn down on the way out.
@@ -635,5 +657,148 @@ def test_focus_thread_does_not_steal_the_screen(app, monkeypatch):
 
         sess.focus_thread(TID, instance="default", activate=True)
         assert calls[-1] == ["open", f"codex://threads/{TID}"]
+    finally:
+        sess.close()
+
+
+def test_health_from_the_instance_that_owns_the_thread_wins(app):
+    """Health was merged flat with last-writer-wins across instances.
+
+    Thread ids are only unique within an instance, so every manager answered for
+    every id the caller asked about — and whichever instance happened to sort
+    last overwrote the truth with `not_following`. The same payload then listed
+    the thread under `following`, contradicting itself.
+    """
+    homes = [Path(tempfile.mkdtemp(prefix="cp")) for _ in range(2)]
+    try:
+        for order in (("alpha", "zulu"), ("zulu", "alpha")):
+            insts = [
+                Instance(slug=s, codex_home=h, app_path=None, is_default=False)
+                for s, h in zip(order, homes, strict=True)
+            ]
+            sess = Session(instances=insts)
+            try:
+                owner = insts[order.index("alpha")]
+                manager = sess.follow_manager(owner)
+                manager.follow(TID)
+                manager.handle_frame(
+                    {
+                        "params": {
+                            "conversationId": TID,
+                            "change": {
+                                "type": "snapshot",
+                                "revision": 1,
+                                "conversationState": {
+                                    "threadRuntimeStatus": {"type": "idle"},
+                                    "requests": [],
+                                },
+                            },
+                        }
+                    }
+                )
+                got = sess.collect_events(threads=[TID])
+                assert got["threads"][TID]["health"] == "ok", f"order {order}"
+                assert got["threads"][TID]["pending_known"] is True, f"order {order}"
+                assert got["following"] == [TID], f"order {order}"
+            finally:
+                sess.close()
+    finally:
+        for h in homes:
+            shutil.rmtree(h, ignore_errors=True)
+
+
+def test_a_thread_no_instance_follows_is_reported_unfollowed(app):
+    sess, _ = live_session(app)
+    try:
+        got = sess.collect_events(threads=["nobody-follows-this"])
+        assert got["threads"]["nobody-follows-this"]["health"] == "not_following"
+        assert got["threads"]["nobody-follows-this"]["pending_known"] is False
+    finally:
+        sess.close()
+
+
+def test_a_rebind_is_caught_even_when_the_old_connection_stays_open(app):
+    """The half-open case, which is the one that actually happened.
+
+    A restarted app leaves the previous connection open and silent, so
+    `is_closed` stays false and the cached client would be handed back forever.
+    Only the socket's inode distinguishes it.
+    """
+    sess, inst = live_session(app)
+    try:
+        first = sess.client(inst)
+        app.rebind_keeping_clients()
+
+        # The point of the test: nothing has closed the old connection.
+        assert not first.is_closed
+
+        second = sess.client(inst)
+        assert second is not first
+        assert second.socket_identity != first.socket_identity
+        assert first.is_closed, "the stale client was left open"
+    finally:
+        sess.close()
+
+
+def test_the_pump_retries_a_subscribe_the_app_never_answered(app, monkeypatch):
+    """Verified live: after a restart the app held no threads, so the
+    re-subscribe reached something with nothing to stream. Asking once would
+    have left the follow silent for good."""
+    monkeypatch.setattr("codex_pilot.actions.RESYNC_RETRY_SECONDS", 0.0)
+    sess, inst = live_session(app)
+    try:
+        sess.client(inst)
+        sess.follow_manager(inst).follow(TID)
+        sess._ensure_pump(inst)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            follows = [
+                f
+                for f in app.frames
+                if f.get("method") == "thread-stream-following-changed"
+                and (f.get("params") or {}).get("conversationId") == TID
+            ]
+            if len(follows) >= 2:
+                break
+            time.sleep(0.05)
+        assert len(follows) >= 2, "the subscribe was asked once and never repeated"
+    finally:
+        sess.close()
+
+
+def test_a_resubscribe_that_fails_mid_send_is_retried_by_the_pump(app, monkeypatch):
+    """The queue is drained before the broadcast, so a send that raises would
+    otherwise drop it on the floor -- the exact permanent wedge resync cures."""
+    sess, inst = live_session(app)
+    try:
+        client = sess.client(inst)
+        sess.follow_manager(inst).follow(TID)
+
+        calls: list[int] = []
+        real = client.broadcast
+
+        def flaky(method, params, **kw):
+            calls.append(1)
+            if len(calls) == 1:
+                raise IpcError("send failed")
+            return real(method, params, **kw)
+
+        monkeypatch.setattr(client, "broadcast", flaky)
+        sess.follow_manager(inst).resync_all("reconnected")
+        sess._ensure_pump(inst)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            follows = [
+                f
+                for f in app.frames
+                if f.get("method") == "thread-stream-following-changed"
+                and (f.get("params") or {}).get("conversationId") == TID
+            ]
+            if follows:
+                break
+            time.sleep(0.05)
+        assert follows, "a failed re-subscribe was never retried"
     finally:
         sess.close()

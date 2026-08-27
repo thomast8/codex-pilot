@@ -159,8 +159,11 @@ The rollout never carries the pending request itself — Codex writes no record 
 one — so a disk block is evidence about liveness, never about approvals.
 
 Following a thread has the same rule. `collect_events` reports each thread's
-`health`: `ok`, `resyncing` (asked, nothing back yet), `lost` (the connection
-dropped), or `not_following` (never followed, or lost with the server process).
+`health`: `ok`, `resyncing` (asked, nothing back yet — including a follow still
+waiting on its first snapshot, which is what an unmounted thread looks like),
+`lost` (the connection dropped), `detached` (a run started here; no live state,
+but its completion still arrives as an event), or `not_following` (never
+followed, or lost with the server process).
 Only `ok` means an empty `pending` is real, and each entry carries its own
 `pending_known` to say so. Pass `epoch` back with `cursor` — sequence numbers
 restart with the server, and a stale cursor otherwise discards everything after

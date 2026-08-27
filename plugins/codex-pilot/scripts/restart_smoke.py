@@ -26,8 +26,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from codex_pilot.actions import Session, _socket_identity  # noqa: E402
+from codex_pilot.actions import Session  # noqa: E402
 from codex_pilot.instances import Instance, discover_instances  # noqa: E402
+from codex_pilot.ipc import CONNECTION_RESET, _stat_identity  # noqa: E402
 
 # The only instance this script may touch, by resolved home.
 ALLOWED_HOME = Path.home() / ".codex-secondary"
@@ -53,6 +54,10 @@ def resolve(slug: str) -> Instance:
             f"only drive {ALLOWED_HOME}. Note that Veridue and the main app share "
             f"{Path.home() / '.codex'}, so both are behind the 'default' slug."
         )
+    # The home alone is not enough: if it were ever a symlink onto ~/.codex the
+    # check above would pass while every operation drove the forbidden app.
+    if inst.app_path is None or inst.app_path.resolve() != ALLOWED_BUNDLE_DIR.resolve():
+        raise Refused(f"refusing {slug!r}: its bundle is {inst.app_path}, not {ALLOWED_BUNDLE_DIR}")
     return inst
 
 
@@ -67,16 +72,37 @@ def socket_owner(inst: Instance) -> int | None:
 
 
 def owner_command(pid: int) -> str:
-    return subprocess.run(
-        ["ps", "-o", "comm=", "-p", str(pid)], capture_output=True, text=True, check=False
-    ).stdout.strip()
+    """The pid's real executable.
+
+    Deliberately not `ps -o comm=`: on macOS that reports argv[0], which the
+    process sets itself, so a `sleep` re-exec'd with the right argv passes any
+    check built on it. `lsof -d txt` reports the actual text segment.
+    """
+    out = subprocess.run(
+        ["lsof", "-p", str(pid), "-a", "-d", "txt", "-Fn"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    for line in out.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return ""
 
 
 def check_owner(pid: int) -> None:
-    """Never signal a process that is not the app we are allowed to drive."""
-    comm = owner_command(pid)
-    if not comm.startswith(str(ALLOWED_BUNDLE_DIR)):
-        raise Refused(f"refusing to signal pid {pid}: {comm!r} is not under {ALLOWED_BUNDLE_DIR}")
+    """Refuse anything that is not the app we are allowed to drive."""
+    exe = owner_command(pid)
+    if not exe:
+        raise Refused(f"refusing pid {pid}: could not read its executable")
+    try:
+        under = Path(exe).resolve().is_relative_to(ALLOWED_BUNDLE_DIR.resolve())
+    except (OSError, ValueError):
+        under = False
+    # `is_relative_to`, not `startswith`: a bundle named "... Personal.app.evil"
+    # string-prefixes the allowed path and would otherwise pass.
+    if not under:
+        raise Refused(f"refusing pid {pid}: {exe!r} is not inside {ALLOWED_BUNDLE_DIR}")
 
 
 def preflight(inst: Instance) -> int | None:
@@ -87,7 +113,7 @@ def preflight(inst: Instance) -> int | None:
     print("bundle            :", ALLOWED_BUNDLE_DIR)
     print("bundle id         :", ALLOWED_BUNDLE_ID)
     print("socket            :", path)
-    print("socket identity   :", _socket_identity(path) if path else None)
+    print("socket identity   :", _stat_identity(path) if path else None)
     print("socket owner pid  :", pid)
     print("owner command     :", owner_command(pid) if pid else "(none)")
     return pid
@@ -109,7 +135,7 @@ def wait_for_socket(inst: Instance, was: tuple[int, int] | None, timeout: float 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         path = inst.socket_path()
-        if path is not None and _socket_identity(path) not in (None, was):
+        if path is not None and _stat_identity(path) not in (None, was):
             return True
         time.sleep(0.5)
     return False
@@ -120,6 +146,12 @@ def run(inst: Instance, thread: str, mount: bool = False) -> int:
     failures: list[str] = []
     try:
         client = session.client(inst)
+        # Received frames go to listeners; `_sent` is outbound only, so watching
+        # it for a reset could never have fired.
+        resets: list[dict] = []
+        client.add_broadcast_listener(
+            lambda f: resets.append(f) if f.get("method") == CONNECTION_RESET else None
+        )
         before_identity = client.socket_identity
         print(f"\nconnected, clientId={client.client_id} identity={before_identity}")
 
@@ -148,6 +180,9 @@ def run(inst: Instance, thread: str, mount: bool = False) -> int:
                 time.sleep(2.0)
                 continue
             if fresh.socket_identity != before_identity:
+                fresh.add_broadcast_listener(
+                    lambda f: resets.append(f) if f.get("method") == CONNECTION_RESET else None
+                )
                 reconnected = True
                 print(f"re-handshaked, clientId={fresh.client_id} identity={fresh.socket_identity}")
                 break
@@ -160,8 +195,10 @@ def run(inst: Instance, thread: str, mount: bool = False) -> int:
         # an app that had nothing to stream. Surface it rather than letting a
         # follow that cannot recover look like one that is broken.
         if mount:
-            # Off by default: this deep-links the thread, which yanks the Codex
-            # window to the foreground and steals focus from whoever is working.
+            # Off by default because it deep-links the thread, changing what the
+            # app has mounted. A diagnostic should not alter the state it came to
+            # observe unless asked. (It no longer steals focus -- focus_thread
+            # navigates in the background now.)
             print("\nnudging the app to mount the thread (--mount)...")
             session.focus_thread(thread, instance=inst.slug)
 
@@ -193,7 +230,7 @@ def run(inst: Instance, thread: str, mount: bool = False) -> int:
         else:
             failures.append(f"the app holds the thread but the follow never recovered: {health}")
 
-        if any(m.get("method") == "ipc-connection-reset" for m in getattr(client, "_sent", [])):
+        if resets:
             print("\nNOTE: ipc-connection-reset was observed live -- it can be marked verified.")
         else:
             print("\nNOTE: no ipc-connection-reset seen; it stays decoded-but-unverified.")
@@ -221,8 +258,8 @@ def main() -> int:
     ap.add_argument(
         "--mount",
         action="store_true",
-        help="focus the thread after the restart. Brings the Codex window to the "
-        "foreground and steals focus, so it is opt-in.",
+        help="focus the thread after the restart. Changes what the app has "
+        "mounted, so it is opt-in.",
     )
     args = ap.parse_args()
 
@@ -233,8 +270,12 @@ def main() -> int:
         return 0
 
     pid = socket_owner(inst)
-    if pid is not None:
-        check_owner(pid)
+    if pid is None:
+        raise Refused(
+            "refusing: nothing owns the target socket, so there is no app to verify. "
+            "Start the Personal instance first."
+        )
+    check_owner(pid)
     return run(inst, args.thread, mount=args.mount)
 
 

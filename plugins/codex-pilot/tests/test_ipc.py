@@ -281,8 +281,6 @@ def test_a_router_error_response_resets_strikes(wired):
     silent = True
 
     def sometimes(msg):
-        if msg.get("method") == "initialize":
-            return router._default_responder(msg)
         if silent:
             return None
         return {

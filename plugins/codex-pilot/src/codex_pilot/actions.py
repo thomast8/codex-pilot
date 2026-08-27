@@ -111,21 +111,6 @@ class ResolvedThread:
         return self.info.name
 
 
-def _socket_identity(path: Path) -> tuple[int, int] | None:
-    """(st_dev, st_ino) of a socket, or None if it is not there right now.
-
-    The socket path is stable across an app restart -- `$CODEX_HOME/ipc/ipc.sock`
-    either way -- so the path cannot tell a restart apart. The inode can: the app
-    unlinks and re-binds, which allocates a new one. None during the window
-    between those two, which is treated the same as "changed".
-    """
-    try:
-        st = path.stat()
-    except OSError:
-        return None
-    return (st.st_dev, st.st_ino)
-
-
 class Session:
     """Holds one IPC connection per live instance, opened on demand."""
 
@@ -372,9 +357,25 @@ class Session:
                 merged.extend(got["events"])
                 dropped += got["dropped"]
                 following.extend(got["following"])
+                # Managers only answer for threads they track, so these cannot
+                # collide: one instance's truth can no longer be overwritten by
+                # another instance's ignorance.
                 health.update(got["threads"])
             if merged or time.monotonic() >= deadline:
                 merged.sort(key=lambda e: e["seq"])
+                # Anything the caller asked about that no instance follows is
+                # genuinely unfollowed -- said once, here, rather than by every
+                # manager that has never heard of it.
+                for thread_id in threads or []:
+                    health.setdefault(
+                        thread_id,
+                        {
+                            "health": "not_following",
+                            "reason": None,
+                            "pending": [],
+                            "pending_known": False,
+                        },
+                    )
                 return {
                     "events": merged,
                     "cursor": merged[-1]["seq"] if merged else after,
@@ -418,9 +419,7 @@ class Session:
                 existing = self._clients.get(instance.slug)
                 socket_path = instance.socket_path()
                 if existing is not None and not existing.is_closed:
-                    if socket_path is not None and _socket_identity(socket_path) == (
-                        existing.socket_identity
-                    ):
+                    if socket_path is not None and existing.matches_socket():
                         return existing
                     # Same path, different inode (or none): the app re-bound the
                     # socket, so this connection points at a server that is gone.
@@ -434,7 +433,6 @@ class Session:
                     f"(no socket under {instance.codex_home})"
                 )
             client = IpcClient(socket_path=socket_path, timeout=self._ipc_timeout)
-            client.socket_identity = _socket_identity(socket_path)
             try:
                 client.initialize()
             except BaseException:

@@ -350,3 +350,21 @@ async def test_collect_events_carries_an_epoch(empty_home: Path):
     assert payload["epoch"]
     assert payload["cursor_reset"] is False
     assert payload["threads"] == {}
+
+
+@pytest.mark.anyio
+async def test_a_cursor_from_a_previous_server_is_reset(empty_home: Path):
+    """The epoch has to survive the tool signature, not just the Session call."""
+    async with (
+        stdio_client(server_params(empty_home)) as (read, write),
+        ClientSession(read, write) as sess,
+    ):
+        await sess.initialize()
+        result = await sess.call_tool(
+            "collect_events", {"epoch": "a-previous-process", "after": 9999}
+        )
+        payload = json.loads(result.content[0].text)
+
+    assert payload["ok"] is True
+    assert payload["cursor_reset"] is True
+    assert payload["cursor"] == 0

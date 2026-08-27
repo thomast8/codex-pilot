@@ -103,7 +103,10 @@ def _with_disk(
     supervisor actually has to act on.
     """
     out["pending_known"] = False
-    phase = transcript.rollout_turn_phase(rollout) if rollout is not None else None
+    try:
+        phase = transcript.rollout_turn_phase(rollout) if rollout is not None else None
+    except Exception:  # noqa: BLE001 - a bad rollout must not fail the whole call
+        phase = None
     if phase is None:
         out["disk"] = None
         return out
@@ -168,6 +171,9 @@ def thread_status(thread: str, instance: str | None = None) -> dict[str, Any]:
         out.update(sess.own_run_fields(resolved.thread_id))
         if sess.live_run(resolved.thread_id) is not None:
             # Our own CLI holds the lock, so the app has no live state for it.
+            # Still false rather than absent: the field is the documented branch
+            # point, and a caller should never have to guess a default for it.
+            out["pending_known"] = False
             out["state"] = None
             out["note"] = (
                 "a detached run started here is still going: read log_path, wait for "
@@ -195,18 +201,7 @@ def thread_status(thread: str, instance: str | None = None) -> dict[str, Any]:
             "service_tier": state.service_tier,
             "approvals_reviewer": state.approvals_reviewer,
             "goal": state.goal,
-            "pending": [
-                {
-                    "request_id": p.request_id,
-                    "kind": p.kind,
-                    "summary": p.summary,
-                    "reason": p.reason,
-                    "cwd": p.cwd,
-                    "available_decisions": p.available_decisions,
-                    "answerable": p.answerable,
-                }
-                for p in state.pending
-            ],
+            "pending": [p.as_dict() for p in state.pending],
         }
         return out
     except (ActionError, IpcError, ThreadError) as exc:
@@ -461,7 +456,10 @@ def follow_thread(thread: str, follow: bool = True, instance: str | None = None)
         "\n\nEvery response carries an `epoch`; pass it back alongside "
         "`cursor`. If the server restarted, sequence numbers began again and "
         "your cursor would silently discard everything after it -- a mismatch "
-        "resets the cursor and sets `cursor_reset`."
+        "resets the cursor and sets `cursor_reset`. Omitting `epoch` leaves you "
+        "relying on a best-effort check that only catches a cursor beyond "
+        "any this process has issued, so it stops helping once the new "
+        "process passes it."
     )
 )
 def collect_events(

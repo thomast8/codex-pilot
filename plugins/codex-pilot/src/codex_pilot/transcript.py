@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -157,6 +158,21 @@ def read(
     }
 
 
+# A timestamp is ISO-8601 and nothing else. The value is file content, and the
+# `disk` block puts it in front of a model, so it is bounded and shape-checked
+# rather than passed through: a rollout is writable by anything with access to
+# CODEX_HOME, and an unbounded string here would be a free channel into an
+# orchestrator's context.
+_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def _timestamp_of(record: dict[str, Any]) -> str | None:
+    at = record.get("timestamp")
+    if not isinstance(at, str) or not _TIMESTAMP_RE.match(at):
+        return None
+    return at
+
+
 @dataclass(frozen=True)
 class RolloutPhase:
     """Whether a thread's rollout ends inside a turn or between turns."""
@@ -205,8 +221,15 @@ def rollout_turn_phase(rollout: Path, tail_bytes: int = PHASE_TAIL_BYTES) -> Rol
     for raw in lines:
         try:
             record = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             # A rollout being written to has a torn last line; that is normal.
+            continue
+        except RecursionError:
+            # Deeply nested JSON. Not something the app writes, but a rollout is
+            # just a file: anything with write access to CODEX_HOME can plant one,
+            # and `_find_rollout` takes the first sorted match. A crash here would
+            # take out thread_status, which is what a supervisor calls when it
+            # already cannot see.
             continue
         if not isinstance(record, dict) or record.get("type") != "event_msg":
             continue
@@ -216,8 +239,7 @@ def rollout_turn_phase(rollout: Path, tail_bytes: int = PHASE_TAIL_BYTES) -> Rol
         ptype = payload.get("type")
         if ptype == TURN_OPEN or ptype in TURN_CLOSE:
             boundary = str(ptype)
-            at = record.get("timestamp")
-            stamp = at if isinstance(at, str) else None
+            stamp = _timestamp_of(record)
 
     if boundary is None:
         return None

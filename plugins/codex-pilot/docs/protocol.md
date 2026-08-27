@@ -105,12 +105,12 @@ request with `"version": 1` returned `resultType: "success"` from the real owner
 Version map, verbatim from the bundle's `b_` object (remodex's
 `DESKTOP_IPC_METHOD_VERSIONS` agrees — use the disagreement as a drift alarm):
 
-| Method | Version | |
-| --- | --- | --- |
-| `thread-stream-state-changed` | 11 | |
+| Method | Version |
+| --- | --- |
+| `thread-stream-state-changed` | 11 |
 | `thread-stream-following-changed` | 1 |
 | `thread-stream-following-status-requested` | 1 |
-| `ipc-connection-reset` | 1 | *(handled — see Connection health)*
+| `ipc-connection-reset` | 1 |
 | `thread-read-state-changed` | 2 |
 | `thread-archived` | 2 |
 | `thread-unarchived` | 1 |
@@ -132,6 +132,9 @@ Version map, verbatim from the bundle's `b_` object (remodex's
 
 `initialize` is handled by the router itself and is not in the map; it takes
 version 1.
+
+`ipc-connection-reset` is the one method in the map this client *handles* rather
+than sends; see **Connection health**.
 
 **Interrupt is the one special case** (bundle function `S_`): it is version **3**
 when `expectedTurnId` is absent or null, and version **4** when present. So the
@@ -186,7 +189,16 @@ frame. Every registered follow is re-subscribed when a new connection is made.
 One request is not enough. Verified live: after a restart the app came back
 holding **no threads at all**, so the re-subscribe reached an app with nothing to
 stream. Unanswered snapshot requests are therefore repeated on a 15s cadence
-rather than asked once and latched.
+rather than asked once and latched — an initial subscribe included, since a
+thread the app has not mounted never answers the first one either.
+
+**What the strike counter can and cannot see.** It is fed by `_dispatch`, so
+*any* inbound frame counts as life, including router traffic for threads we do
+not follow. It therefore detects the Electron **main** process going silent. A
+wedge confined to the renderer, with the router still chatty, would not trip it —
+and would not trip the inode check either, since nothing re-binds. The disk tier
+(`thread_status`'s `disk` block) is the backstop for that case, which is part of
+why it exists.
 
 ## Acting on a thread
 
@@ -284,7 +296,10 @@ Pending requests live on the conversation object as `conversation.requests`, eac
 
 **`McpServerElicitationAction`:** `"accept"`, `"decline"`, `"cancel"`.
 
-Not on disk: a pending request exists only in live stream state. See *What the rollout does and does not hold*.\n\n> The four values beyond plain accept/decline are **persistent grants**, not
+Not on disk: a pending request exists only in live stream state. See *What the rollout
+does and does not hold*.
+
+> The four values beyond plain accept/decline are **persistent grants**, not
 > per-request answers. `acceptForSession` disables prompting for matching
 > commands for the rest of the session; the two amendment forms write policy that
 > outlives the turn. A caller answering approvals automatically should stick to

@@ -293,11 +293,17 @@ def test_health_of_an_unknown_thread_says_so(manager):
     assert health["pending_known"] is False
 
 
-def test_collect_reports_health_for_threads_it_was_asked_about(manager, frames):
+def test_collect_only_answers_for_threads_it_actually_tracks(manager, frames):
+    """A manager that has never heard of a thread must not answer for it.
+
+    Health is merged flat across instances, so a confident `not_following` from
+    the wrong instance would overwrite the truth from the right one. Session
+    fills in the genuinely-unknown ids.
+    """
     manager.handle_frame(frames[0])
     got = manager.collect([THREAD, "never-followed"])
     assert got["threads"][THREAD]["health"] == "ok"
-    assert got["threads"]["never-followed"]["health"] == "not_following"
+    assert "never-followed" not in got["threads"]
 
 
 def test_a_follow_awaiting_a_snapshot_keeps_asking(manager, frames):
@@ -336,3 +342,103 @@ def test_retrying_a_resync_does_not_flood_the_event_buffer(manager, frames):
         manager.stale_awaiting(older_than=0.0)
     after = len(manager.collect()["events"])
     assert after - before == 1
+
+
+def test_a_reconnect_requeues_even_a_follow_already_awaiting(manager, frames):
+    """The reconnect path went through `_begin_resync`, which queues nothing
+    when the awaiting latch is already set — so a gap followed by a reconnect
+    re-subscribed nothing at all, and the retry stamp was pushed out on top."""
+    manager.handle_frame(frames[0])
+    gap = {
+        "params": {
+            "conversationId": THREAD,
+            "change": {"type": "patches", "baseRevision": 999, "revision": 1000, "patches": []},
+        }
+    }
+    manager.handle_frame(gap)
+    assert manager.take_resync_requests() == [THREAD]
+
+    # Now the connection is replaced. This must ask again.
+    manager.resync_all("reconnected")
+    assert manager.take_resync_requests() == [THREAD]
+
+
+def test_a_brand_new_follow_is_retried_like_any_other():
+    """A fresh follow awaits its first snapshot as surely as one recovering from
+    a gap, and an unmounted thread never answers the first subscribe."""
+    fresh = FollowManager("default")
+    fresh.follow("brand-new")
+    assert fresh.stale_awaiting(older_than=0.0) == ["brand-new"]
+
+
+def test_a_detached_run_is_not_reported_as_unfollowed(manager):
+    """`not_following` is documented as "nothing will ever arrive"; a detached
+    run's completion arrives on this very stream."""
+    manager.emit_external("run-1", EVENT_TURN_COMPLETED, {"route": "detached"})
+    health = manager.health_of("run-1")
+    assert health["health"] == "detached"
+    assert health["pending_known"] is False
+
+
+# The verbatim live capture from tests/test_snapshot.py: an exec approval that a
+# real thread raised when it was blocked on network access.
+REAL_COMMAND_REQUEST = {
+    "method": "item/commandExecution/requestApproval",
+    "id": 1865,
+    "params": {
+        "threadId": THREAD,
+        "turnId": "01a03e6c-fa27-7e01-9910-d884680d1203",
+        "itemId": "exec-fecc7e28-0fe4-43a3-9f13-282dc491b590",
+        "reason": "May I rerun the exact requested curl command with network access?",
+        "command": '/bin/zsh -lc "curl -sS https://example.com"',
+        "cwd": "/tmp/x",
+        "availableDecisions": ["accept", "cancel"],
+    },
+}
+
+
+def snapshot_frame(requests: list[dict]) -> dict:
+    return {
+        "params": {
+            "conversationId": THREAD,
+            "change": {
+                "type": "snapshot",
+                "revision": 1,
+                "conversationState": {
+                    "threadRuntimeStatus": {"type": "active"},
+                    "requests": requests,
+                },
+            },
+        }
+    }
+
+
+def test_a_pending_approval_reaches_the_caller_intact(manager):
+    """The headline promise: a blocked thread is visible without polling.
+
+    Every other health assertion checks an empty pending list, so the serializer
+    could have returned anything at all for a real request.
+    """
+    manager.handle_frame(snapshot_frame([REAL_COMMAND_REQUEST]))
+    health = manager.health_of(THREAD)
+
+    assert health["health"] == "ok"
+    assert health["pending_known"] is True
+    (pending,) = health["pending"]
+    # The id is an integer and is echoed straight back on answer; stringifying
+    # it silently fails to match.
+    assert pending["request_id"] == 1865
+    assert pending["kind"] == "command"
+    assert pending["answerable"] is True
+    assert pending["available_decisions"] == ["accept", "cancel"]
+    assert "curl" in pending["summary"]
+
+
+def test_the_wire_shape_has_exactly_one_definition(manager):
+    """`as_dict` says "one definition, because two would drift". Hold it to that."""
+    from codex_pilot.snapshot import parse_pending
+
+    (request,) = parse_pending([REAL_COMMAND_REQUEST])
+    manager.handle_frame(snapshot_frame([REAL_COMMAND_REQUEST]))
+    (via_health,) = manager.health_of(THREAD)["pending"]
+    assert via_health == request.as_dict()

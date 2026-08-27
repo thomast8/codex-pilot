@@ -73,10 +73,14 @@ answer".
 
 So the answer is now in a field rather than in prose. `pending_known: false`
 means the pending set could not be read at all. Alongside it, `disk` reports what
-the rollout still shows: `phase: mid_turn` is a thread left inside a turn, and
-together with a large `age_seconds` that is the signature of an app that stopped
-answering. The rollout cannot supply the pending request itself — Codex writes no
-record for one, checked across 1,096 real rollouts — but "abandoned mid-turn" and
+the rollout still shows: `phase` is `mid_turn` or `idle`, `last_boundary` is the
+record it read that from, and `last_boundary_at` is when that boundary was
+written. `age_seconds` comes from the thread store rather than the rollout — time
+since the thread's last recorded activity, and null if there is none. A
+`mid_turn` phase with a large `age_seconds` is the signature of an app that
+stopped answering. The rollout cannot supply the pending request itself — Codex writes no
+record for one, checked across 1,096 real rollouts (which mostly ran
+`auto_review`, so see `docs/protocol.md` for the exact scope) — but "abandoned mid-turn" and
 "idle" are different enough to act on.
 
 `collect_events` carries the same idea for follows. Each thread reports `health`
@@ -202,7 +206,7 @@ lighter, no contention, but bounded by what the app will surface.
 ## Development
 
 ```sh
-uv run pytest                                    # 279 tests
+uv run pytest                                    # 280 tests
 uv run ruff check src tests scripts
 uv run mypy
 uv run python scripts/extract_registry.py --check  # protocol drift

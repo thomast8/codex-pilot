@@ -101,6 +101,10 @@ class FollowedThread:
     # When the outstanding snapshot request went out, so a request the app
     # was not ready to answer can be repeated instead of waited on forever.
     awaiting_since: float | None = None
+    # Whether a resync event has already been emitted for the current wait.
+    # Separate from `awaiting_snapshot` because a fresh follow is waiting from
+    # the moment it is registered but has announced nothing yet.
+    resync_announced: bool = False
     lost_reason: str | None = None
     collected_dropped: int = 0
     # True for a thread we only report *about* (a detached run) rather than
@@ -142,7 +146,16 @@ class FollowManager:
     def follow(self, thread_id: str) -> None:
         with self._lock:
             self._threads.setdefault(
-                thread_id, FollowedThread(instance=self.instance, thread_id=thread_id)
+                thread_id,
+                FollowedThread(
+                    instance=self.instance,
+                    thread_id=thread_id,
+                    # A first subscribe is as unanswered as a resync until a
+                    # snapshot lands, and an unmounted thread never answers one.
+                    # Without this the retry could never pick up a new follow.
+                    awaiting_snapshot=True,
+                    awaiting_since=time.monotonic(),
+                ),
             )
 
     def unfollow(self, thread_id: str) -> None:
@@ -188,6 +201,7 @@ class FollowManager:
                     tracked.revision = revision
                     tracked.awaiting_snapshot = False
                     tracked.awaiting_since = None
+                    tracked.resync_announced = False
                     tracked.lost_reason = None
             elif kind == "patches":
                 # A missing baseRevision is treated as a gap: without it there is
@@ -226,13 +240,17 @@ class FollowManager:
         that evicts every real event from the buffer.
         """
         data = data if "held" in data else {**data, "held": tracked.revision}
-        already = tracked.awaiting_snapshot
+        already = tracked.resync_announced
         tracked.state = None
         tracked.revision = None
         tracked.awaiting_snapshot = True
-        tracked.awaiting_since = time.monotonic()
+        tracked.resync_announced = True
         if already:
+            # Deliberately leaves `awaiting_since` alone: refreshing it on every
+            # latched gap would keep pushing the retry deadline out, so a stream
+            # sending mismatched patches forever would never be re-asked.
             return []
+        tracked.awaiting_since = time.monotonic()
         self._resync_requests.append(tracked.thread_id)
         return [self._emit(tracked, EVENT_RESYNC, data)]
 
@@ -250,10 +268,20 @@ class FollowManager:
 
     def _health_locked(self, thread_id: str) -> dict[str, Any]:
         tracked = self._threads.get(thread_id)
-        if tracked is None or tracked.external:
+        if tracked is None:
             return {
                 "health": "not_following",
                 "reason": None,
+                "pending": [],
+                "pending_known": False,
+            }
+        if tracked.external:
+            # A detached run has no stream to read, but it is tracked and its
+            # completion arrives here -- the opposite of `not_following`, which
+            # tells a caller nothing will ever arrive.
+            return {
+                "health": "detached",
+                "reason": "a detached run; no live state, completion arrives as an event",
                 "pending": [],
                 "pending_known": False,
             }
@@ -285,9 +313,17 @@ class FollowManager:
         with self._lock:
             produced: list[Event] = []
             for tracked in self._threads.values():
+                if tracked.external:
+                    # A detached run has no stream, so re-subscribing it is
+                    # meaningless; its completion comes from the process, not
+                    # the app.
+                    continue
                 tracked.state = None
                 tracked.revision = None
                 tracked.awaiting_snapshot = True
+                # Cleared so a thread reported lost can be reported healthy
+                # again once its snapshot lands.
+                tracked.lost_reason = None
                 # Stamped so `stale_awaiting` can pick this up again: an app
                 # that is still starting, or holding no threads, never answers
                 # the first re-subscribe.
@@ -449,7 +485,11 @@ class FollowManager:
                     # Health covers what the caller asked about as well as what
                     # we hold: a thread missing from `following` after a restart
                     # is exactly the case that needs saying out loud.
-                    asked = set(threads or []) | set(following)
+                    # Only ids this manager tracks. A manager that has never
+                    # heard of a thread must not answer for it: the merge across
+                    # instances is flat, so a confident `not_following` from the
+                    # wrong instance would overwrite the truth from the right one.
+                    asked = {t for t in (threads or []) if t in self._threads} | set(following)
                     return {
                         "events": [e.as_dict() for e in events],
                         "cursor": events[-1].seq if events else after,
