@@ -110,10 +110,37 @@ two, the tool refuses rather than guessing — pass `instance` to choose.
 
 ## Waiting for a thread
 
-`follow_thread` then `collect_events(wait_seconds=60)` is how you learn a thread
-finished without polling. `turn_completed` is the signal that it is free for more
-work. Pass the previous `cursor` to get only what is new; a non-zero `dropped`
+`follow_thread` starts a background collector. Events accumulate whether or not
+you are polling, so `collect_events(after=<cursor>, wait_seconds=0)` returns
+everything you missed instantly — you lose nothing by not blocking.
+`turn_completed` means the thread is free for more work; a non-zero `dropped`
 means the buffer overflowed.
+
+**Do not block on a long `wait_seconds`.** The call holds your entire turn while
+it waits: you cannot check another thread, react to anything, or be interrupted.
+It is capped at 30s for that reason, and the result says so when it shortens
+your request. To wait out a turn that takes minutes, background a shell watch
+and let the harness wake you:
+
+```sh
+codex-pilot watch <thread> --until turn_completed --timeout 900
+```
+
+**Do not guess that invocation.** The CLI ships inside the plugin's uv project,
+so it is only on PATH if it was installed as a tool; otherwise it needs
+`uv run --project <the plugin directory>` in front. You do not have to work out
+which: call `collect_events` with a `wait_seconds` above the cap once and the
+`note` in the result hands you the exact command, absolute path and all, for
+this machine.
+
+It prints one JSON event per line and exits when the thread goes idle, so
+running it in the background costs no turn at all. `--until request_pending`
+does the same for catching an approval the moment it appears. Exit codes: 0 got
+the event, 3 timed out without it.
+
+Between the two, prefer draining with `wait_seconds=0` whenever you are already
+doing other work, and a background watch whenever you have nothing to do but
+wait.
 
 A follow only streams while the app has the thread **mounted**. If a follow stays
 silent, `focus_thread` and retry.

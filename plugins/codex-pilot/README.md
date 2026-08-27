@@ -67,7 +67,9 @@ never asked. Set it to `user` on threads you intend to supervise.
 blocked tool call freezes the agent turn that made it — no checking another
 thread, no reacting, no clean interrupt. Events accumulate in the background
 either way, so the cheap move is to drain with `wait_seconds=0` and hand the
-waiting to a shell command the harness can background:
+waiting to a shell command the harness can background. The tool's own wait is
+capped at 30s for the same reason, and says so in the result when it shortens
+what you asked for.
 
 ```sh
 # one notification when the thread goes idle
@@ -76,6 +78,11 @@ codex-pilot watch <thread> --until turn_completed --timeout 900
 # a line per event, for a streaming watch
 codex-pilot watch <thread-a> <thread-b>
 ```
+
+The CLI ships inside the plugin's uv project. Run it as
+`uv run --project /path/to/plugins/codex-pilot codex-pilot watch ...` from
+anywhere, or `uv tool install /path/to/plugins/codex-pilot` once to put
+`codex-pilot` on your PATH.
 
 Each event is one JSON object on stdout, flushed immediately, which is what a
 line-oriented watcher can filter on. Trouble is reported the same way rather
@@ -128,7 +135,7 @@ lighter, no contention, but bounded by what the app will surface.
 ## Development
 
 ```sh
-uv run pytest                                    # 206 tests
+uv run pytest                                    # 216 tests
 uv run ruff check src tests scripts
 uv run mypy
 uv run python scripts/extract_registry.py --check  # protocol drift
