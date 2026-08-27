@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import ipc as ipc_module
 from . import payloads
 from .follow import EVENT_RUN_FAILED, EVENT_TURN_COMPLETED, FollowManager, SeqCounter
 from .instances import Instance, discover_instances
@@ -105,11 +106,31 @@ class ResolvedThread:
         return self.info.name
 
 
+def _socket_identity(path: Path) -> tuple[int, int] | None:
+    """(st_dev, st_ino) of a socket, or None if it is not there right now.
+
+    The socket path is stable across an app restart -- `$CODEX_HOME/ipc/ipc.sock`
+    either way -- so the path cannot tell a restart apart. The inode can: the app
+    unlinks and re-binds, which allocates a new one. None during the window
+    between those two, which is treated the same as "changed".
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
 class Session:
     """Holds one IPC connection per live instance, opened on demand."""
 
-    def __init__(self, instances: list[Instance] | None = None) -> None:
+    def __init__(
+        self,
+        instances: list[Instance] | None = None,
+        ipc_timeout: float = ipc_module.DEFAULT_TIMEOUT,
+    ) -> None:
         self._instances = instances if instances is not None else discover_instances()
+        self._ipc_timeout = ipc_timeout
         self._clients: dict[str, IpcClient] = {}
         self._stores: dict[str, ThreadStore] = {}
         self._runners: dict[str, DetachedRunner] = {}
@@ -371,15 +392,25 @@ class Session:
                 if self._stop.is_set():
                     raise IpcUnavailable("session is closed")
                 existing = self._clients.get(instance.slug)
-                if existing is not None and not existing.is_closed:
-                    return existing
                 socket_path = instance.socket_path()
+                if existing is not None and not existing.is_closed:
+                    if socket_path is not None and _socket_identity(socket_path) == (
+                        existing.socket_identity
+                    ):
+                        return existing
+                    # Same path, different inode (or none): the app re-bound the
+                    # socket, so this connection points at a server that is gone.
+                    # It would never report itself closed -- nothing arrives on it
+                    # to trip the reader -- so retire it explicitly.
+                    existing.close()
+                    self._clients.pop(instance.slug, None)
             if socket_path is None:
                 raise IpcUnavailable(
                     f"Codex Desktop instance {instance.slug!r} is not running "
                     f"(no socket under {instance.codex_home})"
                 )
-            client = IpcClient(socket_path=socket_path)
+            client = IpcClient(socket_path=socket_path, timeout=self._ipc_timeout)
+            client.socket_identity = _socket_identity(socket_path)
             try:
                 client.initialize()
             except BaseException:
@@ -406,6 +437,21 @@ class Session:
                 # otherwise go unnoticed forever.
                 self.follow_manager(instance).resync_all("ipc reconnected")
             return client
+
+    def _rearm_follows(self, instance: Instance) -> None:
+        """Re-subscribe every followed thread after a new connection is made.
+
+        A follow is a broadcast the app records against the *connection* it
+        arrived on, while our registration lives on the Session. So a reconnect
+        leaves a thread listed as followed while no frames will ever arrive for
+        it again. Nothing detected that before: the pump only re-subscribes
+        threads that asked for a resync, and losing a connection never asked.
+        """
+        manager = self._follow.get(instance.slug)
+        if manager is None or not manager.followed:
+            return
+        manager.resync_all("reconnected")
+        self._ensure_pump(instance)
 
     def _make_listener(self, instance: Instance) -> Any:
         """Fan stream-state frames to the follow manager and to any waiter.

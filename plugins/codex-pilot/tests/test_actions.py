@@ -9,7 +9,12 @@ that lets an orchestrator notice a detached run finished.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import shutil
+import socket
+import tempfile
+import threading
 import time
 from functools import partial
 from pathlib import Path
@@ -18,7 +23,9 @@ import pytest
 
 from codex_pilot.actions import ActionError, Session
 from codex_pilot.follow import EVENT_RUN_FAILED, EVENT_TURN_COMPLETED
+from codex_pilot.framing import FrameReader, encode_frame
 from codex_pilot.instances import Instance
+from codex_pilot.ipc import IpcError
 from codex_pilot.resume import DetachedError, DetachedRunner
 from codex_pilot.threads import ThreadStore
 
@@ -324,3 +331,158 @@ def test_a_run_we_stopped_is_not_reported_as_having_failed(home, tmp_path):
     # It exited non-zero because we killed it, which is not the agent failing.
     assert event["data"]["stopped"] is True
     sess.close()
+
+
+# -- connection health and reconnect ------------------------------------------
+#
+# Nothing here had test coverage before: `Session.client`'s cache-validity check,
+# the listener re-attach, and the pump were all exercised only against a live
+# app. The morning's wedge happened inside exactly that gap.
+
+
+class FakeApp:
+    """A unix socket that answers `initialize`, and can re-bind like a restart."""
+
+    def __init__(self) -> None:
+        # macOS caps AF_UNIX paths at 104 bytes, and pytest's tmp_path is already
+        # most of that, so this CODEX_HOME lives in a short temp dir of its own.
+        # A symlink does not help: connect() measures the literal path it is given.
+        self.home = Path(tempfile.mkdtemp(prefix="cp"))
+        (self.home / "ipc").mkdir()
+        (self.home / "thread-writer-locks").mkdir()
+        (self.home / "sessions").mkdir()
+        (self.home / "archived_sessions").mkdir()
+        self.path = self.home / "ipc" / "ipc.sock"
+        self.connections: list[socket.socket] = []
+        self.frames: list[dict] = []
+        self.answer_initialize = True
+        self._stop = threading.Event()
+        self._srv: socket.socket | None = None
+        self.bind()
+
+    def bind(self) -> None:
+        """(Re)create the listening socket, as a restarting app would."""
+        with contextlib.suppress(FileNotFoundError):
+            self.path.unlink()
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(self.path))
+        srv.listen(8)
+        self._srv = srv
+        threading.Thread(target=self._accept, args=(srv,), daemon=True).start()
+
+    def rebind(self) -> None:
+        self.close_clients()
+        if self._srv is not None:
+            with contextlib.suppress(OSError):
+                self._srv.close()
+        self.bind()
+
+    def close_clients(self) -> None:
+        for conn in self.connections:
+            with contextlib.suppress(OSError):
+                conn.close()
+        self.connections = []
+
+    def _accept(self, srv: socket.socket) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            self.connections.append(conn)
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn: socket.socket) -> None:
+        reader = FrameReader()
+        while not self._stop.is_set():
+            try:
+                chunk = conn.recv(65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            for msg in reader.feed(chunk):
+                self.frames.append(msg)
+                if msg.get("method") == "initialize" and self.answer_initialize:
+                    reply = {
+                        "type": "response",
+                        "requestId": msg["requestId"],
+                        "resultType": "success",
+                        "method": "initialize",
+                        "handledByClientId": "c1",
+                        "result": {"clientId": "c1"},
+                    }
+                    with contextlib.suppress(OSError):
+                        conn.sendall(encode_frame(reply))
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.close_clients()
+        if self._srv is not None:
+            with contextlib.suppress(OSError):
+                self._srv.close()
+        shutil.rmtree(self.home, ignore_errors=True)
+
+
+@pytest.fixture
+def app():
+    fake = FakeApp()
+    yield fake
+    fake.stop()
+
+
+def live_session(app: FakeApp, ipc_timeout: float = 1.0):
+    inst = Instance(slug="default", codex_home=app.home, app_path=None, is_default=True)
+    sess = Session(instances=[inst], ipc_timeout=ipc_timeout)
+    sess._stores["default"] = ThreadStore(app.home, lock_holder_probe=lambda paths: {})
+    return sess, inst
+
+
+def test_client_is_reused_while_the_socket_is_the_same(app):
+    sess, inst = live_session(app)
+    try:
+        assert sess.client(inst) is sess.client(inst)
+    finally:
+        sess.close()
+
+
+def test_a_rebound_socket_forces_a_fresh_handshake(app):
+    """The path survives a restart; the inode does not. That is the only tell."""
+    sess, inst = live_session(app)
+    try:
+        first = sess.client(inst)
+        first_identity = first.socket_identity
+        app.rebind()
+
+        second = sess.client(inst)
+        assert second is not first
+        assert second.client_id == "c1"
+        assert second.socket_identity != first_identity
+        assert first.is_closed
+    finally:
+        sess.close()
+
+
+def test_a_failed_handshake_leaves_nothing_behind(app):
+    """A wedged app still accepts the connection, then never answers.
+
+    Without an explicit close the reader thread blocks on recv forever, and the
+    pump retrying every few seconds would leak one per attempt for the whole
+    outage.
+    """
+    sess, inst = live_session(app, ipc_timeout=0.4)
+    try:
+        app.answer_initialize = False
+        before = threading.active_count()
+        for _ in range(3):
+            with pytest.raises(IpcError):
+                sess.client(inst)
+        assert "default" not in sess._clients
+        # Reader threads are asked to stop, not stopped synchronously, so give
+        # them a moment rather than racing their exit.
+        deadline = time.monotonic() + 3.0
+        while threading.active_count() > before and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert threading.active_count() <= before
+    finally:
+        sess.close()

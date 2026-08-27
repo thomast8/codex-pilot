@@ -226,6 +226,44 @@ class FollowManager:
         self._resync_requests.append(tracked.thread_id)
         return [self._emit(tracked, EVENT_RESYNC, data)]
 
+    def resync_all(self, reason: str) -> list[Event]:
+        """Re-subscribe every live follow, after the connection underneath changed.
+
+        A follow is state the app keeps against the connection the subscription
+        arrived on. Reconnecting therefore silently unsubscribes every thread we
+        still consider followed -- `followed` keeps listing them and no frame
+        ever comes. `lost()` is not enough on its own: it reports the outage but
+        queues no resync, so nothing re-broadcasts when the socket returns.
+
+        Clears `lost_reason` so a thread that was reported lost can be reported
+        healthy again once its snapshot lands.
+        """
+        produced: list[Event] = []
+        with self._lock:
+            for tracked in self._threads.values():
+                if tracked.external:
+                    continue
+                tracked.lost_reason = None
+                produced.extend(self._begin_resync(tracked, {"reason": reason}))
+            if produced:
+                self._wake.notify_all()
+        return produced
+
+    def requeue_resync(self, thread_ids: list[str]) -> None:
+        """Put back resync requests whose re-subscribe never made it out.
+
+        `take_resync_requests` empties the queue, so a broadcast that then fails
+        drops the request on the floor and the follow stays silent forever --
+        the same wedge the resync exists to cure.
+        """
+        if not thread_ids:
+            return
+        with self._lock:
+            known = [t for t in thread_ids if t in self._threads]
+            self._resync_requests = known + [
+                t for t in self._resync_requests if t not in set(known)
+            ]
+
     def take_resync_requests(self) -> list[str]:
         """Threads that need a fresh snapshot re-requested from the app.
 

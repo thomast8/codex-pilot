@@ -23,6 +23,7 @@ import os
 import queue
 import socket
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,16 @@ from .registry import build_broadcast, build_request
 
 DEFAULT_TIMEOUT = 15.0  # the router's own discovery timeout is 10s; outlast it
 BROADCAST_QUEUE_MAX = 2000
+# Consecutive timeouts during which *no* frame arrived at all before we give up
+# on the connection. A frozen app (a modal dialog, a hung main process) keeps
+# the socket open and answers nothing, so `is_closed` never trips and every
+# request burns its full timeout forever. One strike is not enough: a single
+# stall under system-wide load should not retire a connection that recovers.
+STALE_STRIKE_LIMIT = 2
+# Sent by the router when it resets the bus. Decoded from the bundle and pinned
+# in the version registry, but never observed live -- treated as fatal on the
+# theory that acting on it early is free and ignoring it is not.
+CONNECTION_RESET = "ipc-connection-reset"
 
 
 class IpcError(Exception):
@@ -92,6 +103,14 @@ class IpcClient:
         self._closed = threading.Event()
         self._fatal: BaseException | None = None
         self.client_id: str | None = None
+        # (st_dev, st_ino) of the socket we connected through. The path is stable
+        # across an app restart but the inode is not, so this is what tells a
+        # re-bound socket apart from the one we still hold.
+        self.socket_identity: tuple[int, int] | None = None
+        # Monotonic stamp of the last frame of any kind. 0.0 until one arrives,
+        # which matters because `initialize` is itself the first exchange.
+        self._last_frame = 0.0
+        self._strikes = 0
 
         self._sock = sock if sock is not None else self._connect()
         self._pump = threading.Thread(target=self._read_loop, daemon=True)
@@ -167,7 +186,15 @@ class IpcClient:
                 w.put({"__disconnected__": True})
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
+        # Any frame at all proves the far end is alive, so this is what the
+        # stale-connection check reads. Recorded before dispatch, not after,
+        # so a listener that raises cannot cost us the liveness evidence.
+        self._last_frame = time.monotonic()
         kind = msg.get("type")
+        if msg.get("method") == CONNECTION_RESET:
+            self._fatal = IpcError("router sent ipc-connection-reset")
+            self.close()
+            return
         if kind == "response":
             rid = msg.get("requestId")
             with self._lock:
@@ -244,22 +271,56 @@ class IpcClient:
             raise IpcError("call initialize() before broadcasting")
         self._send(build_broadcast(method, params))
 
+    def _record_silent_timeout(self, sent_at: float) -> bool:
+        """Count a timeout against the connection, and retire it at the limit.
+
+        Only a timeout with *no* frame arriving for its whole duration is
+        evidence about the connection rather than about one request: a thread
+        the app holds but does not render legitimately costs the router's full
+        ~10s discovery timeout, but that arrives as a `no-client-found`
+        response, and any broadcast in the meantime proves the socket is live.
+
+        Returns whether this call retired the connection. Retiring only closes
+        it -- nothing is re-sent, so a request whose outcome is unknown stays
+        unknown, and the replacement connection is built lazily by the caller.
+        """
+        if self._last_frame >= sent_at:
+            self._strikes = 0
+            return False
+        self._strikes += 1
+        if self._strikes < STALE_STRIKE_LIMIT:
+            return False
+        self._fatal = IpcError(f"no frames received across {self._strikes} consecutive timeouts")
+        self.close()
+        return True
+
     def _exchange(self, envelope: dict[str, Any], timeout: float) -> dict[str, Any]:
         rid = str(envelope["requestId"])
         waiter: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
         with self._lock:
             self._pending[rid] = waiter
         try:
+            sent_at = time.monotonic()
             self._send(envelope)
             try:
                 resp = waiter.get(timeout=timeout)
             except queue.Empty:
+                retired = self._record_silent_timeout(sent_at)
+                detail = (
+                    " -- no frames arrived on this connection either, so it has been "
+                    "retired; the next call re-handshakes"
+                    if retired
+                    else ""
+                )
                 raise IpcTimeout(
                     f"{envelope['method']} timed out after {timeout}s -- outcome unknown, "
-                    "check the Codex Desktop UI before retrying"
+                    f"check the Codex Desktop UI before retrying{detail}"
                 ) from None
             if resp.get("__disconnected__"):
                 raise IpcError(f"connection closed while awaiting {envelope['method']}")
+            # An answer of any kind, including a router error, proves the far end
+            # is talking to us. Only silence counts against the connection.
+            self._strikes = 0
             return resp
         finally:
             with self._lock:
