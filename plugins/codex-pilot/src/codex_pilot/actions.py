@@ -89,6 +89,7 @@ class Session:
         self._runners: dict[str, DetachedRunner] = {}
         self._follow: dict[str, FollowManager] = {}
         self._pumps: dict[str, threading.Thread] = {}
+        self._connecting: dict[str, threading.Lock] = {}
         self._stop = threading.Event()
         self._seq = SeqCounter()
         self._guard = threading.RLock()
@@ -117,53 +118,65 @@ class Session:
         accumulate while nothing is polling, which is the entire point of a
         persistent follow.
         """
-        existing = self._pumps.get(instance.slug)
-        if existing is not None and existing.is_alive():
-            return
+        with self._guard:
+            existing = self._pumps.get(instance.slug)
+            if existing is not None and existing.is_alive():
+                return
 
-        def pump() -> None:
-            """Keep the connection alive and re-request snapshots after a gap.
+            def pump() -> None:
+                """Keep the connection alive and re-request snapshots after a gap.
 
-            Frames reach the manager through the client's broadcast listener, so
-            this loop exists for the two things a listener cannot do: notice the
-            connection died, and re-subscribe a thread whose stream desynced. A
-            gap is otherwise unrecoverable -- nothing would ever ask for a fresh
-            snapshot and the follow would sit silent forever.
-            """
-            manager = self.follow_manager(instance)
-            while not self._stop.is_set():
-                try:
-                    client = self.client(instance)
-                except IpcError:
-                    for thread_id in manager.followed:
-                        manager.lost(thread_id, "Codex Desktop is not reachable")
-                    self._stop.wait(5.0)
-                    continue
-                try:
-                    for thread_id in manager.take_resync_requests():
-                        client.broadcast(FOLLOWING_CHANGED, payloads.follow(thread_id, True))
-                        client.broadcast(
-                            "thread-stream-following-status-requested",
-                            {"conversationId": thread_id, "hostId": "local"},
-                        )
-                    if client.is_closed:
+                Frames reach the manager through the client's broadcast listener,
+                so this loop exists for the two things a listener cannot do:
+                notice the connection died, and re-subscribe a thread whose stream
+                desynced. A gap is otherwise unrecoverable -- nothing would ever
+                ask for a fresh snapshot and the follow would sit silent forever.
+                """
+                manager = self.follow_manager(instance)
+                while not self._stop.is_set():
+                    try:
+                        # Reconnects are noticed inside client(), which queues
+                        # the re-subscribe this loop then broadcasts.
+                        client = self.client(instance)
+                    except IpcError:
                         for thread_id in manager.followed:
-                            manager.lost(thread_id, "IPC connection closed")
+                            manager.lost(thread_id, "Codex Desktop is not reachable")
+                        self._stop.wait(5.0)
+                        continue
+                    try:
+                        pending = manager.take_resync_requests()
+                        try:
+                            for thread_id in pending:
+                                client.broadcast(
+                                    FOLLOWING_CHANGED, payloads.follow(thread_id, True)
+                                )
+                                client.broadcast(
+                                    "thread-stream-following-status-requested",
+                                    {"conversationId": thread_id, "hostId": "local"},
+                                )
+                        except IpcError:
+                            # Already taken off the list; dropping them here
+                            # means nothing ever asks for them again.
+                            manager.requeue_resync(pending)
+                            raise
+                        if client.is_closed:
+                            for thread_id in manager.followed:
+                                manager.lost(thread_id, "IPC connection closed")
+                            self._stop.wait(2.0)
+                            continue
+                    except IpcError:
                         self._stop.wait(2.0)
                         continue
-                except IpcError:
-                    self._stop.wait(2.0)
-                    continue
-                except Exception:  # noqa: BLE001 - a bad frame must not kill the pump
-                    self._stop.wait(1.0)
-                    continue
-                self._stop.wait(0.5)
+                    except Exception:  # noqa: BLE001 - a bad frame must not kill the pump
+                        self._stop.wait(1.0)
+                        continue
+                    self._stop.wait(0.5)
 
-        thread = threading.Thread(
-            target=pump, name=f"codex-pilot-pump-{instance.slug}", daemon=True
-        )
-        self._pumps[instance.slug] = thread
-        thread.start()
+            thread = threading.Thread(
+                target=pump, name=f"codex-pilot-pump-{instance.slug}", daemon=True
+            )
+            self._pumps[instance.slug] = thread
+            thread.start()
 
     def follow_thread(
         self, ref: str, follow: bool = True, instance: str | None = None
@@ -239,26 +252,64 @@ class Session:
                 self._runners[instance.slug] = DetachedRunner(instance, self.store(instance))
             return self._runners[instance.slug]
 
-    def client(self, instance: Instance) -> IpcClient:
-        # Locked check-then-create: the follow pump and an MCP call can both
-        # notice a dropped connection at once, and two clients would mean two
-        # handshakes with one of them orphaned and unread.
+    def _connect_guard(self, instance: Instance) -> threading.Lock:
+        """One connect at a time per instance, held without the cache lock."""
         with self._guard:
-            if self._stop.is_set():
-                raise IpcUnavailable("session is closed")
-            existing = self._clients.get(instance.slug)
-            if existing is not None and not existing.is_closed:
-                return existing
-            socket_path = instance.socket_path()
+            if instance.slug not in self._connecting:
+                self._connecting[instance.slug] = threading.Lock()
+            return self._connecting[instance.slug]
+
+    def client(self, instance: Instance) -> IpcClient:
+        """The instance's live connection, opening one if it needs to.
+
+        Two locks rather than one, deliberately. `_guard` protects the caches
+        and is taken only for the lookups; a per-instance connect lock
+        serialises the handshake, so the follow pump and an MCP call cannot both
+        build a client and leave one orphaned and unread. Holding `_guard`
+        across `initialize()` would do the same job and cost far more: an app
+        that accepts the socket and then says nothing freezes every unrelated
+        caller -- thread stores, follow managers, collect_events -- for the full
+        IPC timeout, turning one wedged connection into a wedged session.
+        """
+        with self._connect_guard(instance):
+            with self._guard:
+                if self._stop.is_set():
+                    raise IpcUnavailable("session is closed")
+                existing = self._clients.get(instance.slug)
+                if existing is not None and not existing.is_closed:
+                    return existing
+                socket_path = instance.socket_path()
             if socket_path is None:
                 raise IpcUnavailable(
                     f"Codex Desktop instance {instance.slug!r} is not running "
                     f"(no socket under {instance.codex_home})"
                 )
             client = IpcClient(socket_path=socket_path)
-            client.initialize()
+            try:
+                client.initialize()
+            except BaseException:
+                # A half-built client still owns a socket and a reader thread.
+                # The pump retries every few seconds, so leaking one per attempt
+                # exhausts both while the app is down -- which is precisely when
+                # the retries happen.
+                client.close()
+                raise
             client.add_broadcast_listener(self._make_listener(instance))
-            self._clients[instance.slug] = client
+            with self._guard:
+                if self._stop.is_set():
+                    client.close()
+                    raise IpcUnavailable("session is closed")
+                self._clients[instance.slug] = client
+            if existing is not None:
+                # Replacing a client, not opening the first one: the app tracks
+                # stream subscriptions per connection, so every follow that was
+                # live on the old one is gone. This belongs here rather than in
+                # the pump because this is the only place that knows a
+                # replacement happened -- the pump cannot tell whether the
+                # client it picks up is the one the subscription was made on,
+                # and a drop between subscribing and its first tick would
+                # otherwise go unnoticed forever.
+                self.follow_manager(instance).resync_all("ipc reconnected")
             return client
 
     def _make_listener(self, instance: Instance) -> Any:

@@ -61,6 +61,51 @@ set to `auto_review` (the default) a subagent silently decides escalations and
 `thread_status` shows nothing pending — indistinguishable from a thread that
 never asked. Set it to `user` on threads you intend to supervise.
 
+## Waiting without burning a turn
+
+`collect_events(wait_seconds=...)` can only wait by blocking the MCP call, and a
+blocked tool call freezes the agent turn that made it — no checking another
+thread, no reacting, no clean interrupt. Events accumulate in the background
+either way, so the cheap move is to drain with `wait_seconds=0` and hand the
+waiting to a shell command the harness can background:
+
+```sh
+# one notification when the thread goes idle
+codex-pilot watch <thread> --until turn_completed --timeout 900
+
+# a line per event, for a streaming watch
+codex-pilot watch <thread-a> <thread-b>
+```
+
+Each event is one JSON object on stdout, flushed immediately, which is what a
+line-oriented watcher can filter on. Trouble is reported the same way rather
+than by going quiet: `watch_dropped` when the buffer overflowed, and `resync` or
+`follow_lost` when the stream broke under it. Those three do **not** end the
+watch — only `watch_timeout`, `watch_error`, a `--until` match, or a signal do,
+and each prints its own line first. Silence therefore always means the watch is
+still running.
+
+`--until` waits for one of the follow subsystem's events: `turn_started`,
+`turn_completed`, `request_pending`, `request_resolved`, `resync`,
+`follow_lost`. The `watch_*` lines are the CLI talking about itself and are
+rejected as `--until` values rather than never matching.
+
+| Exit | Meaning |
+|---|---|
+| `0` | the `--until` event arrived, or a watch with no `--until` hit its timeout |
+| `1` | error — thread could not be resolved, app unreachable |
+| `2` | bad arguments |
+| `3` | timed out before the requested `--until` event arrived |
+| `130` / `143` | interrupted (SIGINT) / terminated (SIGTERM) |
+
+With no `--timeout`, a watch runs indefinitely — including after a
+`follow_lost` it could not recover from. Pass an explicit `--timeout` whenever
+you need the run to be bounded.
+
+The mount constraint applies here as everywhere: a thread the app holds but is
+not rendering streams nothing, so a watch on one runs to its timeout. Surface it
+with `focus_thread` first.
+
 ## Deliberately not implemented
 
 **Queued follow-ups.** The app's newer build has a full queue API
@@ -83,7 +128,7 @@ lighter, no contention, but bounded by what the app will surface.
 ## Development
 
 ```sh
-uv run pytest                                    # 183 tests
+uv run pytest                                    # 206 tests
 uv run ruff check src tests scripts
 uv run mypy
 uv run python scripts/extract_registry.py --check  # protocol drift
