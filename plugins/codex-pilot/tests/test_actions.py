@@ -611,3 +611,29 @@ def test_a_lost_follow_still_resubscribes_when_state_is_read(app):
         assert manager.is_following(TID)
     finally:
         sess.close()
+
+
+def test_focus_thread_does_not_steal_the_screen(app, monkeypatch):
+    """Mounting a thread is about which route a window holds, not which app is in
+    front. Plain `open` activates Codex over whatever someone is working in, and
+    an orchestrator may focus several threads in a row."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "codex_pilot.actions.subprocess.run",
+        lambda argv, **kw: calls.append(argv),
+    )
+    sess, inst = live_session(app)
+    try:
+        seed = app.home / "sessions" / "2026" / "08" / "27"
+        seed.mkdir(parents=True, exist_ok=True)
+        (seed / f"rollout-2026-08-27T10-00-00-{TID}.jsonl").write_text(
+            json.dumps({"type": "session_meta", "payload": {"cwd": "/w", "id": TID}}) + "\n"
+        )
+        out = sess.focus_thread(TID, instance="default")
+        assert calls[-1] == ["open", "-g", f"codex://threads/{TID}"]
+        assert out["activated"] is False
+
+        sess.focus_thread(TID, instance="default", activate=True)
+        assert calls[-1] == ["open", f"codex://threads/{TID}"]
+    finally:
+        sess.close()

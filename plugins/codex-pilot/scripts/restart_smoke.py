@@ -101,7 +101,8 @@ def quit_app() -> None:
 
 
 def relaunch_app() -> None:
-    subprocess.run(["open", "-b", ALLOWED_BUNDLE_ID], check=False, capture_output=True)
+    # -g: relaunch without taking over the screen.
+    subprocess.run(["open", "-g", "-b", ALLOWED_BUNDLE_ID], check=False, capture_output=True)
 
 
 def wait_for_socket(inst: Instance, was: tuple[int, int] | None, timeout: float = 90.0) -> bool:

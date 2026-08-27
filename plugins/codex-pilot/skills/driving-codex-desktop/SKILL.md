@@ -144,9 +144,27 @@ has taken the same slot.
 
 ## Reading state
 
-`thread_status` returns `state: null` with a `note` when it could not read.
-**That is not "nothing is pending."** Treat a null state as unknown and look at
-the app before concluding a thread is idle or unblocked.
+`thread_status` returns `state: null` when it could not read. **That is not
+"nothing is pending."** Branch on `pending_known`, not on an empty list: false
+means the pending set could not be read at all.
+
+When it is false, `disk` reports what the rollout still shows.
+`disk.phase: "mid_turn"` is a thread left inside a turn — with a large
+`age_seconds` that is a stalled agent, and the move is `focus_thread` (which
+navigates in the background and does not steal the screen) or a look at the app.
+`disk.phase: "idle"` means it finished its last turn, so a null state there is
+much less interesting. `disk: null` means even that was unreadable.
+
+The rollout never carries the pending request itself — Codex writes no record for
+one — so a disk block is evidence about liveness, never about approvals.
+
+Following a thread has the same rule. `collect_events` reports each thread's
+`health`: `ok`, `resyncing` (asked, nothing back yet), `lost` (the connection
+dropped), or `not_following` (never followed, or lost with the server process).
+Only `ok` means an empty `pending` is real, and each entry carries its own
+`pending_known` to say so. Pass `epoch` back with `cursor` — sequence numbers
+restart with the server, and a stale cursor otherwise discards everything after
+it in silence; a mismatch comes back with `cursor_reset: true`.
 
 `stop_turn` reports `stopped`. Do not read `ok` — the app answers `ok: true`
 even when it stopped nothing, both for an already-idle thread and for an

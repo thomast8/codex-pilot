@@ -565,12 +565,20 @@ def read_thread(
         "when a tool reports that a thread holds a writer lock but no window "
         "claims it: the app keeps threads open in the background without "
         "rendering them, and only answers for the one it is showing. Wait a "
-        "couple of seconds, then retry the call that failed."
+        "couple of seconds, then retry the call that failed.\n\n"
+        "Navigates in the background, so it does not steal focus from whatever "
+        "the user is doing. Pass activate=true only if they asked to be shown "
+        "the thread."
     )
 )
-def focus_thread(thread: str, instance: str | None = None) -> dict[str, Any]:
+def focus_thread(
+    thread: str, instance: str | None = None, activate: bool = False
+) -> dict[str, Any]:
     try:
-        return {"ok": True, **session().focus_thread(thread, instance=instance)}
+        return {
+            "ok": True,
+            **session().focus_thread(thread, instance=instance, activate=activate),
+        }
     except (ActionError, IpcError, ThreadError) as exc:
         return _fail(exc)
 

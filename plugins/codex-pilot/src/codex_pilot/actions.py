@@ -671,23 +671,34 @@ class Session:
         gained = sorted(set(after["mounted"]) - set(before["mounted"]))
         return {**after, "focused": focused, "mounted_by_sync": gained}
 
-    def focus_thread(self, ref: str, instance: str | None = None) -> dict[str, Any]:
-        """Bring a thread forward in the app so a window claims it.
+    def focus_thread(
+        self, ref: str, instance: str | None = None, activate: bool = False
+    ) -> dict[str, Any]:
+        """Make a window claim a thread, so the app will answer for it.
 
         The app answers owner discovery only for a thread it is rendering, so a
         thread it holds open in the background is undriveable until something
         surfaces it. The `codex://threads/<id>` deep link is how the app itself
         navigates, and it takes effect in a couple of seconds.
+
+        What has to change is which thread a window has *mounted*, not which app
+        the user is looking at, so this navigates in the background by default.
+        Plain `open` activates the app, which yanks Codex in front of whatever
+        someone is working in -- unpleasant for a call an orchestrator makes on
+        its own initiative, and worse when it makes several. `activate=True` is
+        there for a caller that genuinely wants the app in front.
         """
         resolved = self.resolve(ref, instance)
         self._refuse_if_ours(resolved)
         url = f"codex://threads/{resolved.thread_id}"
-        subprocess.run(["open", url], check=False, capture_output=True)
+        argv = ["open", url] if activate else ["open", "-g", url]
+        subprocess.run(argv, check=False, capture_output=True)
         return {
             "instance": resolved.instance.slug,
             "thread": resolved.thread_id,
             "name": resolved.name,
             "opened": url,
+            "activated": activate,
             "note": "give the app a moment, then retry the call that failed",
         }
 
