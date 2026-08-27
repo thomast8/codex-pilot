@@ -51,6 +51,10 @@ SNAPSHOT_WAIT_SECONDS = 3.0
 # Long enough not to spam an app that is merely slow, short enough that a
 # thread the app reopens after a restart starts streaming without a nudge.
 RESYNC_RETRY_SECONDS = 15.0
+# Ceiling on the pump's backoff after an error it did not expect. Long enough
+# that a fault firing every tick costs nothing, short enough that the pump is
+# still there to recover once whatever caused it clears.
+PUMP_FAULT_MAX_BACKOFF = 30.0
 # Finished runs stay listed so threads we started remain visible; the cap
 # keeps a long orchestration session from growing the map without end.
 MAX_TRACKED_RUNS = 200
@@ -181,23 +185,26 @@ class Session:
                 ask for a fresh snapshot and the follow would sit silent forever.
                 """
                 manager = self.follow_manager(instance)
+                faults = 0
                 while not self._stop.is_set():
-                    # First, and before anything that needs the app: a detached
-                    # run finishing is news even when Codex Desktop is not running.
-                    self._adopt_late_ids(instance)
-                    self._reap_runs(instance)
                     try:
-                        # Reconnects are noticed inside client(), which queues
-                        # the re-subscribe this loop then broadcasts.
-                        client = self.client(instance)
-                    except IpcError:
-                        for thread_id in manager.followed:
-                            manager.lost(thread_id, "Codex Desktop is not reachable")
-                        # Detached runs do not need the app, so keep checking on
-                        # them promptly even while it is unreachable.
-                        self._stop.wait(0.5 if self._has_pending_runs(instance) else 5.0)
-                        continue
-                    try:
+                        # First, and before anything that needs the app: a
+                        # detached run finishing is news even when Codex Desktop
+                        # is not running. Inside the guard, because a raise here
+                        # used to end the thread outright.
+                        self._adopt_late_ids(instance)
+                        self._reap_runs(instance)
+                        try:
+                            # Reconnects are noticed inside client(), which queues
+                            # the re-subscribe this loop then broadcasts.
+                            client = self.client(instance)
+                        except IpcError:
+                            for thread_id in manager.followed:
+                                manager.lost(thread_id, "Codex Desktop is not reachable")
+                            # Detached runs do not need the app, so keep checking
+                            # on them promptly even while it is unreachable.
+                            self._stop.wait(0.5 if self._has_pending_runs(instance) else 5.0)
+                            continue
                         # A request the app was not ready for is otherwise never
                         # repeated: the awaiting latch stops anything asking twice.
                         manager.stale_awaiting(RESYNC_RETRY_SECONDS)
@@ -216,16 +223,33 @@ class Session:
                             # means nothing ever asks for them again.
                             manager.requeue_resync(pending)
                             raise
+                        faults = 0
                         if client.is_closed:
                             for thread_id in manager.followed:
                                 manager.lost(thread_id, "IPC connection closed")
                             self._stop.wait(2.0)
                             continue
                     except IpcError:
+                        # The app going away is ordinary, and the follows were
+                        # already told why above.
                         self._stop.wait(2.0)
                         continue
-                    except Exception:  # noqa: BLE001 - a bad frame must not kill the pump
-                        self._stop.wait(1.0)
+                    except Exception as exc:  # noqa: BLE001 - see the comment
+                        # Anything else is a defect here, or a frame shape we
+                        # mishandle. The pump still must not die -- nothing
+                        # restarts it, and every follow would stop being
+                        # maintained with no way back -- but it must not hide
+                        # either. A bare `continue` did exactly that once: a
+                        # method that had gone missing raised on every tick
+                        # while the follows looked healthy and quietly stopped
+                        # being re-subscribed. So the reason goes where a caller
+                        # already looks, and the retry slows down rather than
+                        # spinning a core on a fault that will not clear itself.
+                        faults += 1
+                        reason = f"follow pump failed: {type(exc).__name__}: {exc}"
+                        for thread_id in manager.followed:
+                            manager.lost(thread_id, reason)
+                        self._stop.wait(min(PUMP_FAULT_MAX_BACKOFF, 2.0 ** (faults - 1)))
                         continue
                     self._stop.wait(0.5)
 
