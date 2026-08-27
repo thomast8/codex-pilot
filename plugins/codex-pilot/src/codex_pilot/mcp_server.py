@@ -25,6 +25,7 @@ escalations on its own and nothing ever appears in `thread_status`. Set it to
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -35,9 +36,39 @@ from .threads import ThreadError
 
 server = MCPServer(
     name="codex-pilot",
-    version="0.1.0",
+    version="0.2.0",
     instructions=__doc__,
 )
+
+# Waiting here holds the caller's whole agent turn: nothing else can be checked,
+# nothing reacted to, no clean interrupt. Short gaps are worth absorbing, a long
+# turn is not -- `codex-pilot watch` does that from a shell for free.
+MAX_WAIT_SECONDS = 30.0
+
+
+def _watch_prefix_for(project: Path) -> str:
+    """How the caller invokes the watch CLI, given where this module lives.
+
+    Deliberately not `shutil.which`: this process runs inside the plugin's own
+    uv environment, where the console script is always on PATH -- and the shell
+    the caller will actually run the command in is not. Asking our own PATH
+    answers the wrong question and hands back "command not found".
+
+    A pyproject beside us means we are running from the project rather than
+    from an installed wheel, so the command needs `--project` to find it.
+    """
+    if (project / "pyproject.toml").is_file():
+        return f"uv run --project {project} codex-pilot"
+    return "codex-pilot"
+
+
+def watch_prefix() -> str:
+    return _watch_prefix_for(Path(__file__).resolve().parents[2])
+
+
+def watch_command(thread: str = "<thread>", timeout: float = 900.0) -> str:
+    return f"{watch_prefix()} watch {thread} --until turn_completed --timeout {timeout:g}"
+
 
 _session: Session | None = None
 
@@ -294,11 +325,20 @@ def follow_thread(thread: str, follow: bool = True, instance: str | None = None)
     description=(
         "Drain events from followed threads: turn_started, turn_completed (a "
         "thread went idle and is free for work), request_pending, "
-        "request_resolved, resync, follow_lost. Pass the previous `cursor` to "
-        "get only what is new. wait_seconds>0 blocks until something happens or "
-        "the time runs out, which is how to wait for a thread to finish without "
-        "a polling loop. A non-zero `dropped` means the buffer overflowed and "
-        "some events were lost."
+        "request_resolved, resync, follow_lost. A follow collects in the "
+        "background whether or not you are polling, so passing the previous "
+        "`cursor` with wait_seconds=0 returns everything that happened since "
+        "you last looked, immediately and without waiting. Use a small "
+        f"wait_seconds only to avoid a tight loop: it is capped at "
+        f"{MAX_WAIT_SECONDS:g}s because a blocked tool call freezes this entire "
+        "turn -- you cannot check another thread, react, or be interrupted "
+        "while it runs -- and a `note` in the result says so whenever your wait "
+        "was shortened. To wait out a turn that takes minutes, do not block "
+        f"here. Background a shell watch instead: `{watch_command()}`, which "
+        "costs no turn and reports when the thread goes idle. An empty result "
+        "can also mean the app is holding the thread without rendering it, in "
+        "which case the follow streams nothing until focus_thread. A non-zero "
+        "`dropped` means the buffer overflowed and some events were lost."
     )
 )
 def collect_events(
@@ -307,18 +347,36 @@ def collect_events(
     wait_seconds: float = 0.0,
     instance: str | None = None,
 ) -> dict[str, Any]:
+    asked = max(0.0, wait_seconds)
+    granted = min(MAX_WAIT_SECONDS, asked)
     try:
-        return {
+        result: dict[str, Any] = {
             "ok": True,
             **session().collect_events(
                 threads,
                 after=after,
-                wait_seconds=min(120.0, max(0.0, wait_seconds)),
+                wait_seconds=granted,
                 instance=instance,
             ),
         }
     except (ActionError, IpcError, ThreadError) as exc:
         return _fail(exc)
+    if granted < asked:
+        # Shortening the wait without saying so is indistinguishable from a
+        # wait that ran its course and found nothing, which is how a caller
+        # ends up believing a thread is still working hours after it stopped.
+        # Name the thread the caller is actually watching where we can: a
+        # placeholder they have to fill in is one more step between them and
+        # the thing that works.
+        candidates = threads or result.get("following") or []
+        target = candidates[0] if len(candidates) == 1 else "<thread>"
+        result["note"] = (
+            f"wait_seconds capped at {granted:g}s (asked for {asked:g}s): a blocked "
+            f"tool call freezes this whole turn. To wait longer without spending "
+            f"one, run this in a background shell instead: "
+            f"{watch_command(target, asked)}"
+        )
+    return result
 
 
 @server.tool(
