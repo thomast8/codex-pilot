@@ -30,6 +30,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
+from . import transcript
 from .actions import ActionError, Session
 from .ipc import IpcError
 from .resume import DetachedError
@@ -86,6 +87,30 @@ def _fail(exc: Exception) -> dict[str, Any]:
     return {"ok": False, "error": type(exc).__name__, "message": str(exc)}
 
 
+def _with_disk(
+    out: dict[str, Any], rollout: Path | None, age_seconds: float | None
+) -> dict[str, Any]:
+    """Say what the rollout knows when the live stream told us nothing.
+
+    `state: None` on its own is indistinguishable from "nothing pending", which
+    is how a thread blocked on an approval goes unnoticed. `pending_known` is
+    the machine-readable half of that: false means we could not look, never that
+    we looked and found nothing.
+
+    The disk block cannot supply the pending set -- rollouts hold no record of a
+    request that has not been answered yet -- but it does separate a thread
+    abandoned mid-turn from one that is simply idle, which is the distinction a
+    supervisor actually has to act on.
+    """
+    out["pending_known"] = False
+    phase = transcript.rollout_turn_phase(rollout) if rollout is not None else None
+    if phase is None:
+        out["disk"] = None
+        return out
+    out["disk"] = {**phase.as_dict(), "age_seconds": age_seconds}
+    return out
+
+
 @server.tool(
     description=(
         "List Codex threads across every installed instance: which instance each "
@@ -117,7 +142,12 @@ def list_threads(instance: str | None = None) -> dict[str, Any]:
         "model/reasoning/plan-mode settings in force, and anything the thread is "
         "waiting on an answer for, plus the `rollout` path to read its transcript. "
         "Read this before steering, stopping or responding. A null state means "
-        "the read failed -- it does NOT mean nothing is pending."
+        "the read failed -- it does NOT mean nothing is pending. Branch on "
+        "`pending_known`: false means the pending set could not be read at "
+        "all. When it is false, `disk` reports what the rollout on disk "
+        "still shows -- `phase: mid_turn` is a thread that was left inside a "
+        "turn, which together with a large `age_seconds` is the signature of "
+        "a wedged app: focus_thread it or check the UI."
     )
 )
 def thread_status(thread: str, instance: str | None = None) -> dict[str, Any]:
@@ -147,12 +177,13 @@ def thread_status(thread: str, instance: str | None = None) -> dict[str, Any]:
         if not resolved.info.app_owned:
             out["state"] = None
             out["note"] = "not open in the app; no live state to read"
-            return out
+            return _with_disk(out, rollout, resolved.info.age_seconds)
         state = sess.thread_state(resolved)
         if state is None:
             out["state"] = None
             out["note"] = "could not read stream state -- check the app UI"
-            return out
+            return _with_disk(out, rollout, resolved.info.age_seconds)
+        out["pending_known"] = True
         out["following"] = sess.follow_manager(resolved.instance).is_following(resolved.thread_id)
         out["state"] = {
             "runtime": state.runtime,
