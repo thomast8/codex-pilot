@@ -42,6 +42,18 @@ class PendingRequest:
         """Whether we know which follower method answers this kind."""
         return self.kind is not None
 
+    def as_dict(self) -> dict[str, Any]:
+        """The wire shape. One definition, because two would drift."""
+        return {
+            "request_id": self.request_id,
+            "kind": self.kind,
+            "summary": self.summary,
+            "reason": self.reason,
+            "cwd": self.cwd,
+            "available_decisions": self.available_decisions,
+            "answerable": self.answerable,
+        }
+
 
 @dataclass(frozen=True)
 class ThreadState:

@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_pilot.actions import ActionError, Session
+from codex_pilot.actions import ActionError, ResolvedThread, Session
 from codex_pilot.follow import EVENT_RUN_FAILED, EVENT_TURN_COMPLETED
 from codex_pilot.framing import FrameReader, encode_frame
 from codex_pilot.instances import Instance
@@ -484,5 +484,157 @@ def test_a_failed_handshake_leaves_nothing_behind(app):
         while threading.active_count() > before and time.monotonic() < deadline:
             time.sleep(0.02)
         assert threading.active_count() <= before
+    finally:
+        sess.close()
+
+
+def test_a_reconnect_resubscribes_every_followed_thread(app):
+    """The app records a follow against the connection it arrived on.
+
+    So reconnecting silently unsubscribes everything while `followed` keeps
+    listing it -- the thread stays registered and no frame ever arrives again.
+    """
+    sess, inst = live_session(app)
+    try:
+        sess.client(inst)
+        manager = sess.follow_manager(inst)
+        manager.follow(TID)
+        sess._ensure_pump(inst)
+
+        app.rebind()
+        sess.client(inst)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            follows = [
+                f
+                for f in app.frames
+                if f.get("method") == "thread-stream-following-changed"
+                and (f.get("params") or {}).get("conversationId") == TID
+            ]
+            if follows:
+                break
+            time.sleep(0.05)
+        assert follows, "reconnect never re-broadcast the follow"
+        assert follows[-1]["params"]["following"] is True
+    finally:
+        sess.close()
+
+
+def test_a_resubscribe_that_fails_to_send_is_not_dropped(app):
+    """take_resync_requests empties the queue, so a failed broadcast loses it."""
+    sess, inst = live_session(app)
+    try:
+        manager = sess.follow_manager(inst)
+        manager.follow(TID)
+        manager.resync_all("reconnected")
+
+        taken = manager.take_resync_requests()
+        assert taken == [TID]
+        assert manager.take_resync_requests() == []
+
+        manager.requeue_resync(taken)
+        assert manager.take_resync_requests() == [TID]
+    finally:
+        sess.close()
+
+
+def test_requeue_ignores_threads_that_stopped_being_followed(app):
+    sess, inst = live_session(app)
+    try:
+        manager = sess.follow_manager(inst)
+        manager.requeue_resync(["gone-thread"])
+        assert manager.take_resync_requests() == []
+    finally:
+        sess.close()
+
+
+# -- cursor epoch -------------------------------------------------------------
+#
+# Sequence numbers restart at 0 when the MCP server process does, and `collect`
+# only returns events with `seq > after`. A supervisor that kept its cursor
+# across a bounce therefore filters out every event that follows, forever, with
+# nothing in the response to say so.
+
+
+def test_collect_events_reports_an_epoch(app):
+    sess, _ = live_session(app)
+    try:
+        got = sess.collect_events()
+        assert got["epoch"]
+        assert got["cursor_reset"] is False
+    finally:
+        sess.close()
+
+
+def test_a_cursor_from_a_previous_process_is_reset_not_obeyed(app):
+    sess, inst = live_session(app)
+    try:
+        manager = sess.follow_manager(inst)
+        manager.emit_external(TID, EVENT_TURN_COMPLETED, {"route": "detached"})
+
+        stale = sess.collect_events(after=9999, epoch="a-previous-process")
+        assert stale["cursor_reset"] is True
+        assert [e["thread"] for e in stale["events"]] == [TID]
+    finally:
+        sess.close()
+
+
+def test_a_cursor_beyond_the_current_sequence_is_reset(app):
+    """Even with no epoch passed, an impossible cursor is a bounce tell."""
+    sess, inst = live_session(app)
+    try:
+        manager = sess.follow_manager(inst)
+        manager.emit_external(TID, EVENT_TURN_COMPLETED, {"route": "detached"})
+
+        got = sess.collect_events(after=9999)
+        assert got["cursor_reset"] is True
+        assert len(got["events"]) == 1
+    finally:
+        sess.close()
+
+
+def test_a_matching_epoch_honours_the_cursor(app):
+    sess, inst = live_session(app)
+    try:
+        manager = sess.follow_manager(inst)
+        manager.emit_external(TID, EVENT_TURN_COMPLETED, {"route": "detached"})
+        first = sess.collect_events()
+        assert len(first["events"]) == 1
+
+        again = sess.collect_events(after=first["cursor"], epoch=first["epoch"])
+        assert again["cursor_reset"] is False
+        assert again["events"] == []
+    finally:
+        sess.close()
+
+
+def test_a_lost_follow_still_resubscribes_when_state_is_read(app):
+    """Registered is not the same as healthy.
+
+    `snapshot` skipped the subscribe whenever a follow was registered, to avoid
+    unsubscribing a live one. But a follow that lost its connection is
+    registered and receiving nothing, so that skip meant waiting the full
+    timeout for a frame that could not arrive -- and reporting "could not read
+    stream state" on a thread the app would have answered for.
+    """
+    sess, inst = live_session(app)
+    try:
+        sess.client(inst)
+        manager = sess.follow_manager(inst)
+        manager.follow(TID)
+        manager.lost(TID, "IPC connection closed")
+        before = len(
+            [f for f in app.frames if f.get("method") == "thread-stream-following-changed"]
+        )
+
+        resolved = ResolvedThread(instance=inst, thread_id=TID, info=sess.store(inst).describe(TID))
+        sess.snapshot(resolved, wait=0.2)
+
+        follows = [f for f in app.frames if f.get("method") == "thread-stream-following-changed"]
+        assert len(follows) > before, "an unhealthy follow was never re-subscribed"
+        # The registration survives, so it must not be torn down on the way out.
+        assert all(f["params"]["following"] is True for f in follows[before:])
+        assert manager.is_following(TID)
     finally:
         sess.close()

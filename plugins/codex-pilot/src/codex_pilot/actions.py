@@ -24,6 +24,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -146,6 +147,10 @@ class Session:
         self._connecting: dict[str, threading.Lock] = {}
         self._stop = threading.Event()
         self._seq = SeqCounter()
+        # Sequence numbers restart at 0 with the process, so a cursor from a
+        # previous one silently filters out everything that follows it. The
+        # epoch is what lets a caller notice instead of going quietly deaf.
+        self._epoch = uuid.uuid4().hex
         self._guard = threading.RLock()
         self._snapshot_waiters: dict[str, list[queue.Queue[dict[str, Any]]]] = {}
 
@@ -325,6 +330,7 @@ class Session:
         after: int = 0,
         wait_seconds: float = 0.0,
         instance: str | None = None,
+        epoch: str | None = None,
     ) -> dict[str, Any]:
         """Drain events across instances, waiting if asked.
 
@@ -342,16 +348,24 @@ class Session:
             for i in self._instances
             if instance is None or i.slug == instance
         ]
+        # A cursor we could never have issued belongs to a previous process, so
+        # honouring it would drop every event from here on. Start over and say so.
+        cursor_reset = (epoch is not None and epoch != self._epoch) or after > self._seq.peek()
+        if cursor_reset:
+            after = 0
+
         deadline = time.monotonic() + max(0.0, wait_seconds)
         while True:
             merged: list[dict[str, Any]] = []
             dropped = 0
             following: list[str] = []
+            health: dict[str, Any] = {}
             for manager in managers:
                 got = manager.collect(threads, after=after, wait_seconds=0.0)
                 merged.extend(got["events"])
                 dropped += got["dropped"]
                 following.extend(got["following"])
+                health.update(got["threads"])
             if merged or time.monotonic() >= deadline:
                 merged.sort(key=lambda e: e["seq"])
                 return {
@@ -359,6 +373,9 @@ class Session:
                     "cursor": merged[-1]["seq"] if merged else after,
                     "dropped": dropped,
                     "following": sorted(set(following)),
+                    "threads": health,
+                    "epoch": self._epoch,
+                    "cursor_reset": cursor_reset,
                 }
             self._stop.wait(min(0.25, max(0.05, deadline - time.monotonic())))
 
@@ -1032,16 +1049,24 @@ class Session:
         subscribe and unsubscribe around it: the unsubscribe would deregister
         the live follow while our bookkeeping still called it active, leaving a
         follow that silently receives nothing.
+
+        Registered is not the same as healthy, though, and the two were treated
+        as one. A follow whose connection dropped is still registered while
+        receiving nothing, so skipping the subscribe meant waiting the full
+        timeout for a frame that could not arrive and then reporting the thread
+        unreadable. So the subscribe is driven by whether state is actually
+        arriving, and the *unsubscribe* by whether the follow is ours to keep.
         """
         manager = self.follow_manager(resolved.instance)
         client = self.client(resolved.instance)
-        already_following = manager.is_following(resolved.thread_id)
+        registered = manager.is_following(resolved.thread_id)
+        healthy = registered and manager.state_of(resolved.thread_id) is not None
 
         waiter: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=4)
         with self._guard:
             self._snapshot_waiters.setdefault(resolved.thread_id, []).append(waiter)
         try:
-            if not already_following:
+            if not healthy:
                 client.broadcast(FOLLOWING_CHANGED, payloads.follow(resolved.thread_id, True))
             try:
                 return waiter.get(timeout=wait)
@@ -1054,7 +1079,7 @@ class Session:
                     waiters.remove(waiter)
                 if not waiters:
                     self._snapshot_waiters.pop(resolved.thread_id, None)
-            if not already_following:
+            if not registered:
                 client.broadcast(FOLLOWING_CHANGED, payloads.follow(resolved.thread_id, False))
 
     def thread_row(self, inst: Instance, info: ThreadInfo) -> dict[str, Any]:

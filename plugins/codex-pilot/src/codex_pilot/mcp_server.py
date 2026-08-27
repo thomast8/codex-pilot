@@ -420,6 +420,17 @@ def follow_thread(thread: str, follow: bool = True, instance: str | None = None)
         "can also mean the app is holding the thread without rendering it, in "
         "which case the follow streams nothing until focus_thread. A non-zero "
         "`dropped` means the buffer overflowed and some events were lost."
+        "\n\n`threads` reports each thread's health -- ok, resyncing, lost, "
+        "detached or not_following -- with whatever it is waiting on. Read "
+        "`pending` only together with `pending_known`: an empty list on a "
+        "thread whose state cannot be read means 'no idea', NOT 'nothing "
+        "pending'. A thread that reports not_following was never followed or "
+        "was lost with the process, so nothing will ever arrive for it until "
+        "you follow it again."
+        "\n\nEvery response carries an `epoch`; pass it back alongside "
+        "`cursor`. If the server restarted, sequence numbers began again and "
+        "your cursor would silently discard everything after it -- a mismatch "
+        "resets the cursor and sets `cursor_reset`."
     )
 )
 def collect_events(
@@ -427,6 +438,7 @@ def collect_events(
     after: int = 0,
     wait_seconds: float = 0.0,
     instance: str | None = None,
+    epoch: str | None = None,
 ) -> dict[str, Any]:
     asked = max(0.0, wait_seconds)
     granted = min(MAX_WAIT_SECONDS, asked)
@@ -438,6 +450,7 @@ def collect_events(
                 after=after,
                 wait_seconds=granted,
                 instance=instance,
+                epoch=epoch,
             ),
         }
     except (ActionError, IpcError, ThreadError) as exc:

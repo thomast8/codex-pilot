@@ -51,6 +51,11 @@ class SeqCounter:
             self._value += 1
             return self._value
 
+    def peek(self) -> int:
+        """The highest sequence issued so far, for spotting an impossible cursor."""
+        with self._lock:
+            return self._value
+
 
 EVENT_TURN_STARTED = "turn_started"
 EVENT_TURN_COMPLETED = "turn_completed"
@@ -226,53 +231,41 @@ class FollowManager:
         self._resync_requests.append(tracked.thread_id)
         return [self._emit(tracked, EVENT_RESYNC, data)]
 
-    def resync_all(self, reason: str) -> list[Event]:
-        """Re-subscribe every live follow, after the connection underneath changed.
+    def health_of(self, thread_id: str) -> dict[str, Any]:
+        """What this follow can and cannot currently tell you.
 
-        A follow is state the app keeps against the connection the subscription
-        arrived on. Reconnecting therefore silently unsubscribes every thread we
-        still consider followed -- `followed` keeps listing them and no frame
-        ever comes. `lost()` is not enough on its own: it reports the outage but
-        queues no resync, so nothing re-broadcasts when the socket returns.
-
-        Clears `lost_reason` so a thread that was reported lost can be reported
-        healthy again once its snapshot lands.
-        """
-        produced: list[Event] = []
-        with self._lock:
-            for tracked in self._threads.values():
-                if tracked.external:
-                    continue
-                tracked.lost_reason = None
-                produced.extend(self._begin_resync(tracked, {"reason": reason}))
-            if produced:
-                self._wake.notify_all()
-        return produced
-
-    def requeue_resync(self, thread_ids: list[str]) -> None:
-        """Put back resync requests whose re-subscribe never made it out.
-
-        `take_resync_requests` empties the queue, so a broadcast that then fails
-        drops the request on the floor and the follow stays silent forever --
-        the same wedge the resync exists to cure.
-        """
-        if not thread_ids:
-            return
-        with self._lock:
-            known = [t for t in thread_ids if t in self._threads]
-            self._resync_requests = known + [
-                t for t in self._resync_requests if t not in set(known)
-            ]
-
-    def take_resync_requests(self) -> list[str]:
-        """Threads that need a fresh snapshot re-requested from the app.
-
-        A gap is only recoverable if somebody re-subscribes; without this the
-        follow stays wedged forever, silently reporting nothing.
+        `pending` is only meaningful alongside `pending_known`. An empty list on
+        a thread whose state we cannot read means "no idea", not "nothing
+        pending" -- conflating the two is how a blocked thread goes unnoticed,
+        which is the whole reason this is reported rather than inferred from an
+        absence in `following`.
         """
         with self._lock:
-            pending, self._resync_requests = self._resync_requests, []
-            return pending
+            return self._health_locked(thread_id)
+
+    def _health_locked(self, thread_id: str) -> dict[str, Any]:
+        tracked = self._threads.get(thread_id)
+        if tracked is None or tracked.external:
+            return {
+                "health": "not_following",
+                "reason": None,
+                "pending": [],
+                "pending_known": False,
+            }
+        state = tracked.projected
+        if tracked.lost_reason is not None:
+            health, reason = "lost", tracked.lost_reason
+        elif tracked.awaiting_snapshot or state is None:
+            health, reason = "resyncing", "awaiting a fresh snapshot"
+        else:
+            health, reason = "ok", None
+        known = state is not None
+        return {
+            "health": health,
+            "reason": reason,
+            "pending": [p.as_dict() for p in state.pending] if known and state else [],
+            "pending_known": known,
+        }
 
     def resync_all(self, reason: str) -> list[Event]:
         """Re-request a snapshot for every followed thread after a reconnect.
@@ -403,11 +396,17 @@ class FollowManager:
             with self._lock:
                 events, dropped = self._gather(threads, after)
                 if events or time.monotonic() >= deadline:
+                    following = sorted(t for t, v in self._threads.items() if not v.external)
+                    # Health covers what the caller asked about as well as what
+                    # we hold: a thread missing from `following` after a restart
+                    # is exactly the case that needs saying out loud.
+                    asked = set(threads or []) | set(following)
                     return {
                         "events": [e.as_dict() for e in events],
                         "cursor": events[-1].seq if events else after,
                         "dropped": dropped,
-                        "following": sorted(t for t, v in self._threads.items() if not v.external),
+                        "following": following,
+                        "threads": {t: self._health_locked(t) for t in sorted(asked)},
                     }
                 self._wake.wait(timeout=min(1.0, max(0.05, deadline - time.monotonic())))
 
