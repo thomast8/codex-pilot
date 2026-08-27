@@ -1,8 +1,13 @@
 # codex-pilot
 
-Drive Codex Desktop threads from Claude Code: send work, steer a running turn,
-stop one, answer approval requests, change model / reasoning / plan mode, and
-get told when a thread goes idle.
+Drive Codex Desktop threads from Claude Code: start work in the repo or worktree
+it belongs to, steer a running turn, stop one, answer approval requests, change
+model / reasoning / plan mode, and get told when a thread goes idle.
+
+Nothing blocks on Codex. Every call returns while the agent keeps working, so a
+session that hands off a job stays free to do something else instead of sitting
+on a synchronous `codex exec`. The one exception is `collect_events`, which waits
+only if you ask it to and is capped at two minutes.
 
 Built by decoding Codex Desktop's private local IPC protocol from the installed
 app bundle and validating every call against the running app. The full decode is
@@ -16,16 +21,19 @@ in [`docs/protocol.md`](docs/protocol.md).
 
 | Tool | |
 | --- | --- |
+| `start_thread` | create a thread, optionally making it a worktree and branch, and start its first turn |
 | `list_threads` | every thread across every installed Codex instance, with its route |
-| `thread_status` | busy/idle, current turn, settings, and anything the thread is waiting on |
-| `send_message` | start a turn — routes itself over IPC or a detached resume |
+| `thread_status` | busy/idle, current turn, settings, and anything the thread is waiting on — plus what the rollout shows when the app will not stream |
+| `send_message` | start a turn on an existing thread; routes itself over IPC or a detached resume |
 | `steer_turn` | inject into a *running* turn without restarting it |
-| `stop_turn` | interrupt, optionally only if a specific turn is still running |
+| `stop_turn` | interrupt a turn, or terminate a detached run and its process group |
 | `respond` | answer an approval, permission request, tool question or MCP elicitation |
 | `edit_thread` | model, reasoning effort, plan mode, fast mode, sandbox, approvals; or compact |
 | `set_goal` | give a thread a standing objective |
-| `follow_thread` / `collect_events` | learn when a turn finished, without polling |
+| `follow_thread` / `collect_events` | learn when a turn finished, without polling — covers detached runs too, and reports each follow's health |
 | `focus_thread` | make the app mount a thread it is holding but not showing |
+| `sync_threads` | which threads the app will actually answer for, and mount the rest |
+| `read_thread` | what a thread said, read off disk — works for every thread |
 
 ## Install
 
@@ -42,7 +50,7 @@ Or as a plugin, which ships the MCP server and the usage skill together:
 /plugin install codex-pilot@<your-marketplace>
 ```
 
-## The three things that decide what is possible
+## The things that decide what is possible
 
 **The writer lock picks the route.** Codex allows one writer per thread. A thread
 the app has open can only be driven over IPC; one nothing holds can only be
@@ -56,10 +64,73 @@ driven by neither route until something surfaces it — that is what `focus_thre
 is for. Remodex documents the same boundary: *"Codex Desktop only accepts an
 external stream after that thread's route is mounted."*
 
+**Not seeing something is not the same as there being nothing.** This is the one
+rule that decides whether a supervising session notices a wedged agent or waits
+on it forever. Stream state only reaches a thread the app has *mounted*, so
+`thread_status` returns `state: null` for plenty of threads that are very much
+doing something — and an empty pending list read exactly like "nothing to
+answer".
+
+So the answer is now in a field rather than in prose. `pending_known: false`
+means the pending set could not be read at all. Alongside it, `disk` reports what
+the rollout still shows: `phase` is `mid_turn` or `idle`, `last_boundary` is the
+record it read that from, and `last_boundary_at` is when that boundary was
+written. `age_seconds` comes from the thread store rather than the rollout — time
+since the thread's last recorded activity, and null if there is none. A
+`mid_turn` phase with a large `age_seconds` is the signature of an app that
+stopped answering. The rollout cannot supply the pending request itself — Codex writes no
+record for one, checked across 1,096 real rollouts (which mostly ran
+`auto_review`, so see `docs/protocol.md` for the exact scope) — but "abandoned mid-turn" and
+"idle" are different enough to act on.
+
+`collect_events` carries the same idea for follows. Each thread reports `health`
+(`ok`, `resyncing`, `lost`, `not_following`) with its own `pending_known`, so a
+thread that is unwatched because the server restarted says so instead of simply
+being absent from `following`. Pass the `epoch` back with your `cursor`: sequence
+numbers restart with the process, and without it a stale cursor silently
+discards every event that follows, forever.
+
+**A blocked thread is usually a settings problem.** A thread has no network by
+default, and a command needing one fails as a DNS error rather than as a policy
+refusal. `edit_thread` grants it: `sandboxPolicy` carries `networkAccess` and
+`writableRoots`. Verified live, a thread that could not resolve a host answered
+HTTP 200 on the next turn after the grant. Note `permissions` is a named profile
+id string, not a permission object, and the two cannot be combined.
+
 **Approvals only appear when the thread asks a human.** With `approvalsReviewer`
 set to `auto_review` (the default) a subagent silently decides escalations and
 `thread_status` shows nothing pending — indistinguishable from a thread that
 never asked. Set it to `user` on threads you intend to supervise.
+
+**Creating a thread is the one thing the IPC surface cannot do.** The app's
+follower protocol only drives threads that already exist, and there is no
+`codex://new` deep link, so `start_thread` spawns `codex exec` detached and
+reads the new thread id off its JSONL. It returns in about a second, works in
+the directory you name rather than the caller's, and the thread it creates can
+be pulled into Codex Desktop afterwards with `focus_thread`.
+
+That introduces a third lock state, which the rest of the surface is built
+around rather than papering over. While such a run is going, the lock holder is
+*ours*, not the app's: `route` reads `detached_running`, every app-driven verb
+refuses instead of walking you into a second writer on the rollout, and
+`stop_turn` terminates the run's process group. When it exits, the run reports
+`turn_completed` on the same event stream a followed thread uses, so one
+`collect_events` waits on app threads and detached runs alike.
+
+**Codex's own worktrees are not reachable from here.** Codex Desktop can run a
+thread in its own git worktree and fork a conversation into one, but that is an
+app-side affordance: no IPC method creates a thread, and a thread started from
+here does not hold the app-control tools that do it — asked to fork itself into a
+worktree it delegates to a subagent that hand-rolls `git worktree add` into /tmp
+on a detached HEAD, which is a directory rather than a managed worktree.
+
+So `start_thread` makes them itself, in the same place and layout Codex uses
+(`<CODEX_HOME>/worktrees/<id>/<repo>`, overridable with
+`CODEX_PILOT_WORKTREE_ROOT`), on a branch the caller names, refusing one that
+already exists. Parallel work
+either starts in the app (and codex-pilot drives the threads it produces) or uses
+worktrees you made yourself, kept out of Codex's own worktree root, which it
+garbage-collects.
 
 ## Waiting without burning a turn
 
@@ -135,7 +206,7 @@ lighter, no contention, but bounded by what the app will surface.
 ## Development
 
 ```sh
-uv run pytest                                    # 216 tests
+uv run pytest                                    # 317 tests
 uv run ruff check src tests scripts
 uv run mypy
 uv run python scripts/extract_registry.py --check  # protocol drift
@@ -143,6 +214,14 @@ uv run python scripts/extract_registry.py --check  # protocol drift
 
 `scripts/live_smoke.py` drives a real thread one method at a time. It requires an
 explicit `--thread` and hard-codes no ids; point it at something disposable.
+
+`scripts/restart_smoke.py` quits and relaunches a Codex Desktop to prove the
+pilot re-handshakes and re-arms its follows. Because it kills an app, it refuses
+any instance whose resolved `CODEX_HOME` is not the one it is scoped to, targets
+bundles by id rather than by the name `ChatGPT` (which matches every clone), and
+checks a pid against the bundle directory before signalling it. `--dry-run`
+prints the resolved target and stops; nothing destructive happens without
+`--yes`.
 
 ### When Codex Desktop updates
 

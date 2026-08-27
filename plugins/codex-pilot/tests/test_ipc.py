@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -216,3 +217,116 @@ def test_request_before_initialize_is_refused(wired):
     client, _ = wired
     with pytest.raises(IpcError):
         client.request("thread-owner-discovery", {"conversationId": "c1"})
+
+
+# -- connection health: the wedge that started this ---------------------------
+#
+# A frozen app keeps the socket open and answers nothing, so `is_closed` stays
+# false and every request burns its full timeout forever. These pin the strike
+# rule that ends that: a timeout only counts when *no* frame arrived while we
+# waited, and two in a row retire the connection.
+
+
+def test_silent_timeouts_retire_the_connection(wired):
+    client, router = wired
+    client.initialize()
+    router.responder = lambda msg: None
+
+    for _ in range(2):
+        with pytest.raises(IpcTimeout):
+            client.request("thread-owner-discovery", {"conversationId": "c1"}, timeout=0.3)
+
+    assert client.is_closed
+
+
+def test_one_silent_timeout_is_not_enough(wired):
+    """A single stall under load must not tear down a connection that recovers."""
+    client, router = wired
+    client.initialize()
+    router.responder = lambda msg: None
+
+    with pytest.raises(IpcTimeout):
+        client.request("thread-owner-discovery", {"conversationId": "c1"}, timeout=0.3)
+
+    assert not client.is_closed
+
+
+def test_a_frame_arriving_mid_wait_suppresses_the_strike(wired):
+    """Traffic proves the socket is alive even when this request goes unanswered."""
+    client, router = wired
+    client.initialize()
+
+    def silent_but_chatty(msg):
+        router.send(
+            {
+                "type": "broadcast",
+                "method": "thread-stream-state-changed",
+                "params": {"conversationId": "c1"},
+            }
+        )
+        return None
+
+    router.responder = silent_but_chatty
+    for _ in range(3):
+        with pytest.raises(IpcTimeout):
+            client.request("thread-owner-discovery", {"conversationId": "c1"}, timeout=0.3)
+
+    assert not client.is_closed
+
+
+def test_a_router_error_response_resets_strikes(wired):
+    """`no-client-found` for an unmounted thread is an answer, not silence."""
+    client, router = wired
+    client.initialize()
+    silent = True
+
+    def sometimes(msg):
+        if silent:
+            return None
+        return {
+            "type": "response",
+            "requestId": msg["requestId"],
+            "resultType": "error",
+            "error": "no-client-found",
+        }
+
+    router.responder = sometimes
+    with pytest.raises(IpcTimeout):
+        client.request("thread-owner-discovery", {"conversationId": "c1"}, timeout=0.3)
+
+    silent = False
+    with pytest.raises(RouterError):
+        client.request("thread-owner-discovery", {"conversationId": "c1"}, timeout=1.0)
+
+    silent = True
+    with pytest.raises(IpcTimeout):
+        client.request("thread-owner-discovery", {"conversationId": "c1"}, timeout=0.3)
+
+    # The error response cleared the first strike, so this is strike one again.
+    assert not client.is_closed
+
+
+def test_retiring_the_connection_never_resends(wired):
+    """A dead connection is replaced, not retried: the outcome stays unknown."""
+    client, router = wired
+    client.initialize()
+    router.responder = lambda msg: None
+
+    for _ in range(2):
+        with pytest.raises(IpcTimeout):
+            client.request("thread-follower-start-turn", {"conversationId": "c1"}, timeout=0.3)
+
+    turns = [m for m in router.received if m.get("method") == "thread-follower-start-turn"]
+    assert len(turns) == 2
+    assert len({m["requestId"] for m in turns}) == 2
+
+
+def test_connection_reset_broadcast_closes_the_client(wired):
+    """Decoded, not yet verified live: the router's own reset signal."""
+    client, router = wired
+    client.initialize()
+    router.send({"type": "broadcast", "method": "ipc-connection-reset", "params": {}})
+    deadline = time.monotonic() + 2.0
+    while not client.is_closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert client.is_closed

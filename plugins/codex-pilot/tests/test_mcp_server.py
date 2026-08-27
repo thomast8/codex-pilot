@@ -24,12 +24,15 @@ EXPECTED_TOOLS = {
     "list_threads",
     "thread_status",
     "send_message",
+    "start_thread",
     "steer_turn",
     "stop_turn",
     "respond",
     "edit_thread",
     "set_goal",
     "focus_thread",
+    "sync_threads",
+    "read_thread",
     "follow_thread",
     "collect_events",
 }
@@ -146,9 +149,17 @@ class StubSession:
     def __init__(self) -> None:
         self.wait_seconds: float | None = None
 
-    def collect_events(self, threads, after=0, wait_seconds=0.0, instance=None):
+    def collect_events(self, threads, after=0, wait_seconds=0.0, instance=None, epoch=None):
         self.wait_seconds = wait_seconds
-        return {"events": [], "cursor": after, "dropped": 0, "following": []}
+        return {
+            "events": [],
+            "cursor": after,
+            "dropped": 0,
+            "following": [],
+            "threads": {},
+            "epoch": "stub-epoch",
+            "cursor_reset": False,
+        }
 
 
 @pytest.fixture
@@ -266,3 +277,94 @@ async def test_respond_accepts_an_integer_request_id(empty_home: Path):
         schema = tools["respond"].input_schema["properties"]["request_id"]
         rendered = json.dumps(schema)
         assert "integer" in rendered
+
+
+def seed_rollout(home: Path, thread_id: str, boundary: str) -> None:
+    sub = home / "sessions" / "2026" / "08" / "27"
+    sub.mkdir(parents=True, exist_ok=True)
+    records = [
+        {"type": "session_meta", "payload": {"cwd": "/w", "id": thread_id}},
+        {
+            "timestamp": "2026-08-27T10:45:36.919Z",
+            "type": "event_msg",
+            "payload": {"type": boundary},
+        },
+    ]
+    (sub / f"rollout-2026-08-27T11-45-36-{thread_id}.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n"
+    )
+
+
+@pytest.mark.anyio
+async def test_unreadable_state_says_pending_is_unknown(empty_home: Path):
+    """`state: null` alone reads exactly like "nothing pending", and is not.
+
+    A thread the app holds without rendering it returns no stream state at all,
+    so a supervisor has to be told the difference in a field it can branch on
+    rather than in prose it has to parse.
+    """
+    tid = "01a042d3-4387-7601-a01b-1fbb4f67f272"
+    seed_rollout(empty_home, tid, "task_started")
+    async with (
+        stdio_client(server_params(empty_home)) as (read, write),
+        ClientSession(read, write) as sess,
+    ):
+        await sess.initialize()
+        result = await sess.call_tool("thread_status", {"thread": tid})
+        payload = json.loads(result.content[0].text)
+
+    assert payload["ok"] is True
+    assert payload["state"] is None
+    assert payload["pending_known"] is False
+    assert payload["disk"]["phase"] == "mid_turn"
+    assert payload["disk"]["last_boundary"] == "task_started"
+
+
+@pytest.mark.anyio
+async def test_an_idle_thread_reports_idle_from_disk(empty_home: Path):
+    tid = "01a04346-6163-7343-b111-000000000000"
+    seed_rollout(empty_home, tid, "task_complete")
+    async with (
+        stdio_client(server_params(empty_home)) as (read, write),
+        ClientSession(read, write) as sess,
+    ):
+        await sess.initialize()
+        result = await sess.call_tool("thread_status", {"thread": tid})
+        payload = json.loads(result.content[0].text)
+
+    assert payload["disk"]["phase"] == "idle"
+    assert payload["pending_known"] is False
+
+
+@pytest.mark.anyio
+async def test_collect_events_carries_an_epoch(empty_home: Path):
+    async with (
+        stdio_client(server_params(empty_home)) as (read, write),
+        ClientSession(read, write) as sess,
+    ):
+        await sess.initialize()
+        result = await sess.call_tool("collect_events", {})
+        payload = json.loads(result.content[0].text)
+
+    assert payload["ok"] is True
+    assert payload["epoch"]
+    assert payload["cursor_reset"] is False
+    assert payload["threads"] == {}
+
+
+@pytest.mark.anyio
+async def test_a_cursor_from_a_previous_server_is_reset(empty_home: Path):
+    """The epoch has to survive the tool signature, not just the Session call."""
+    async with (
+        stdio_client(server_params(empty_home)) as (read, write),
+        ClientSession(read, write) as sess,
+    ):
+        await sess.initialize()
+        result = await sess.call_tool(
+            "collect_events", {"epoch": "a-previous-process", "after": 9999}
+        )
+        payload = json.loads(result.content[0].text)
+
+    assert payload["ok"] is True
+    assert payload["cursor_reset"] is True
+    assert payload["cursor"] == 0

@@ -133,9 +133,72 @@ Version map, verbatim from the bundle's `b_` object (remodex's
 `initialize` is handled by the router itself and is not in the map; it takes
 version 1.
 
+`ipc-connection-reset` is the one method in the map this client *handles* rather
+than sends; see **Connection health**.
+
 **Interrupt is the one special case** (bundle function `S_`): it is version **3**
 when `expectedTurnId` is absent or null, and version **4** when present. So the
 precondition-free form stays callable on a client that only speaks v3.
+
+## Connection health — verified
+
+The connection is long-lived: one socket, one handshake, reused across calls so a
+follow subscription survives between requests. Two things can end it without the
+socket ever saying so, and each needs its own tell.
+
+**A frozen app.** A Codex Desktop stuck behind a modal dialog keeps its socket
+open and answers nothing. The fd stays valid, `recv` blocks rather than returning
+EOF, and every request burns its full 15s timeout against a connection that is
+never coming back. Observed: `send_message` failing with `IpcTimeout` on
+`thread-owner-discovery` for twenty minutes while `list_threads` and
+`focus_thread` kept working — those two read writer locks off disk and shell out
+to `open`, so neither proves anything about the socket.
+
+The tell is a timeout during which **no frame of any kind arrived**. Two
+consecutive such timeouts retire the connection. Any frame resets the count, and
+so does any answer — including `no-client-found`, which is what a thread the app
+holds but does not render legitimately returns after the router's full ~10s
+discovery timeout. Without that distinction, asking about an unmounted thread
+would tear down a healthy connection.
+
+**A restarted app.** The socket path is stable across a restart
+(`$CODEX_HOME/ipc/ipc.sock` either way), so the path cannot tell. The inode can:
+the app unlinks and re-binds, allocating a new one. `(st_dev, st_ino)` is
+recorded at connect and compared on every cache hit. Verified live across a real
+quit-and-relaunch: `59558764` → `62473890`, and the replacement handshake
+returned a new `clientId`.
+
+**Retiring only closes.** Nothing is re-sent. A request whose outcome was unknown
+stays unknown — the app may well have received it — and the replacement
+connection is built lazily on the next call. This is the same rule `respond`
+already follows, and for the same reason: re-sending could answer a different
+request that has since taken the same slot.
+
+**`ipc-connection-reset` is handled but unproven.** It is pinned in the version
+map and treated as fatal when received. A real restart smoke did **not** produce
+one, so whether the router ever sends it to a follower is still **decoded, not
+verified**. It costs nothing to act on and would detect a reset instantly if it
+does arrive.
+
+**Follows do not survive a reconnect by themselves.** A follow is state the app
+keeps against the connection its `thread-stream-following-changed` broadcast
+arrived on. Reconnecting therefore unsubscribes everything, silently — the
+follower still considers itself following and simply never receives another
+frame. Every registered follow is re-subscribed when a new connection is made.
+
+One request is not enough. Verified live: after a restart the app came back
+holding **no threads at all**, so the re-subscribe reached an app with nothing to
+stream. Unanswered snapshot requests are therefore repeated on a 15s cadence
+rather than asked once and latched — an initial subscribe included, since a
+thread the app has not mounted never answers the first one either.
+
+**What the strike counter can and cannot see.** It is fed by `_dispatch`, so
+*any* inbound frame counts as life, including router traffic for threads we do
+not follow. It therefore detects the Electron **main** process going silent. A
+wedge confined to the renderer, with the router still chatty, would not trip it —
+and would not trip the inode check either, since nothing re-binds. The disk tier
+(`thread_status`'s `disk` block) is the backstop for that case, which is part of
+why it exists.
 
 ## Acting on a thread
 
@@ -233,6 +296,9 @@ Pending requests live on the conversation object as `conversation.requests`, eac
 
 **`McpServerElicitationAction`:** `"accept"`, `"decline"`, `"cancel"`.
 
+Not on disk: a pending request exists only in live stream state. See *What the rollout
+does and does not hold*.
+
 > The four values beyond plain accept/decline are **persistent grants**, not
 > per-request answers. `acceptForSession` disables prompting for matching
 > commands for the rest of the session; the two amendment forms write policy that
@@ -268,6 +334,55 @@ re-announce. Set `following: false` to stop.
 | `turnHistory.history.entitiesByKey` | turns, keyed `tail:N:local:<uuid>` |
 | `currentPermissions` | `approvalPolicy`, `approvalsReviewer`, `sandboxPolicy.writableRoots` |
 | `cwd`, `rolloutPath`, `id` | thread identity and location |
+
+## What the rollout does and does not hold — corpus-validated
+
+A third label, distinct from the two used elsewhere here. **Verified** means
+executed against a live Codex Desktop; **decoded** means read out of the app
+bundle and never executed. **Corpus-validated** means established by enumerating
+real rollout files on disk — strong evidence about what Codex writes, but bounded
+by what these particular threads happened to do.
+
+**Rollouts contain no pending approval request.** Every record type across
+**1,096 rollouts** was enumerated on 2026-08-27: 932 under `~/.codex` and 164
+under `~/.codex-secondary`. Neither home holds any approval-request record type —
+no `exec_approval_request`, no `apply_patch_approval_request`, nothing carrying a
+`requests` array. Every textual hit for `requestApproval` on disk is incidental:
+an agent that happened to read this plugin's own protocol notes.
+
+That matches how the format works. A rollout records what *happened* — completed
+items, turn boundaries, messages, reasoning, turn context. A request that has not
+been answered has not happened yet. It lives only in the app's in-memory
+`conversationState.requests`, which reaches a follower through the stream and
+nowhere else.
+
+Decided approvals *do* land, as `event_msg` / `item_completed` with
+`item.type` in `{CommandExecution, FileChange}` and `status` in
+`{completed, failed, declined}`. So a post-hoc audit of what a thread declined is
+available from disk; a live "what is it waiting on" is not.
+
+Caveat: both corpora ran mostly with `approvalsReviewer: auto_review`, so few
+approvals ever reached a human. The `declined` records show that even
+human-decided ones appear only after the decision.
+
+**Turn boundaries are the useful thing that is on disk.** `event_msg` records of
+type `task_started`, `task_complete` and `turn_aborted` bracket every turn, so
+the rollout can say whether a thread was left *inside* a turn — which separates
+"abandoned mid-turn twenty minutes ago" from "idle, nothing to see", and that is
+the distinction a supervisor has to act on when stream state is unreadable.
+
+**Take the last boundary in file order. Never count opens against closes.**
+Rollouts routinely open with an out-of-order burst: a `task_complete` written
+*before* a `task_started` at an identical millisecond, and duplicate
+`task_started` at the same one. Counting reads those threads as permanently
+wedged. Across one day's 36 rollouts, last-boundary-wins yields 35 idle and 1
+mid-turn — the mid-turn one last active at 10:50 while its file was still open at
+11:45, which is exactly the wedge it is meant to catch.
+
+The record vocabulary is **not** a closed set: it differs between instances
+(`~/.codex-secondary` carries `thread_rolled_back` and `image_generation_end`,
+which the `~/.codex` sweep never saw), so anything unrecognised must be skipped
+rather than assumed.
 
 ## The single-writer lock
 
