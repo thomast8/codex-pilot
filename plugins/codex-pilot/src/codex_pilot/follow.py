@@ -207,7 +207,7 @@ class FollowManager:
         `awaiting_snapshot` flag stops a broken stream turning into resync spam
         that evicts every real event from the buffer.
         """
-        data = {**data, "held": tracked.revision} if "held" in data else data
+        data = data if "held" in data else {**data, "held": tracked.revision}
         already = tracked.awaiting_snapshot
         tracked.state = None
         tracked.revision = None
@@ -226,6 +226,41 @@ class FollowManager:
         with self._lock:
             pending, self._resync_requests = self._resync_requests, []
             return pending
+
+    def resync_all(self, reason: str) -> list[Event]:
+        """Re-request a snapshot for every followed thread after a reconnect.
+
+        A replaced connection means the app holds no record of our
+        subscriptions, so every follow is silently dead until it is asked for
+        again. This deliberately bypasses the `awaiting_snapshot` guard that
+        `_begin_resync` honours: a thread already awaiting a snapshot when the
+        socket died is exactly the one that would otherwise never be re-queued,
+        and would sit silent forever.
+        """
+        with self._lock:
+            produced: list[Event] = []
+            for tracked in self._threads.values():
+                tracked.state = None
+                tracked.revision = None
+                tracked.awaiting_snapshot = True
+                if tracked.thread_id not in self._resync_requests:
+                    self._resync_requests.append(tracked.thread_id)
+                produced.append(self._emit(tracked, EVENT_RESYNC, {"reason": reason}))
+            if produced:
+                self._wake.notify_all()
+            return produced
+
+    def requeue_resync(self, thread_ids: list[str]) -> None:
+        """Put back ids whose re-subscribe broadcast failed after being taken.
+
+        `take_resync_requests` pops, so a failed send would otherwise lose them
+        outright -- and `_begin_resync` will not queue them again while
+        `awaiting_snapshot` holds.
+        """
+        with self._lock:
+            for thread_id in thread_ids:
+                if thread_id in self._threads and thread_id not in self._resync_requests:
+                    self._resync_requests.append(thread_id)
 
     def lost(self, thread_id: str, reason: str) -> None:
         with self._lock:

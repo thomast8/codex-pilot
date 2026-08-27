@@ -128,6 +128,26 @@ def test_a_revision_gap_resyncs_instead_of_applying(manager, frames):
     assert manager._threads[THREAD].state is None
 
 
+def test_a_failed_patch_reports_the_revision_it_held(manager, frames):
+    """`held` is the one value worth having when debugging a gap, and the
+    PatchError branch is the one that does not pass it in itself."""
+    snapshot_frame = next(f for f in frames if f["params"]["change"]["type"] == "snapshot")
+    manager.handle_frame(snapshot_frame)
+    held = manager._threads[THREAD].revision
+    assert held is not None
+
+    broken = json.loads(
+        json.dumps(next(f for f in frames if f["params"]["change"]["type"] == "patches"))
+    )
+    broken["params"]["change"]["baseRevision"] = held
+    broken["params"]["change"]["patches"] = [{"op": "replace", "path": [], "value": 1}]
+
+    events = manager.handle_frame(broken)
+
+    assert [e.type for e in events] == [EVENT_RESYNC]
+    assert events[0].data["held"] == held
+
+
 def test_patches_before_any_snapshot_resync(manager, frames):
     patch_frame = next(f for f in frames if f["params"]["change"]["type"] == "patches")
     assert [e.type for e in manager.handle_frame(patch_frame)] == [EVENT_RESYNC]
@@ -193,3 +213,59 @@ def test_unfollow_stops_tracking(manager):
     manager.unfollow(THREAD)
     assert manager.followed == []
     assert manager.is_following(THREAD) is False
+
+
+# -- gap recovery after a reconnect ----------------------------------------
+#
+# When the IPC connection is replaced, the app has no record of our
+# subscriptions. Recovery has to survive the `awaiting_snapshot` guard, which
+# is exactly the state a follow is in when the connection dies mid-gap.
+
+
+def _open_a_gap(manager: FollowManager, frames: list[dict]) -> None:
+    """Feed a patch with no snapshot behind it, which is a revision gap."""
+    patch = next(f for f in frames if f["params"]["change"]["type"] == "patches")
+    manager.handle_frame(patch)
+
+
+def test_resync_all_requeues_a_thread_already_awaiting_a_snapshot(manager, frames):
+    _open_a_gap(manager, frames)
+    assert manager.take_resync_requests() == [THREAD]
+    # Second gap while already awaiting: deliberately does not re-queue, which
+    # is the wedge a reconnect has to break.
+    _open_a_gap(manager, frames)
+    assert manager.take_resync_requests() == []
+
+    produced = manager.resync_all("ipc reconnected")
+
+    assert manager.take_resync_requests() == [THREAD]
+    assert [e.type for e in produced] == [EVENT_RESYNC]
+    assert produced[0].data["reason"] == "ipc reconnected"
+
+
+def test_resync_all_emits_a_collectable_event_so_silence_is_never_ambiguous(manager, frames):
+    manager.resync_all("ipc reconnected")
+    collected = manager.collect()
+    assert [e["type"] for e in collected["events"]] == [EVENT_RESYNC]
+
+
+def test_resync_all_on_nothing_followed_is_a_no_op():
+    empty = FollowManager("default")
+    assert empty.resync_all("ipc reconnected") == []
+    assert empty.take_resync_requests() == []
+
+
+def test_requeue_resync_restores_ids_a_failed_broadcast_took(manager, frames):
+    _open_a_gap(manager, frames)
+    taken = manager.take_resync_requests()
+    assert taken == [THREAD]
+
+    manager.requeue_resync(taken)
+
+    assert manager.take_resync_requests() == [THREAD]
+
+
+def test_requeue_resync_does_not_duplicate_an_id_still_queued(manager, frames):
+    _open_a_gap(manager, frames)
+    manager.requeue_resync([THREAD])
+    assert manager.take_resync_requests() == [THREAD]
