@@ -269,3 +269,70 @@ def test_requeue_resync_does_not_duplicate_an_id_still_queued(manager, frames):
     _open_a_gap(manager, frames)
     manager.requeue_resync([THREAD])
     assert manager.take_resync_requests() == [THREAD]
+
+def test_health_reports_pending_when_the_state_is_readable(manager, frames):
+    manager.handle_frame(frames[0])
+    health = manager.health_of(THREAD)
+    assert health["health"] == "ok"
+    assert health["pending_known"] is True
+    assert health["pending"] == []
+
+
+def test_health_never_reports_an_unreadable_thread_as_nothing_pending(manager):
+    """The whole defect in one assertion: absence of state is not absence of asks."""
+    manager.lost(THREAD, "IPC connection closed")
+    health = manager.health_of(THREAD)
+    assert health["health"] == "lost"
+    assert health["pending"] == []
+    assert health["pending_known"] is False
+
+
+def test_health_of_an_unknown_thread_says_so(manager):
+    health = manager.health_of("never-followed")
+    assert health["health"] == "not_following"
+    assert health["pending_known"] is False
+
+
+def test_collect_reports_health_for_threads_it_was_asked_about(manager, frames):
+    manager.handle_frame(frames[0])
+    got = manager.collect([THREAD, "never-followed"])
+    assert got["threads"][THREAD]["health"] == "ok"
+    assert got["threads"]["never-followed"]["health"] == "not_following"
+
+
+def test_a_follow_awaiting_a_snapshot_keeps_asking(manager, frames):
+    """Asking once is not enough when the app was not ready to answer.
+
+    Verified live: after an app restart the thread was not reopened at all, so
+    the re-subscribe went out to an app that would never answer it. The
+    awaiting-snapshot latch then stopped anything asking again, leaving the
+    follow silent for good once the thread did come back.
+    """
+    manager.handle_frame(frames[0])
+    manager.resync_all("reconnected")
+    assert manager.take_resync_requests() == [THREAD]
+
+    # Nothing came back, so it must be asked again -- but not on every tick.
+    assert manager.stale_awaiting(older_than=60.0) == []
+    assert manager.stale_awaiting(older_than=0.0) == [THREAD]
+
+
+def test_a_follow_that_got_its_snapshot_stops_asking(manager, frames):
+    manager.handle_frame(frames[0])
+    manager.resync_all("reconnected")
+    manager.take_resync_requests()
+
+    manager.handle_frame(frames[0])
+    assert manager.stale_awaiting(older_than=0.0) == []
+    assert manager.health_of(THREAD)["health"] == "ok"
+
+
+def test_retrying_a_resync_does_not_flood_the_event_buffer(manager, frames):
+    """The latch exists to stop resync spam evicting real events. Keep that."""
+    manager.handle_frame(frames[0])
+    before = len(manager.collect()["events"])
+    manager.resync_all("reconnected")
+    for _ in range(20):
+        manager.stale_awaiting(older_than=0.0)
+    after = len(manager.collect()["events"])
+    assert after - before == 1

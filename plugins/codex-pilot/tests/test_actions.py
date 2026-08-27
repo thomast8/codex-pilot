@@ -488,37 +488,10 @@ def test_a_failed_handshake_leaves_nothing_behind(app):
         sess.close()
 
 
-def test_a_reconnect_resubscribes_every_followed_thread(app):
-    """The app records a follow against the connection it arrived on.
-
-    So reconnecting silently unsubscribes everything while `followed` keeps
-    listing it -- the thread stays registered and no frame ever arrives again.
-    """
-    sess, inst = live_session(app)
-    try:
-        sess.client(inst)
-        manager = sess.follow_manager(inst)
-        manager.follow(TID)
-        sess._ensure_pump(inst)
-
-        app.rebind()
-        sess.client(inst)
-
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            follows = [
-                f
-                for f in app.frames
-                if f.get("method") == "thread-stream-following-changed"
-                and (f.get("params") or {}).get("conversationId") == TID
-            ]
-            if follows:
-                break
-            time.sleep(0.05)
-        assert follows, "reconnect never re-broadcast the follow"
-        assert follows[-1]["params"]["following"] is True
-    finally:
-        sess.close()
+# Reconnect re-subscription itself lives in tests/test_reconnect.py, which
+# drives it against the shared fake app. What is kept here is the half-open
+# case that harness cannot express: a re-bind with the old connection still
+# open, where `is_closed` never trips and only the inode tells you.
 
 
 def test_a_resubscribe_that_fails_to_send_is_not_dropped(app):

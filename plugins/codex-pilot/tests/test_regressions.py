@@ -19,7 +19,26 @@ from codex_pilot.follow import (
     FollowManager,
     SeqCounter,
 )
+from codex_pilot.ipc import STALE_STRIKE_LIMIT, IpcClient
 from codex_pilot.snapshot import PatchError, apply_patches, project
+
+
+class _StrikeOnly(IpcClient):
+    """An IpcClient with no socket: only the strike bookkeeping is exercised."""
+
+    def __init__(self) -> None:
+        self._last_frame = 0.0
+        self._strikes = 0
+        self._fatal: BaseException | None = None
+        self.closed_calls = 0
+
+    def close(self) -> None:
+        self.closed_calls += 1
+
+
+def _detached_client() -> _StrikeOnly:
+    return _StrikeOnly()
+
 
 FIXTURE = Path(__file__).parent / "fixtures" / "stream_frames.json"
 THREAD = "01a03e2b-a106-77a3-add2-913ac3f7336a"
@@ -214,3 +233,92 @@ def test_long_poll_still_returns_promptly_when_idle():
     started = time.monotonic()
     assert m.collect([THREAD], wait_seconds=0.4)["events"] == []
     assert time.monotonic() - started >= 0.3
+
+
+# -- the app-wedge episode ----------------------------------------------------
+#
+# One morning Codex Desktop froze mid-turn behind a macOS update dialog. Three
+# separate defects each hid it, and two threads sat wedged for twenty minutes.
+# These describe what a supervisor could not see, not how it is now seen.
+
+
+def test_a_connection_that_answers_nothing_is_eventually_given_up_on():
+    """Every send_message failed while list_threads and focus_thread worked.
+
+    Those two read the disk and shell out, so they never proved the socket was
+    alive -- and the socket never reported itself closed, because a frozen app
+    holds it open. Only killing the server process by hand recovered it.
+    """
+    client = _detached_client()
+
+    retired = [client._record_silent_timeout(time.monotonic()) for _ in range(STALE_STRIKE_LIMIT)]
+    assert retired[-1] is True
+    assert client.closed_calls == 1
+
+
+def test_a_live_connection_is_never_given_up_on_for_a_slow_thread():
+    """An unmounted thread costs the router its full discovery timeout.
+
+    Counting that as evidence about the connection would tear down a healthy
+    one every time somebody asked about a thread the app is not rendering.
+    """
+    client = _detached_client()
+
+    for _ in range(10):
+        sent_at = time.monotonic()
+        client._last_frame = sent_at + 0.001  # a frame landed while we waited
+        assert client._record_silent_timeout(sent_at) is False
+    assert client.closed_calls == 0
+
+
+def test_an_empty_following_list_no_longer_looks_like_a_quiet_thread():
+    """collect_events answered `following: []` while a thread held an approval.
+
+    The registry had gone with the server process, so there was nothing to
+    re-arm and nothing in the response to say the thread was unwatched.
+    """
+    manager = FollowManager("default")
+    got = manager.collect([THREAD])
+
+    assert got["following"] == []
+    assert got["threads"][THREAD]["health"] == "not_following"
+    assert got["threads"][THREAD]["pending_known"] is False
+
+
+def test_a_follow_that_survived_a_reconnect_asks_for_a_new_snapshot(frames):
+    """Registrations outlive a connection; subscriptions do not.
+
+    `lost()` reported the drop but queued no resync, and the pump only
+    re-subscribes threads that asked for one -- so the follow stayed listed and
+    permanently silent.
+    """
+    manager = FollowManager("default")
+    manager.follow(THREAD)
+    manager.handle_frame(frames[0])
+    manager.lost(THREAD, "IPC connection closed")
+
+    manager.resync_all("reconnected")
+    assert manager.take_resync_requests() == [THREAD]
+
+
+def test_unreadable_stream_state_is_never_reported_as_nothing_pending(tmp_path):
+    """`state: null` and "no approvals" were the same answer.
+
+    The rollout cannot supply the pending request -- no record type exists for
+    one -- but it can say the thread was left inside a turn.
+    """
+    from codex_pilot import transcript
+
+    roll = tmp_path / "r.jsonl"
+    roll.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-08-27T10:45:36.919Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started"},
+            }
+        )
+        + "\n"
+    )
+    phase = transcript.rollout_turn_phase(roll)
+    assert phase is not None and phase.mid_turn

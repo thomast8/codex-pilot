@@ -98,6 +98,9 @@ class FollowedThread:
     last_runtime: str | None = None
     last_requests: frozenset[Any] = frozenset()
     awaiting_snapshot: bool = False
+    # When the outstanding snapshot request went out, so a request the app
+    # was not ready to answer can be repeated instead of waited on forever.
+    awaiting_since: float | None = None
     lost_reason: str | None = None
     collected_dropped: int = 0
     # True for a thread we only report *about* (a detached run) rather than
@@ -184,6 +187,7 @@ class FollowManager:
                     tracked.state = payload
                     tracked.revision = revision
                     tracked.awaiting_snapshot = False
+                    tracked.awaiting_since = None
                     tracked.lost_reason = None
             elif kind == "patches":
                 # A missing baseRevision is treated as a gap: without it there is
@@ -226,6 +230,7 @@ class FollowManager:
         tracked.state = None
         tracked.revision = None
         tracked.awaiting_snapshot = True
+        tracked.awaiting_since = time.monotonic()
         if already:
             return []
         self._resync_requests.append(tracked.thread_id)
@@ -283,6 +288,10 @@ class FollowManager:
                 tracked.state = None
                 tracked.revision = None
                 tracked.awaiting_snapshot = True
+                # Stamped so `stale_awaiting` can pick this up again: an app
+                # that is still starting, or holding no threads, never answers
+                # the first re-subscribe.
+                tracked.awaiting_since = time.monotonic()
                 if tracked.thread_id not in self._resync_requests:
                     self._resync_requests.append(tracked.thread_id)
                 produced.append(self._emit(tracked, EVENT_RESYNC, {"reason": reason}))
@@ -301,6 +310,46 @@ class FollowManager:
             for thread_id in thread_ids:
                 if thread_id in self._threads and thread_id not in self._resync_requests:
                     self._resync_requests.append(thread_id)
+
+    def stale_awaiting(self, older_than: float) -> list[str]:
+        """Follows still waiting on a snapshot they asked for a while ago.
+
+        A resync is requested once and then latched, which is right for a gap in
+        a stream the app is actively sending: one request is enough. It is wrong
+        after a reconnect, where the request can reach an app that is still
+        starting up, or that has not reopened the thread at all -- verified
+        live, where the re-subscribe went out to an app holding no threads and
+        the follow then sat silent with nothing left to ask again.
+
+        Re-queues them for the pump. Deliberately does not emit another event:
+        the latch still does its original job of keeping resync spam from
+        evicting real events from the buffer.
+        """
+        now = time.monotonic()
+        with self._lock:
+            due = [
+                t.thread_id
+                for t in self._threads.values()
+                if not t.external
+                and t.awaiting_snapshot
+                and t.awaiting_since is not None
+                and now - t.awaiting_since >= older_than
+            ]
+            for thread_id in due:
+                self._threads[thread_id].awaiting_since = now
+            pending = set(self._resync_requests)
+            self._resync_requests.extend(t for t in due if t not in pending)
+            return due
+
+    def take_resync_requests(self) -> list[str]:
+        """Threads that need a fresh snapshot re-requested from the app.
+
+        A gap is only recoverable if somebody re-subscribes; without this the
+        follow stays wedged forever, silently reporting nothing.
+        """
+        with self._lock:
+            pending, self._resync_requests = self._resync_requests, []
+            return pending
 
     def lost(self, thread_id: str, reason: str) -> None:
         with self._lock:

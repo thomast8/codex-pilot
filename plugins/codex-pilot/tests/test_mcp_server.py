@@ -149,9 +149,17 @@ class StubSession:
     def __init__(self) -> None:
         self.wait_seconds: float | None = None
 
-    def collect_events(self, threads, after=0, wait_seconds=0.0, instance=None):
+    def collect_events(self, threads, after=0, wait_seconds=0.0, instance=None, epoch=None):
         self.wait_seconds = wait_seconds
-        return {"events": [], "cursor": after, "dropped": 0, "following": []}
+        return {
+            "events": [],
+            "cursor": after,
+            "dropped": 0,
+            "following": [],
+            "threads": {},
+            "epoch": "stub-epoch",
+            "cursor_reset": False,
+        }
 
 
 @pytest.fixture

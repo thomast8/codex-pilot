@@ -47,6 +47,10 @@ OWNER_DISCOVERY = "thread-owner-discovery"
 FOLLOWING_CHANGED = "thread-stream-following-changed"
 STREAM_STATE_CHANGED = "thread-stream-state-changed"
 SNAPSHOT_WAIT_SECONDS = 3.0
+# How long an unanswered snapshot request waits before being asked again.
+# Long enough not to spam an app that is merely slow, short enough that a
+# thread the app reopens after a restart starts streaming without a nudge.
+RESYNC_RETRY_SECONDS = 15.0
 # Finished runs stay listed so threads we started remain visible; the cap
 # keeps a long orchestration session from growing the map without end.
 MAX_TRACKED_RUNS = 200
@@ -209,6 +213,9 @@ class Session:
                         self._stop.wait(0.5 if self._has_pending_runs(instance) else 5.0)
                         continue
                     try:
+                        # A request the app was not ready for is otherwise never
+                        # repeated: the awaiting latch stops anything asking twice.
+                        manager.stale_awaiting(RESYNC_RETRY_SECONDS)
                         pending = manager.take_resync_requests()
                         try:
                             for thread_id in pending:
