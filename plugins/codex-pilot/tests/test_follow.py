@@ -270,6 +270,7 @@ def test_requeue_resync_does_not_duplicate_an_id_still_queued(manager, frames):
     manager.requeue_resync([THREAD])
     assert manager.take_resync_requests() == [THREAD]
 
+
 def test_health_reports_pending_when_the_state_is_readable(manager, frames):
     manager.handle_frame(frames[0])
     health = manager.health_of(THREAD)
