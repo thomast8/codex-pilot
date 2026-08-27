@@ -59,10 +59,27 @@ def write_rollout(home: Path, thread_id: str, cwd: Path) -> None:
     )
 
 
-def session(home: Path, tmp_path: Path, binary: Path, holders: dict[str, str] | None = None):
+# Two lock holders lsof cannot tell apart -- both report the command "codex".
+# APP_PID is the process serving the instance's IPC socket (so the app);
+# FOREIGN_PID is a `codex exec resume` nobody in this process started.
+APP_PID = 78222
+FOREIGN_PID = 69843
+
+
+def session(
+    home: Path,
+    tmp_path: Path,
+    binary: Path,
+    holders: dict[str, tuple[int, str]] | None = None,
+    app_pids: frozenset[int] | None = frozenset({APP_PID}),
+):
     inst = Instance(slug="default", codex_home=home, app_path=None, is_default=True)
     sess = Session(instances=[inst])
-    store = ThreadStore(home, lock_holder_probe=lambda paths: dict(holders or {}))
+    store = ThreadStore(
+        home,
+        lock_holder_probe=lambda paths: dict(holders or {}),
+        app_process_probe=lambda socks: None if app_pids is None else set(app_pids),
+    )
     sess._stores["default"] = store
     sess._runners["default"] = DetachedRunner(inst, store, codex_binary=binary)
     return sess, inst
@@ -152,7 +169,12 @@ def test_a_new_run_replaces_a_finished_one_for_the_same_thread(home, tmp_path):
 def test_route_says_running_when_the_lock_is_ours_not_the_apps(home, tmp_path):
     work = tmp_path / "work"
     work.mkdir()
-    sess, _ = session(home, tmp_path, stub(tmp_path, [STARTED], sleep=5), holders={TID: "codex(1)"})
+    sess, _ = session(
+        home,
+        tmp_path,
+        stub(tmp_path, [STARTED], sleep=5),
+        holders={TID: (FOREIGN_PID, "codex")},
+    )
     sess.start_thread("build it", cwd=str(work))
     write_rollout(home, TID, work)
     row = next(r for r in sess.list_threads() if r["thread"] == TID)
@@ -447,7 +469,11 @@ def app():
 def live_session(app: FakeApp, ipc_timeout: float = 1.0):
     inst = Instance(slug="default", codex_home=app.home, app_path=None, is_default=True)
     sess = Session(instances=[inst], ipc_timeout=ipc_timeout)
-    sess._stores["default"] = ThreadStore(app.home, lock_holder_probe=lambda paths: {})
+    sess._stores["default"] = ThreadStore(
+        app.home,
+        lock_holder_probe=lambda paths: {},
+        app_process_probe=lambda socks: set(),
+    )
     return sess, inst
 
 
@@ -802,3 +828,151 @@ def test_a_resubscribe_that_fails_mid_send_is_retried_by_the_pump(app, monkeypat
         assert follows, "a failed re-subscribe was never retried"
     finally:
         sess.close()
+
+
+# -- a writer this process did not start --------------------------------------
+#
+# The bug these pin: `detached_running` used to exist only in the spawning
+# process's in-memory run map, so any *other* process -- a fresh Session, a
+# `codex-pilot watch`, the same MCP server after a restart -- saw a held lock
+# and called it `desktop`. That sends callers to an IPC route that cannot work,
+# and it is the same "absence reported as fact" this codebase keeps finding in
+# itself: no entry in the run map is not evidence the app owns the thread.
+
+
+def test_a_foreign_writer_is_detached_running_with_no_run_map_entry(home, tmp_path):
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={TID: (FOREIGN_PID, "codex")})
+    assert sess.live_run(TID) is None  # nothing this process started
+    assert sess.route_for(sess.resolve(TID).info) == "detached_running"
+    sess.close()
+
+
+def test_the_app_holding_the_lock_is_still_the_desktop_route(home, tmp_path):
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={TID: (APP_PID, "codex")})
+    assert sess.route_for(sess.resolve(TID).info) == "desktop"
+    sess.close()
+
+
+def test_an_unheld_thread_is_still_the_detached_route(home, tmp_path):
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={})
+    assert sess.route_for(sess.resolve(TID).info) == "detached"
+    sess.close()
+
+
+def test_an_unclassifiable_holder_routes_to_unknown(home, tmp_path):
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(
+        home, tmp_path, stub(tmp_path, []), holders={TID: (FOREIGN_PID, "codex")}, app_pids=None
+    )
+    assert sess.route_for(sess.resolve(TID).info) == "unknown"
+    sess.close()
+
+
+def test_send_message_refuses_a_thread_a_foreign_writer_holds(home, tmp_path):
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={TID: (FOREIGN_PID, "codex")})
+    # The dangerous direction: with `app_owned` narrowed, nothing may fall
+    # through to `codex exec resume` and take a lock someone else holds.
+    with pytest.raises(ActionError, match="another writer"):
+        sess.send_message(TID, "hello")
+    sess.close()
+
+
+def test_steer_stop_and_focus_refuse_a_thread_a_foreign_writer_holds(home, tmp_path):
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={TID: (FOREIGN_PID, "codex")})
+    # Every verb that assumes the app holds the lock has to refuse, and each
+    # refusal has to name the holder rather than leave the caller guessing.
+    for call in (
+        lambda: sess.steer_turn(TID, "x"),
+        lambda: sess.stop_turn(TID),
+        lambda: sess.focus_thread(TID),
+    ):
+        with pytest.raises(ActionError, match=rf"codex\({FOREIGN_PID}\)"):
+            call()
+    sess.close()
+
+
+def test_the_refusal_names_the_holder_so_it_can_be_found(home, tmp_path):
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={TID: (FOREIGN_PID, "codex")})
+    with pytest.raises(ActionError, match=rf"codex\({FOREIGN_PID}\)"):
+        sess.send_message(TID, "hello")
+    sess.close()
+
+
+def test_stop_turn_never_signals_a_process_we_do_not_own(home, tmp_path):
+    # Refusing is the point: killpg on a pid this process did not spawn is
+    # somebody else's agent, and possibly somebody else's process group.
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={TID: (FOREIGN_PID, "codex")})
+    with pytest.raises(ActionError) as exc:
+        sess.stop_turn(TID)
+    assert "did not start" in str(exc.value)
+    sess.close()
+
+
+def test_a_thread_row_reports_the_foreign_route_without_claiming_it_is_ours(home, tmp_path):
+    write_rollout(home, TID, tmp_path)
+    sess, inst = session(home, tmp_path, stub(tmp_path, []), holders={TID: (FOREIGN_PID, "codex")})
+    row = next(r for r in sess.list_threads() if r["thread"] == TID)
+    assert row["route"] == "detached_running"
+    # `started_here` is what distinguishes our run from anyone else's, and this
+    # one is not ours -- so no pid or log path may be reported for it.
+    assert "started_here" not in row
+    assert row["holder"] == f"codex({FOREIGN_PID})"
+    sess.close()
+
+
+def test_an_unclassified_holder_is_never_handed_to_the_detached_route(home, tmp_path):
+    # The holder could not be classified, so the app may or may not have it.
+    # send_message tries IPC, which merely errors when wrong -- what it must
+    # never do is resume, because that is the second writer on the rollout.
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(
+        home, tmp_path, stub(tmp_path, []), holders={TID: (FOREIGN_PID, "codex")}, app_pids=None
+    )
+    with pytest.raises((ActionError, IpcError)):
+        sess.send_message(TID, "hello")
+    assert sess._runs == {}
+    sess.close()
+
+
+def test_an_unprobeable_lock_is_never_handed_to_the_detached_route(home, tmp_path):
+    write_rollout(home, TID, tmp_path)
+    inst = Instance(slug="default", codex_home=home, app_path=None, is_default=True)
+    sess = Session(instances=[inst])
+    store = ThreadStore(
+        home,
+        lock_holder_probe=lambda paths: None,
+        app_process_probe=lambda socks: set(),
+    )
+    sess._stores["default"] = store
+    sess._runners["default"] = DetachedRunner(inst, store, codex_binary=stub(tmp_path, []))
+    assert sess.route_for(sess.resolve(TID).info) == "unknown"
+    with pytest.raises((ActionError, IpcError)):
+        sess.send_message(TID, "hello")
+    assert sess._runs == {}
+    sess.close()
+
+
+def test_focus_refuses_a_holder_it_could_not_classify(home, tmp_path):
+    # The one verb with nothing to gain from trying: it would ask the app to
+    # open a rollout whose writer we could not identify.
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(
+        home, tmp_path, stub(tmp_path, []), holders={TID: (FOREIGN_PID, "codex")}, app_pids=None
+    )
+    with pytest.raises(ActionError, match="could not tell"):
+        sess.focus_thread(TID)
+    sess.close()
+
+
+def test_focus_still_works_on_a_thread_nothing_holds(home, tmp_path):
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={})
+    assert sess.focus_thread(TID)["thread"] == TID
+    sess.close()

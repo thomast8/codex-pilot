@@ -64,6 +64,17 @@ driven by neither route until something surfaces it — that is what `focus_thre
 is for. Remodex documents the same boundary: *"Codex Desktop only accepts an
 external stream after that thread's route is mounted."*
 
+**A lock holder is not always the app, and the name will not tell you.** A
+detached `codex exec` holds the same lock, and `lsof` reports its command as
+`codex` exactly like the app's own `codex app-server` child. What separates
+them is the pid: the app's writer is the process listening on that instance's
+IPC socket, or a descendant of it. That test is decided from the process table,
+not from anything only the calling process remembers, so a second session — or
+the same one after a restart — reaches the same verdict instead of mistaking
+someone else's writer for the app. Deciding it from argv would be worse than
+useless: a detached run's argv contains the whole prompt, and a prompt can say
+anything.
+
 **Not seeing something is not the same as there being nothing.** This is the one
 rule that decides whether a supervising session notices a wedged agent or waits
 on it forever. Stream state only reaches a thread the app has *mounted*, so
@@ -111,11 +122,19 @@ be pulled into Codex Desktop afterwards with `focus_thread`.
 
 That introduces a third lock state, which the rest of the surface is built
 around rather than papering over. While such a run is going, the lock holder is
-*ours*, not the app's: `route` reads `detached_running`, every app-driven verb
-refuses instead of walking you into a second writer on the rollout, and
+a `codex exec`, not the app: `route` reads `detached_running`, every app-driven
+verb refuses instead of walking you into a second writer on the rollout, and
 `stop_turn` terminates the run's process group. When it exits, the run reports
 `turn_completed` on the same event stream a followed thread uses, so one
 `collect_events` waits on app threads and detached runs alike.
+
+The run does not have to be one this process started. A writer belonging to
+another session reads as `detached_running` just the same, with no
+`started_here` on the row — and then `stop_turn` refuses along with everything
+else, because that process group is not ours to signal. This is what Codex
+Desktop's *"This is open in another app"* banner looks like from the other side:
+the thread is being written to the whole time, the app simply cannot attach to
+show it.
 
 **Codex's own worktrees are not reachable from here.** Codex Desktop can run a
 thread in its own git worktree and fork a conversation into one, but that is an

@@ -51,19 +51,74 @@ def write_rollout(home: Path, cwd: Path, archived: bool = False) -> None:
     )
 
 
-def runner(home: Path, tmp_path: Path, record: Path, holders=None) -> DetachedRunner:
+APP_PID = 78222
+FOREIGN_PID = 69843
+
+
+def runner(
+    home: Path,
+    tmp_path: Path,
+    record: Path,
+    holders=None,
+    app_pids: frozenset[int] | None = frozenset({APP_PID}),
+    lock_probe=None,
+) -> DetachedRunner:
     inst = Instance(slug="default", codex_home=home, app_path=None, is_default=True)
-    store = ThreadStore(home, lock_holder_probe=lambda paths: holders or {})
+    store = ThreadStore(
+        home,
+        lock_holder_probe=lock_probe or (lambda paths: dict(holders or {})),
+        app_process_probe=lambda socks: None if app_pids is None else set(app_pids),
+    )
     return DetachedRunner(inst, store, codex_binary=make_stub(tmp_path, record))
 
 
-def test_refuses_when_a_writer_lock_is_held(home, tmp_path):
+def test_refuses_when_the_app_holds_the_writer_lock(home, tmp_path):
     # The app owns it; a detached run would fight for the same single writer.
     work = tmp_path / "work"
     work.mkdir()
     write_rollout(home, work)
-    r = runner(home, tmp_path, tmp_path / "rec.json", holders={TID: "codex(7687)"})
+    r = runner(home, tmp_path, tmp_path / "rec.json", holders={TID: (APP_PID, "codex")})
     with pytest.raises(LockedError):
+        r.run(TID, "hello")
+
+
+def test_refuses_when_a_writer_that_is_not_the_app_holds_the_lock(home, tmp_path):
+    # The dangerous regression: once `app_owned` was narrowed to mean "the app
+    # specifically", a check written against it would wave a foreign writer
+    # through and put a second `codex exec` on the same rollout. The refusal
+    # has to key on the lock being held at all, not on who is holding it.
+    work = tmp_path / "work"
+    work.mkdir()
+    write_rollout(home, work)
+    r = runner(home, tmp_path, tmp_path / "rec.json", holders={TID: (FOREIGN_PID, "codex")})
+    with pytest.raises(LockedError):
+        r.run(TID, "hello")
+
+
+def test_refuses_when_the_holder_could_not_be_classified(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    write_rollout(home, work)
+    r = runner(
+        home,
+        tmp_path,
+        tmp_path / "rec.json",
+        holders={TID: (FOREIGN_PID, "codex")},
+        app_pids=None,
+    )
+    with pytest.raises(LockedError):
+        r.run(TID, "hello")
+
+
+def test_refuses_when_the_lock_state_could_not_be_probed(home, tmp_path):
+    # A probe that could not run has not established that the lock is free.
+    # Reading its silence as "nothing holds it" is how a second writer lands
+    # on a rollout the app is already writing.
+    work = tmp_path / "work"
+    work.mkdir()
+    write_rollout(home, work)
+    r = runner(home, tmp_path, tmp_path / "rec.json", lock_probe=lambda paths: None)
+    with pytest.raises(LockedError, match="could not be"):
         r.run(TID, "hello")
 
 
@@ -167,7 +222,14 @@ def test_binary_defaults_to_the_instance_app_when_present(tmp_path):
     home = tmp_path / "h"
     (home / "thread-writer-locks").mkdir(parents=True)
     inst = Instance(slug="default", codex_home=home, app_path=app, is_default=True)
-    r = DetachedRunner(inst, ThreadStore(home, lock_holder_probe=lambda p: {}))
+    r = DetachedRunner(
+        inst,
+        ThreadStore(
+            home,
+            lock_holder_probe=lambda p: {},
+            app_process_probe=lambda socks: set(),
+        ),
+    )
     # The app writes the rollout store; resuming with a different build risks
     # a format mismatch.
     assert r.codex_binary == binary
@@ -177,7 +239,14 @@ def test_binary_falls_back_to_path_when_no_app_bundle(tmp_path):
     home = tmp_path / "h"
     (home / "thread-writer-locks").mkdir(parents=True)
     inst = Instance(slug="default", codex_home=home, app_path=None, is_default=True)
-    r = DetachedRunner(inst, ThreadStore(home, lock_holder_probe=lambda p: {}))
+    r = DetachedRunner(
+        inst,
+        ThreadStore(
+            home,
+            lock_holder_probe=lambda p: {},
+            app_process_probe=lambda socks: set(),
+        ),
+    )
     assert r.codex_binary.name == "codex"
 
 
@@ -220,7 +289,11 @@ NEW_TID = "01a03f10-e3e1-7b30-9dfc-7c659c4d7434"
 
 def new_runner(home: Path, tmp_path: Path, record: Path, lines: list[str]) -> DetachedRunner:
     inst = Instance(slug="default", codex_home=home, app_path=None, is_default=True)
-    store = ThreadStore(home, lock_holder_probe=lambda paths: {})
+    store = ThreadStore(
+        home,
+        lock_holder_probe=lambda paths: {},
+        app_process_probe=lambda socks: set(),
+    )
     return DetachedRunner(inst, store, codex_binary=json_stub(tmp_path, record, lines))
 
 

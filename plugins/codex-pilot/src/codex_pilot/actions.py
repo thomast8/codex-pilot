@@ -59,12 +59,15 @@ PUMP_FAULT_MAX_BACKOFF = 30.0
 # keeps a long orchestration session from growing the map without end.
 MAX_TRACKED_RUNS = 200
 
-# Route values. `detached_running` is the state that did not exist before
-# start_thread: a lock held by one of our own children, so neither route
-# works until it exits.
+# Route values. `detached_running` is a lock held by a writer that is not the
+# app -- one of our own `codex exec` children, or anyone else's -- so neither
+# route works until it exits. `unknown` is the honest fourth: a lock state we
+# could not establish. It is not `detached`, because resuming onto a lock that
+# may be held is the one mistake that corrupts a rollout.
 ROUTE_DESKTOP = "desktop"
 ROUTE_DETACHED = "detached"
 ROUTE_RUNNING = "detached_running"
+ROUTE_UNKNOWN = "unknown"
 
 # An unmounted thread costs the router's full discovery timeout (~10s
 # measured) before it answers no-client-found, while a mounted one
@@ -101,6 +104,21 @@ class UnclaimedThreadError(ActionError):
     problem. Bringing the thread forward in the app fixes it -- `focus_thread`
     does that. Version drift produces the same symptom, so it stays a secondary
     suspect if focusing does not help.
+
+    Raised only when the holder is *known* to be the app. A lock held by
+    another writer produces this same `no-client-found`, but focusing that
+    thread would ask Codex Desktop to open a rollout somebody else is writing,
+    so it gets `ForeignWriterError` and its own remedy instead.
+    """
+
+
+class ForeignWriterError(ActionError):
+    """A writer that is not Codex Desktop holds this thread's lock.
+
+    Neither route reaches it: the app cannot answer for a thread it does not
+    hold, and resuming would put a second writer on the rollout. The only thing
+    to do is wait for the holder to exit -- or, when it is one of our own runs,
+    stop it. `_refuse_if_held_elsewhere` phrases both.
     """
 
 
@@ -154,7 +172,12 @@ class Session:
     def store(self, instance: Instance) -> ThreadStore:
         with self._guard:
             if instance.slug not in self._stores:
-                self._stores[instance.slug] = ThreadStore(instance.codex_home)
+                # The instance, not the store, knows every socket this app may
+                # be listening on -- and getting that wrong misreads the app's
+                # own writer as a foreign one.
+                self._stores[instance.slug] = ThreadStore(
+                    instance.codex_home, socket_candidates=instance.socket_candidates()
+                )
             return self._stores[instance.slug]
 
     def follow_manager(self, instance: Instance) -> FollowManager:
@@ -573,6 +596,10 @@ class Session:
             response = client.request(OWNER_DISCOVERY, payloads.owner_discovery(resolved.thread_id))
         except RouterError as exc:
             if exc.error == "no-client-found":
+                # Same reply, three different situations. Which one it is
+                # depends on who holds the writer lock, and the remedies do not
+                # overlap: focusing a thread another writer holds is the one
+                # thing that must never be suggested.
                 if resolved.info.app_owned:
                     raise UnclaimedThreadError(
                         f"{resolved.thread_id} holds a writer lock ({resolved.info.holder}) but "
@@ -580,6 +607,21 @@ class Session:
                         "Bring it forward with focus_thread and retry. It cannot be resumed "
                         "detached either, because the lock is taken. If focusing does not help, "
                         "suspect version drift and run scripts/extract_registry.py --check."
+                    ) from exc
+                if resolved.info.holder is not None:
+                    raise UnclaimedThreadError(
+                        f"{resolved.thread_id} holds a writer lock "
+                        f"({resolved.info.holder.described}) and no window claims it. Do not "
+                        "focus it until you know the holder is the app: if it is not, that "
+                        "puts a second writer on the rollout. Check the holder's pid "
+                        f"(`ps -o command= -p {resolved.info.holder.pid}`) and wait for it "
+                        "to exit; read_thread works meanwhile."
+                    ) from exc
+                if not resolved.info.lock_known:
+                    raise UnclaimedThreadError(
+                        f"no window owns {resolved.thread_id}, and the writer lock could not "
+                        "be probed, so whether anything holds it is unknown. Do not resume it "
+                        "detached on that basis. Check `lsof` is usable and retry."
                     ) from exc
                 raise NoOwnerError(
                     f"no window owns {resolved.thread_id} in instance "
@@ -711,7 +753,21 @@ class Session:
         there for a caller that genuinely wants the app in front.
         """
         resolved = self.resolve(ref, instance)
-        self._refuse_if_ours(resolved)
+        self._refuse_if_held_elsewhere(resolved)
+        # Stricter than the shared guard, which lets an unclassifiable holder
+        # through so the IPC verbs can at least try. Focusing is the one verb
+        # with no diagnostic value in trying: it asks the app to open a rollout
+        # whose writer we could not identify. The app would refuse the lock
+        # itself, but this is the two-writer direction and it is not worth
+        # being one bug away from.
+        holder = resolved.info.holder
+        if holder is not None and holder.is_app is None:
+            raise ForeignWriterError(
+                f"{holder.described} holds the writer lock on {resolved.thread_id}. Until "
+                "the holder is known to be Codex Desktop, focusing it risks asking the app "
+                "to open a rollout another writer has. Check the pid "
+                f"(`ps -o command= -p {holder.pid}`) and retry once `lsof` is usable."
+            )
         url = f"codex://threads/{resolved.thread_id}"
         argv = ["open", url] if activate else ["open", "-g", url]
         subprocess.run(argv, check=False, capture_output=True)
@@ -726,32 +782,47 @@ class Session:
 
     # -- mutating verbs -----------------------------------------------------
 
-    def _refuse_if_ours(self, resolved: ResolvedThread) -> None:
+    def _refuse_if_held_elsewhere(self, resolved: ResolvedThread) -> None:
         """Stop before any verb that assumes the app holds the lock.
 
-        `app_owned` only means *someone* holds the writer lock, and since
-        start_thread that someone can be one of our own `codex exec` children.
-        Without this check `owner_of` reports no-client-found, the caller is
-        told the app has the thread open without showing it, and the suggested
-        remedy -- focus_thread -- asks Codex Desktop to open a thread our own
-        writer is still holding. That is the two-writer case the lock exists to
-        prevent, reached by following our own error message.
+        A held lock only means *someone* is writing. Since start_thread that
+        someone can be one of our own `codex exec` children, and it can equally
+        be a run another process started. Without this check `owner_of` reports
+        no-client-found, the caller is told the app has the thread open without
+        showing it, and the suggested remedy -- focus_thread -- asks Codex
+        Desktop to open a thread another writer is still holding. That is the
+        two-writer case the lock exists to prevent, reached by following our own
+        error message.
+
+        Two phrasings because there are two remedies. A run we started can be
+        stopped and its log read; one we did not can only be waited out, and its
+        pid is not ours to signal.
         """
         own = self.live_run(resolved.thread_id)
-        if own is None:
+        if own is not None:
+            raise ForeignWriterError(
+                f"a detached run codex-pilot started (pid {own.pid}) still holds the writer "
+                f"lock on {resolved.thread_id}, so it cannot be driven through the app. "
+                f"Wait for it (collect_events reports turn_completed when it exits), read "
+                f"{own.log_path}, or stop_turn to terminate it. Do not focus it in the app "
+                "while it is running -- that would put a second writer on the rollout."
+            )
+        holder = resolved.info.holder
+        if holder is None or holder.is_app is not False:
             return
-        raise ActionError(
-            f"a detached run codex-pilot started (pid {own.pid}) still holds the writer "
-            f"lock on {resolved.thread_id}, so it cannot be driven through the app. "
-            f"Wait for it (collect_events reports turn_completed when it exits), read "
-            f"{own.log_path}, or stop_turn to terminate it. Do not focus it in the app "
-            "while it is running -- that would put a second writer on the rollout."
+        raise ForeignWriterError(
+            f"{holder} holds the writer lock on {resolved.thread_id} and is not Codex "
+            "Desktop -- another writer, most likely a `codex exec` run this process did "
+            "not start. Neither route reaches the thread until it exits: the app cannot "
+            "answer for a thread it does not hold, and resuming would put a second writer "
+            "on the rollout. Wait for it to finish, and read the rollout (read_thread) "
+            "for what it is doing meanwhile. Do not focus it in the app while it runs."
         )
 
     def _follower_request(
         self, resolved: ResolvedThread, method: str, params: dict[str, Any]
     ) -> dict[str, Any]:
-        self._refuse_if_ours(resolved)
+        self._refuse_if_held_elsewhere(resolved)
         owner = self.owner_of(resolved)
         client = self.client(resolved.instance)
         response = client.request(method, params, target_client_id=owner)
@@ -811,15 +882,27 @@ class Session:
     def route_for(self, info: ThreadInfo) -> str:
         """Which route this thread can be driven by right now.
 
-        Three states, not two. A lock holder is not necessarily the app: while
-        one of our own detached runs is going it holds the lock too. Calling
-        that 'desktop' would send callers to an IPC route that cannot work, and
-        calling it 'detached' would promise it is free to resume when it is
-        not -- so it gets its own value.
+        Four states, not two. A lock holder is not necessarily the app: a
+        detached `codex exec` holds the lock too. Calling that 'desktop' sends
+        callers to an IPC route that cannot work, and calling it 'detached'
+        promises it is free to resume when it is not -- so it gets its own
+        value, decided from the holder's pid rather than from anything only
+        this process knows.
+
+        The run map is consulted first because it is strictly more informative
+        when it has an answer -- it knows the run is ours, and it covers the gap
+        between spawning a child and that child taking the lock, where the
+        process table would still say the thread is free.
         """
         if self.live_run(info.thread_id) is not None:
             return ROUTE_RUNNING
-        return ROUTE_DESKTOP if info.app_owned else ROUTE_DETACHED
+        if not info.lock_known:
+            return ROUTE_UNKNOWN
+        if info.holder is None:
+            return ROUTE_DETACHED
+        if info.holder.is_app is None:
+            return ROUTE_UNKNOWN
+        return ROUTE_DESKTOP if info.holder.is_app else ROUTE_RUNNING
 
     def start_thread(
         self,
@@ -892,10 +975,15 @@ class Session:
         can only be driven detached. The writer lock decides, and it is never
         worked around -- if the app owns the thread but no window claims it,
         that is drift, and running detached would collide with a held lock.
+
+        A lock state we could not establish takes the IPC route rather than the
+        detached one. Both may be wrong, but only one of them can corrupt a
+        rollout: an IPC attempt against a thread the app does not hold comes
+        back as an error, while a resume onto a held lock is a second writer.
         """
         resolved = self.resolve(ref, instance)
-        self._refuse_if_ours(resolved)
-        if resolved.info.app_owned:
+        self._refuse_if_held_elsewhere(resolved)
+        if resolved.info.app_owned or not resolved.info.resumable:
             result = self._follower_request(
                 resolved,
                 "thread-follower-start-turn",
@@ -957,6 +1045,18 @@ class Session:
             # start_thread launched -- autonomous, and by default unattended --
             # could not be stopped from here at all.
             return self._stop_detached(resolved, own)
+        # A detached writer this process did not spawn looks identical from
+        # here, but the pid is not ours: _stop_detached signals a whole process
+        # group, and that group belongs to somebody else's agent. Refuse rather
+        # than guess, and say whose it is so it can be found.
+        holder = resolved.info.holder
+        if holder is not None and holder.is_app is False:
+            raise ForeignWriterError(
+                f"{holder} holds the writer lock on {resolved.thread_id} and is a writer "
+                "this process did not start, so there is no turn to interrupt over IPC and "
+                "its process group is not ours to signal. Stop it where it was started, or "
+                "wait for it to exit."
+            )
         params = payloads.interrupt_turn(resolved.thread_id, expected_turn_id=expected_turn_id)
         result = self._follower_request(resolved, "thread-follower-interrupt-turn", params)
         interrupted = result.get("interruptedTurnId")
@@ -1135,6 +1235,11 @@ class Session:
             "name": info.name,
             "cwd": info.cwd,
             "route": self.route_for(info),
+            # Who is writing, when anyone is. `started_here` below says whether
+            # that is one of ours; without the holder there is no way for a
+            # caller to tell a foreign writer from an app-held thread at all.
+            "holder": str(info.holder) if info.holder is not None else None,
+            "lock_known": info.lock_known,
             "age_seconds": info.age_seconds,
             "turn_id": info.turn_id,
             "rollout": str(info.rollout) if info.rollout is not None else None,
@@ -1194,12 +1299,12 @@ class Session:
             if instance is not None and inst.slug != instance:
                 continue
             store = self.store(inst)
-            held = store.lock_holders()
+            held = store.lock_census()
             seen: set[str] = set()
             # Same one lsof sweep feeds both loops, and the same newest-activity
             # ordering list_open() used.
             lock_held = sorted(
-                store.describe_many(held),
+                store.describe_many(held.holders),
                 key=lambda i: (i.age_seconds is None, i.age_seconds or 0.0),
             )
             for info in lock_held:
@@ -1212,5 +1317,5 @@ class Session:
             for thread_id in ours:
                 if thread_id in seen:
                     continue
-                out.append(self.thread_row(inst, store.describe(thread_id, holders=held)))
+                out.append(self.thread_row(inst, store.describe(thread_id, census=held)))
         return out

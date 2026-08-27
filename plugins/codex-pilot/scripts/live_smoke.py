@@ -48,7 +48,9 @@ def phase_read(session: Session, ref: str, instance: str | None) -> None:
     resolved = session.resolve(ref, instance)
     print(f"\nresolved {ref!r} -> {resolved.instance.slug}:{resolved.thread_id}")
     print(f"  name={resolved.name}  app_owned={resolved.info.app_owned}")
-    print(f"  holder={resolved.info.holder}  archived={resolved.info.archived}")
+    holder = resolved.info.holder
+    print(f"  holder={holder.described if holder else None}")
+    print(f"  lock_known={resolved.info.lock_known}  archived={resolved.info.archived}")
     print(f"  cwd={resolved.info.cwd}")
     print(f"  rollout turn_id={resolved.info.turn_id}")
 

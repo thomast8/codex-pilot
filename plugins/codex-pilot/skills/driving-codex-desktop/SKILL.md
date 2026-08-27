@@ -93,9 +93,14 @@ Codex allows one writer per thread, and `send_message` picks accordingly:
   poll the log. An archived thread is unarchived first, reported as
   `unarchived: true`.
 
-- **One of our own detached runs holds it** (`route: detached_running`) →
-  neither driving route works until it exits. Wait for `turn_completed`, read
-  its log, or `stop_turn` it. Do not focus it into the app meanwhile.
+- **A detached `codex exec` holds it** (`route: detached_running`) → neither
+  driving route works until it exits. `started_here: true` means the run is
+  ours: wait for `turn_completed`, read its `log_path`, or `stop_turn` it. With
+  no `started_here` the writer belongs to another process — another Claude
+  session's codex-pilot, or a terminal — and then only waiting is available.
+  `stop_turn` refuses it rather than signalling a process group that is not
+  ours; `read_thread` still shows what it is doing. Do not focus either into
+  the app meanwhile.
 
 - **App holds it but is not *showing* it** → neither route works. The app locks
   every thread it has open but only answers for the one a window is rendering,
@@ -103,7 +108,27 @@ Codex allows one writer per thread, and `send_message` picks accordingly:
   couple of seconds, and retry. If focusing does not help, then suspect protocol
   drift after an app update and run `scripts/extract_registry.py --check`.
 
+- **The lock state could not be established** (`route: unknown`, or
+  `lock_known: false`) → the holder could not be classified, or `lsof` could not
+  be run at all. Not a synonym for free: `send_message` will try IPC, which is
+  harmless when wrong, and refuses to resume, which is not.
+
+Which case you are in is on `thread_status` and every `list_threads` row:
+`holder` names the process holding the lock, and `route` says what that makes
+possible. Both are read from the process table rather than from anything only
+the calling process remembers, so a second session sees the same answer.
+
 Never try to defeat the lock. Two writers on one rollout corrupt it.
+
+### "This is open in another app"
+
+Codex Desktop showing that banner over a thread, with nothing streaming into
+the window, is this state seen from the other side: some other writer holds the
+lock, so the app cannot attach and shows a static read of the rollout. When the
+writer is a `codex exec` run, that is `route: detached_running`, and it is
+working normally — the turn is being appended to the rollout the whole time.
+Do not press Retry to force it. Read `log_path` (if the run is ours) or the
+rollout; the app renders the whole turn once the writer exits.
 
 ## Approvals
 
@@ -418,7 +443,8 @@ it over IPC from the start.
 Its route reads `detached_running`, and neither driving route works: `steer_turn`,
 `respond`, `edit_thread` and `focus_thread` all refuse, by design. What you can
 do is wait for it, read `log_path`, or `stop_turn` to terminate it and its whole
-process group.
+process group. That last one only for a run this server started (`started_here`):
+another process's writer gets the same refusal as every other verb.
 
 **Never `focus_thread` a running one.** That asks the app to open a thread our
 own writer still holds, and two writers on one rollout corrupt it. The tools

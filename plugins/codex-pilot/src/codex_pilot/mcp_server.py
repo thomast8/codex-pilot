@@ -12,10 +12,15 @@ nothing holds can only be driven by resuming it detached. `send_message` picks
 for you. The lock is never worked around -- two writers on one rollout corrupt
 it.
 
-**A locked thread is not always a reachable one.** The app holds a writer lock
-on every thread it has open, but only answers for the one a window is actually
-showing. A thread it is holding in the background can be driven by neither route
-until something surfaces it -- `focus_thread` does that.
+**A locked thread is not always a reachable one, and the holder is not always
+the app.** The app holds a writer lock on every thread it has open, but only
+answers for the one a window is actually showing. A thread it is holding in the
+background can be driven by neither route until something surfaces it --
+`focus_thread` does that. A lock held by a `codex exec` run instead, ours or
+another process's, reads as route `detached_running`, and focusing *that* is
+the one thing never to do: it asks the app to open a rollout somebody else is
+writing. `holder` on `thread_status` and `list_threads` says which case it is,
+and `started_here` says whether the run is ours to stop.
 
 **Approvals only reach you when the thread asks a human.** With
 `approvalsReviewer` set to `auto_review` (the default) a subagent decides
@@ -164,6 +169,11 @@ def thread_status(thread: str, instance: str | None = None) -> dict[str, Any]:
             "thread": resolved.thread_id,
             "name": resolved.name,
             "route": sess.route_for(resolved.info),
+            # Who holds the writer lock, when anyone does. `started_here` says
+            # whether that is one of our own runs; without the holder there is
+            # nothing to tell a foreign writer from an app-held thread.
+            "holder": str(resolved.info.holder) if resolved.info.holder else None,
+            "lock_known": resolved.info.lock_known,
             "cwd": resolved.info.cwd,
             "archived": resolved.info.archived,
             "rollout": str(rollout) if rollout is not None else None,
@@ -180,6 +190,30 @@ def thread_status(thread: str, instance: str | None = None) -> dict[str, Any]:
                 "turn_completed from collect_events, or stop_turn to terminate it"
             )
             return out
+        holder = resolved.info.holder
+        if holder is not None and holder.is_app is not True:
+            # Locked, but not by the app. Saying only "not open in the app"
+            # here reads as an idle thread waiting to be resumed, and it is the
+            # opposite: something is writing it right now and neither route
+            # reaches it. `pending_known` stays false because there is no live
+            # state to have read the pending set from.
+            out["pending_known"] = False
+            out["state"] = None
+            out["note"] = (
+                f"the writer lock is held by {holder.described}; it is neither driveable "
+                "over IPC nor free to resume until that process exits. Read the rollout "
+                "(read_thread) for what it is doing, and do not focus_thread it."
+            )
+            return _with_disk(out, rollout, resolved.info.age_seconds)
+        if not resolved.info.lock_known:
+            out["pending_known"] = False
+            out["state"] = None
+            out["note"] = (
+                "the writer lock could not be probed, so whether anything holds this "
+                "thread is unknown -- it is not safe to resume on that basis. Check "
+                "that `lsof` is usable."
+            )
+            return _with_disk(out, rollout, resolved.info.age_seconds)
         if not resolved.info.app_owned:
             out["state"] = None
             out["note"] = "not open in the app; no live state to read"
@@ -262,7 +296,8 @@ def send_message(
         "focus into the app. 'danger-full-access' is refused unless the server "
         "was started with CODEX_PILOT_ALLOW_FULL_ACCESS. "
         "While the run goes it holds the thread's writer lock, so route reads "
-        "'detached_running' and the thread cannot be steered or driven over IPC; "
+        "'detached_running' (with `started_here` true, since it is ours) and the "
+        "thread cannot be steered or driven over IPC; "
         "stop_turn terminates it, and collect_events reports turn_completed (or "
         "run_failed) when it exits. Do NOT focus_thread it while it runs. Once "
         "it is idle, focus_thread brings it into Codex Desktop for IPC. Read "
@@ -314,8 +349,10 @@ def steer_turn(thread: str, text: str, instance: str | None = None) -> dict[str,
 @server.tool(
     description=(
         "Interrupt the running turn. On a thread one of our own detached runs is "
-        "writing (route 'detached_running') this terminates that run and its "
-        "whole process group, and `stopped` says whether it was still alive. "
+        "writing (route 'detached_running' with `started_here`) this terminates that "
+        "run and its whole process group, and `stopped` says whether it was still "
+        "alive. A detached writer this process did not start is refused rather than "
+        "signalled -- its process group is not ours -- so stop it where it was started. "
         "Otherwise it interrupts over IPC: pass expected_turn_id (from thread_status) to "
         "refuse stopping a turn that started after you looked. Read `stopped` in "
         "the result, not `ok`: the app answers ok:true even when it stopped "
@@ -564,6 +601,10 @@ def read_thread(
         "claims it: the app keeps threads open in the background without "
         "rendering them, and only answers for the one it is showing. Wait a "
         "couple of seconds, then retry the call that failed.\n\n"
+        "Only for a lock the app itself holds. On route 'detached_running' the "
+        "holder is a `codex exec` run, and this is refused: asking the app to open "
+        "a rollout another writer has is exactly the two-writer case the lock "
+        "prevents. Wait for that run to exit, or stop_turn it if it is ours.\n\n"
         "Navigates in the background, so it does not steal focus from whatever "
         "the user is doing. Pass activate=true only if they asked to be shown "
         "the thread."

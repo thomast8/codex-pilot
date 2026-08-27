@@ -214,6 +214,7 @@ def run(inst: Instance, thread: str, mount: bool = False) -> int:
         info = session.store(inst).describe(thread)
         print(f"follow health : {health.get('health')} ({health.get('reason')})")
         print(f"app holds it  : {info.app_owned} (holder={info.holder})")
+        print(f"resumable     : {info.resumable} (lock_known={info.lock_known})")
 
         if health.get("health") == "ok":
             print("follow recovered on its own")

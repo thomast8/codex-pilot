@@ -85,9 +85,12 @@ class DetachedError(Exception):
 
 
 class LockedError(DetachedError):
-    """Something already holds this thread's writer lock.
+    """This thread's writer lock is held, or could not be shown to be free.
 
-    Almost always Codex Desktop, in which case the IPC route is the one to use.
+    Codex Desktop when the thread is open in the app, in which case the IPC
+    route is the one to use -- but equally another `codex exec`, ours or
+    anyone's, and then neither route reaches it until that process exits.
+    Raised for an unprobeable lock too: not knowing is not the same as free.
     Never work around this: two writers on one rollout corrupt it, which is
     exactly what the lock exists to prevent.
     """
@@ -229,10 +232,24 @@ class DetachedRunner:
 
         # Checked immediately before spawning, but this is advisory: the CLI
         # takes the lock itself and is the authoritative arbiter of the race.
-        if info.app_owned:
+        #
+        # Keyed on `resumable`, which is narrower than "the app does not own
+        # it" in both directions that matter. A `codex exec` holding the lock
+        # is not the app and must still block us -- two of them on one rollout
+        # is the corruption the lock exists to prevent, and it does not become
+        # safe because the other writer is not Codex Desktop. And a lock state
+        # we could not probe has not been established as free.
+        if not info.resumable:
+            if info.holder is not None:
+                raise LockedError(
+                    f"{thread_id} is held by {info.holder.described} -- use the IPC route "
+                    "while Codex Desktop has it open, close the thread in the app to free "
+                    "it, or wait for another writer to exit"
+                )
             raise LockedError(
-                f"{thread_id} is held by {info.holder} -- use the IPC route while the app "
-                "has it open, or close the thread in the app to free it"
+                f"the writer lock on {thread_id} could not be probed, so whether anything "
+                "holds it is unknown -- refusing to resume rather than risk a second writer "
+                "on the rollout. Check that `lsof` is usable and retry."
             )
 
         unarchived = False
