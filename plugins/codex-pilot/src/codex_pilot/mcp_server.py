@@ -577,10 +577,13 @@ def collect_events(
         "the unmounted ones and re-checks. Mounting is additive, not a swap -- "
         "bringing one forward does not evict the others -- so treat this as a "
         "one-off warm-up for the threads you intend to watch, NOT something to "
-        "cycle through repeatedly. Threads one of our own detached runs is "
-        "writing are skipped rather than focused. Returns each thread with "
-        "`mounted` and its owning client, plus `mounted_by_sync` for the ones "
-        "this call gained."
+        "cycle through repeatedly. Returns each thread with `mounted` and its "
+        "owning client, plus `mounted_by_sync` for the ones this call gained "
+        "and `skipped` for the ones it could not mount, each with a `reason`: a "
+        "thread one of our own detached runs is writing, one another writer "
+        "holds, one listed off a writer lock with nothing on disk to bind it to "
+        "yet, or one whose instance has no nameable app to aim the link at. "
+        "None of those fails the sweep -- the rest still mount."
     )
 )
 def sync_threads(

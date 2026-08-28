@@ -772,7 +772,11 @@ def test_sync_threads_reports_no_focus_when_it_mounts_nothing(app, monkeypatch):
     )
     sess, inst = live_session(app, ipc_timeout=0.2)
     try:
-        assert sess.sync_threads(mount=False)["focus"] is None
+        out = sess.sync_threads(mount=False)
+        assert out["focus"] is None
+        # The key is part of the shape on every path, not only the ones that
+        # had something to skip.
+        assert out["skipped"] == []
     finally:
         sess.close()
 
@@ -1220,3 +1224,59 @@ def test_send_message_refuses_settings_it_cannot_apply_on_the_desktop_route(home
         with pytest.raises(ActionError, match="edit_thread"):
             sess.send_message(TID, "hello", **kwargs)
     sess.close()
+
+
+def test_sync_threads_skips_a_thread_it_cannot_resolve_and_mounts_the_rest(app, monkeypatch):
+    """A lock fd is enough to be listed, and not enough to be resolvable.
+
+    `list_threads` derives rows partly from the writer-lock census, so a thread
+    whose lock file has an open fd is listed even when it has no rollout and no
+    `session_index.jsonl` entry -- a state the app really produces, briefly, for
+    a thread it has just created. `resolve` rightly refuses such an id, and one
+    of them used to abort the whole sweep, so every other thread that would have
+    mounted did not. It comes back in `skipped` with a reason instead: absence
+    is reported, not swallowed and not fatal.
+    """
+    second = "01a03f10-e3e1-7b30-9dfc-7c659c4d7435"
+    phantom = "01a04797-bf31-7c90-ad8d-62ef34c60d11"
+    opened: list[str] = []
+
+    monkeypatch.setattr(
+        "codex_pilot.actions.subprocess.run",
+        lambda argv, **kw: opened.append(argv[-1]),
+    )
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+
+    sess, inst = live_session(app, ipc_timeout=0.2)
+    # Three lock holders, all the app's -- so all three route 'desktop' -- but
+    # only two of them exist on disk.
+    sess._stores["default"] = ThreadStore(
+        app.home,
+        lock_holder_probe=lambda paths: {t: (4242, "codex") for t in (TID, second, phantom)},
+        app_process_probe=lambda socks: {4242},
+    )
+    seed = app.home / "sessions" / "2026" / "08" / "27"
+    seed.mkdir(parents=True, exist_ok=True)
+    with (app.home / "session_index.jsonl").open("w") as fh:
+        for tid, name in ((TID, "one"), (second, "two")):
+            fh.write(
+                json.dumps({"id": tid, "thread_name": name, "updated_at": "2026-01-01"}) + "\n"
+            )
+            (seed / f"rollout-2026-08-27T10-00-00-{tid}.jsonl").write_text(
+                json.dumps({"type": "session_meta", "payload": {"cwd": "/w", "id": tid}}) + "\n"
+            )
+
+    try:
+        out = sess.sync_threads(settle_seconds=0.0)
+
+        assert sorted(out["focused"]) == sorted([TID, second])
+        assert phantom not in out["focused"]
+        # The regression: the two resolvable threads still get their deep link.
+        assert sorted(opened) == sorted([f"codex://threads/{t}" for t in (TID, second)])
+        assert [s["thread"] for s in out["skipped"]] == [phantom]
+        skipped = out["skipped"][0]
+        assert skipped["reason"] == "unresolvable"
+        assert skipped["instance"] == "default"
+        assert phantom in skipped["detail"]
+    finally:
+        sess.close()
