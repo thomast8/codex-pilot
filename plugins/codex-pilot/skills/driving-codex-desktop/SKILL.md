@@ -150,6 +150,12 @@ which.**
   a thread the app has open it fails with `failed to archive session`, which is
   the lock talking.
 
+  `<App>` is not always the obvious one: several bundles can claim a home and
+  only one is running it. Take the bundle of whatever is listening on
+  `<home>/ipc/ipc.sock`, and when nothing is, the bundle stamped with that home
+  — for `~/.codex` the *unstamped* `/Applications/ChatGPT.app`, since a clone
+  may stamp it as well.
+
 Archive threads *you* started, once their work is harvested and their branch is
 committed and pushed — archiving does not preserve a worktree, and Codex clears
 its own worktree root without warning. Never archive a thread the user has open
@@ -390,7 +396,8 @@ Ask the instance instead. Its own `codex` binary answers, and this is a read:
 
 Keep stdin open, hence the `sleep`; the server answers and a closed pipe cuts it
 off first. Bind both halves to one instance, as everywhere else here: its own
-bundle rather than the `codex` on PATH, which is usually an older build, *and*
+bundle rather than the `codex` on PATH, which is usually an older build (picking
+`<App>` is the same problem as under archiving above), *and*
 its `CODEX_HOME`, since the catalogue follows the account that home is signed
 into. Run bare against a second instance you get the default home's answer, with
 no error to tell you. Each entry gives `model`,

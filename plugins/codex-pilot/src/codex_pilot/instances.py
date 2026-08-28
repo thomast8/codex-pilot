@@ -102,9 +102,10 @@ def installed_apps(search_dirs: list[Path] | None = None) -> list[Path]:
     """Every Codex Desktop bundle on this machine, stamped or not.
 
     Wider than `discover_instances`, and deliberately so: that keys by
-    CODEX_HOME and drops the stock unstamped bundle, which is exactly the app a
-    user is most likely to be looking at. Callers that need to recognise "a
-    Codex window just came forward" want all of them.
+    CODEX_HOME, so every bundle claiming one home collapses into a single
+    instance carrying a single `app_path`. Callers that need to recognise "a
+    Codex window just came forward" want every bundle that could have raised
+    one, not just the one that won its home.
     """
     out: list[Path] = []
     for directory in DEFAULT_SEARCH_DIRS if search_dirs is None else search_dirs:
@@ -118,14 +119,16 @@ def installed_apps(search_dirs: list[Path] | None = None) -> list[Path]:
 def stock_app(search_dirs: list[Path] | None = None) -> Path | None:
     """The unstamped ChatGPT bundle, which is the one that serves the default home.
 
-    `discover_instances` drops it on purpose -- it keys by CODEX_HOME and the
-    default home is registered whether or not a bundle is installed -- so the
-    default instance's `app_path` ends up being whichever *clone* stamped
-    `~/.codex`, if any. That is the wrong bundle to name when the app is cold:
-    a machine with only a stock install has no `app_path` at all, and one where
-    a clone shares the default home would launch the clone. Being unstamped is
-    what identifies the stock install, so it is worth deriving separately
-    rather than reading off an instance.
+    Being unstamped is what identifies the stock install: with no
+    `LSEnvironment.CODEX_HOME` in its Info.plist it falls back to the default
+    home at launch. That makes the absence of a stamp a claim in its own right,
+    and a better one than a clone's stamp on the same home -- which is why
+    `discover_instances` gives this bundle the default instance's `app_path`,
+    and why the rule is expressed here rather than inline there.
+
+    Still worth deriving separately for callers holding an `Instance` they
+    built by hand rather than one discovery produced, which carries no
+    `app_path` to read.
     """
     for app in installed_apps(search_dirs):
         if _codex_home_from_plist(app) is None:
@@ -142,6 +145,19 @@ def discover_instances(
     unstamped, because `~/.codex` is where a stock install keeps its state.
     Instances are keyed by CODEX_HOME, so two bundles pointing at one home
     collapse into a single instance rather than becoming rival targets.
+
+    Which of those two lends its `app_path` is not arbitrary, because that is
+    the bundle every caller holding an `Instance` will name -- and one of them
+    shells out to `<app_path>/Contents/Resources/codex` to resume a thread. The
+    stock bundle wins the default home: a clone stamping `~/.codex` is a real
+    configuration, and left to claim it a detached resume would drive the stock
+    app's store with the clone's binary. Bundles update independently, so that
+    is a version mismatch waiting to happen.
+
+    Filesystem-only, deliberately. Which bundle is *running* is a better answer
+    still, but it costs a process sweep and goes stale in a long-lived Session,
+    so it is asked at the point of use -- see `actions.Session.link_target` and
+    `resume.DetachedRunner.codex_binary`.
     """
     dirs = list(DEFAULT_SEARCH_DIRS) if search_dirs is None else search_dirs
     home = default_home or default_codex_home()
@@ -159,7 +175,8 @@ def discover_instances(
             app_home = _codex_home_from_plist(app)
             if app_home is None:
                 # An unstamped ChatGPT.app is the stock install: it uses the
-                # default home, which is already registered.
+                # default home, which is already registered. Which bundle that
+                # home ends up carrying is settled once, after the sweep.
                 continue
             if app_home in by_home:
                 existing = by_home[app_home]
@@ -177,6 +194,18 @@ def discover_instances(
                 app_path=app,
                 is_default=False,
             )
+
+    # Last, so it overrides a clone that stamped the default home rather than
+    # merely filling a gap the clone left.
+    stock = stock_app(dirs)
+    if stock is not None:
+        default = by_home[home]
+        by_home[home] = Instance(
+            slug=default.slug,
+            codex_home=default.codex_home,
+            app_path=stock,
+            is_default=default.is_default,
+        )
 
     instances = list(by_home.values())
     instances.sort(key=lambda i: (not i.is_default, i.slug))

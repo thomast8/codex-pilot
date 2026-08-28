@@ -69,9 +69,48 @@ def test_stamped_clone_is_discovered(tmp_path):
 def test_unstamped_app_maps_to_the_default_home_and_does_not_duplicate(tmp_path):
     apps = tmp_path / "Applications"
     apps.mkdir()
-    make_app(apps, "ChatGPT", None)
+    stock = make_app(apps, "ChatGPT", None)
     found = discover_instances(search_dirs=[apps], default_home=tmp_path / "primary")
     assert [i.slug for i in found] == ["default"]
+    # Not merely folded in: a machine with only a stock install used to leave
+    # `app_path` empty, and a detached resume then shelled out to whatever
+    # `codex` was on PATH -- an older build than the one that wrote the store.
+    assert found[0].app_path == stock
+
+
+def test_the_stock_bundle_wins_whichever_directory_is_scanned_first(tmp_path):
+    # The stock app lives in /Applications and clones in ~/Applications, so the
+    # scan order happens to favour it in practice. Nothing may depend on that.
+    system = tmp_path / "Applications"
+    user = tmp_path / "UserApplications"
+    system.mkdir()
+    user.mkdir()
+    home = tmp_path / "primary"
+    make_app(system, "ChatGPT Veridue", str(home))
+    stock = make_app(user, "ChatGPT", None)
+    assert discover_instances([system, user], default_home=home)[0].app_path == stock
+
+
+def test_a_clone_still_lends_the_default_home_its_bundle_when_alone(tmp_path):
+    apps = tmp_path / "Applications"
+    apps.mkdir()
+    home = tmp_path / "primary"
+    clone = make_app(apps, "ChatGPT Veridue", str(home))
+    # Nothing outranks it, so the only claimant is the answer -- still better
+    # than falling through to PATH.
+    assert discover_instances([apps], default_home=home)[0].app_path == clone
+
+
+def test_a_clone_keeps_its_own_home_when_the_stock_bundle_is_present(tmp_path):
+    # The stock bundle takes the *default* home and nothing else; a clone's own
+    # instance must be untouched by the preference.
+    apps = tmp_path / "Applications"
+    apps.mkdir()
+    clone = make_app(apps, "ChatGPT Personal", str(tmp_path / "secondary"))
+    stock = make_app(apps, "ChatGPT", None)
+    found = discover_instances([apps], default_home=tmp_path / "primary")
+    assert next(i for i in found if i.slug == "personal").app_path == clone
+    assert next(i for i in found if i.is_default).app_path == stock
 
 
 def test_two_apps_sharing_a_codex_home_collapse_to_one_instance(tmp_path):
@@ -175,16 +214,17 @@ def test_the_stock_bundle_is_the_unstamped_one(tmp_path):
 def test_a_clone_stamped_with_the_default_home_is_not_the_stock_bundle(tmp_path):
     """The case that makes this worth deriving separately.
 
-    A clone may stamp `~/.codex`, and `discover_instances` then records *it* as
-    the default instance's `app_path` -- so a cold default would be launched as
-    the clone. The unstamped bundle is the one the user means.
+    A clone may stamp `~/.codex`. Being unstamped is what picks the bundle the
+    user means out of the two claimants, and `discover_instances` hands the
+    default instance that same answer -- one rule, one place, so a caller
+    reading `app_path` and one asking `stock_app` cannot disagree.
     """
     apps = tmp_path / "Applications"
     apps.mkdir()
-    clone = make_app(apps, "ChatGPT Veridue", "/h/.codex")
+    make_app(apps, "ChatGPT Veridue", "/h/.codex")
     stock = make_app(apps, "ChatGPT", None)
-    assert discover_instances([apps], default_home=Path("/h/.codex"))[0].app_path == clone
     assert stock_app([apps]) == stock
+    assert discover_instances([apps], default_home=Path("/h/.codex"))[0].app_path == stock
 
 
 def test_no_stock_bundle_is_reported_as_absent(tmp_path):
