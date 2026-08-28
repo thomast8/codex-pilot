@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "codex-pilot",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Drive Codex Desktop threads from Claude Code: send work, steer a running turn, stop one, answer approval requests, change model/reasoning/plan mode, and get told when a thread goes idle.",
   "owner": {
     "name": "Thomas Tiotto"

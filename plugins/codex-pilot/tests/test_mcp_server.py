@@ -225,8 +225,10 @@ def test_a_negative_wait_is_floored_without_claiming_it_was_capped(stub_session:
 
 @pytest.mark.anyio
 async def test_the_served_version_matches_what_ships(empty_home: Path):
-    """Four places state the version; the handshake is the one a client sees, so
-    a drifting literal there means nobody can tell which build they have."""
+    """Five places state the version; the handshake is the one a client sees, so
+    a drifting literal there means nobody can tell which build they have. The
+    fifth is `uv.lock`, checked below because `uv` rewrites it from
+    `pyproject.toml` and a stale one leaves every working tree dirty."""
     pyproject = tomllib.loads((REPO / "pyproject.toml").read_text())
     expected = pyproject["project"]["version"]
     plugin = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text())
@@ -235,6 +237,7 @@ async def test_the_served_version_matches_what_ships(empty_home: Path):
     )
     assert plugin["version"] == expected
     assert marketplace["version"] == expected
+    assert f'name = "codex-pilot"\nversion = "{expected}"' in (REPO / "uv.lock").read_text()
 
     async with (
         stdio_client(server_params(empty_home)) as (read, write),

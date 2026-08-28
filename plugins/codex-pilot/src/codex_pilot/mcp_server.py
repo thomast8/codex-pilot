@@ -43,7 +43,7 @@ from .threads import ThreadError
 
 server = MCPServer(
     name="codex-pilot",
-    version="0.2.1",
+    version="0.2.2",
     instructions=__doc__,
 )
 

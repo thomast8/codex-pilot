@@ -241,6 +241,21 @@ and handling one runs `ensurePrimaryWindowVisible` — restore, show, focus on t
 primary window — *before* it navigates. `-g`, which is what `activate=false`
 does, only stops macOS activating the app on the launch side.
 
+So the first thing it does is check whether the raise is needed at all. A thread
+the app is already rendering gets no link: that link would re-run the window
+restore to display what is already displayed, which is the whole cost of a focus
+and none of its effect. You get `focus.reason: skipped_already_mounted`, the
+owning client on `owner`, and no flash. The check is a bounded probe, because
+asking is lopsided — a mounted thread answers in ~0.4s, an unmounted one costs
+the router's full ~10s before it says so — so it waits one second for a yes and
+otherwise fires the link. That means an unmounted focus costs about a second
+more than it used to, and a mounted app that answers slowly gets a redundant
+flash rather than a thread nobody can reach. `owner: null` says nothing proved
+the thread mounted; it is not a claim that it was not.
+
+`activate=true` skips the check, because a caller asking for the window in front
+is asking for something being mounted does not already provide.
+
 What the plugin does instead is give the screen back. It notes the frontmost app,
 fires the link, waits for the Codex window it aimed at to actually come forward,
 and reactivates what was displaced; `sync_threads` does it once for the whole
@@ -252,11 +267,16 @@ in both return values:
 the honest half of the feature —
 
 - `already_frontmost` — the user was in Codex to begin with; nothing was taken.
-- `not_raised` — no Codex window came forward within a few seconds, or the user
-  moved on to something else meanwhile. Reactivating on that basis would drag
-  them out of wherever they went, so it does not. Note the third case this
-  covers: a cold or busy app that raises *after* the guard stopped watching,
-  where the interruption still lands and nothing undoes it.
+- `not_raised` — no Codex window came forward inside the window we gave it, or
+  the user moved on to something else meanwhile. Reactivating on that basis
+  would drag them out of wherever they went, so it does not. `waited_seconds`
+  says how long that window was, which is the only way to tell those two apart:
+  3s when the app was already running, 15s when the link had to launch it,
+  since a launch reaches the screen long after a raise would have. A busy app
+  slower than its deadline is still the case nothing undoes.
+- `skipped_already_mounted` — no link was fired, because the app was already
+  showing the thread. Nothing was taken, so nothing needs giving back.
+- `suppressed` — `CODEX_PILOT_SUPPRESS_FOCUS` is set. See below.
 - `not_confirmed` — the reactivation was issued and the app never came back to
   the front. Running the command is not the same as winning the foreground, and
   this says which happened.
@@ -264,7 +284,18 @@ the honest half of the feature —
   reactivation failed outright. The screen is wherever the app left it.
 
 So this turns being yanked away into a flash, which is better and is still an
-interruption. Focus deliberately, and rarely:
+interruption.
+
+**Turning it off entirely.** Set `CODEX_PILOT_SUPPRESS_FOCUS` and no deep link
+is ever fired. Read what that costs: suppression does not make a thread
+reachable, it only declines to surface it, so the thread stays exactly as
+undriveable over IPC as it was. Responses carry `surfaced: false` and a
+suppressed sweep returns every thread it would have mounted in `skipped`. Use
+`read_thread`, which works off the rollout and needs no window. And note what it
+does **not** cover: if Codex Desktop raises *itself* — on an approval request,
+say — no setting here can stop that, because no link of ours was involved.
+
+Focus deliberately, and rarely:
 
 - **Never focus just to look.** `read_thread` answers "what is it doing" off
   disk, for any thread, mounted or not, without touching the app. Focusing is
@@ -274,15 +305,17 @@ interruption. Focus deliberately, and rarely:
   Mounting is additive, and `sync_threads` restores the screen once for the
   whole sweep, so mounting five threads together costs one flash — the same
   five focused one at a time as you get to them cost five.
-- **`sync_threads(mount=true)` focuses every unmounted thread it can**, and
-  with no `threads` argument that is all of them. Name the threads you mean.
+- **Mounting is opt-in.** A bare `sync_threads` is a census and costs no one
+  their screen, so asking what is reachable is always safe. `mount=true`
+  focuses every unmounted thread it can, and with no `threads` argument that is
+  all of them — so when you do ask for it, name the threads you mean.
   The ones it could not mount come back in `skipped` with a reason rather than
   failing the sweep: `unresolvable` (listed off a writer lock, but with nothing
   on disk to bind it to yet — often a thread the app has only just made, and
   worth retrying), `detached_running` (one of our own runs holds it),
-  `refused` (someone else's writer does) and `unaimable` (its instance's
-  serving app could not be named, so there is no link to aim). Nothing in
-  `skipped` was mounted.
+  `refused` (someone else's writer does), `unaimable` (its instance's
+  serving app could not be named, so there is no link to aim) and `suppressed`
+  (`CODEX_PILOT_SUPPRESS_FOCUS` is set). Nothing in `skipped` was mounted.
 - If it is not worth interrupting the user for, it is not worth focusing for.
   Read the rollout and leave the app where it is. The restore is a mitigation,
   not a licence.
