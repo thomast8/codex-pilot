@@ -92,8 +92,14 @@ FOCUS_PROBE_TIMEOUT_SECONDS = 1.0
 SUPPRESS_FOCUS_ENV = "CODEX_PILOT_SUPPRESS_FOCUS"
 
 
+# Set to any other value to suppress. These spellings read as off, because
+# `CODEX_PILOT_SUPPRESS_FOCUS=0` meaning *on* is the classic footgun, and
+# someone reaching for this switch is reaching for it in a hurry.
+_OFF = {"", "0", "false", "no", "off"}
+
+
 def focus_suppressed() -> bool:
-    return bool(os.environ.get(SUPPRESS_FOCUS_ENV))
+    return os.environ.get(SUPPRESS_FOCUS_ENV, "").strip().lower() not in _OFF
 
 
 class LinkTarget(NamedTuple):
@@ -797,7 +803,7 @@ class Session:
         mount what this one could not.
         """
         before = self.census(threads, instance)
-        if mount and focus_suppressed():
+        if mount and before["unmounted"] and focus_suppressed():
             # The census is still the honest half of the answer; what is
             # withheld is the mounting, and the caller is told which.
             return {
@@ -805,8 +811,12 @@ class Session:
                 "focused": [],
                 "mounted_by_sync": [],
                 "focus": {"restored": False, "reason": "suppressed"},
+                # Not classified any further: the per-thread checks below never
+                # ran, so this says the sweep declined to mount them, not that
+                # they were mountable. One of these may also be held by another
+                # writer, which an unsuppressed sweep would have said instead.
                 "skipped": [
-                    self._skip(row, "suppressed", f"{SUPPRESS_FOCUS_ENV} is set")
+                    self._skip(row, "suppressed", f"{SUPPRESS_FOCUS_ENV} is set; not attempted")
                     for row in before["threads"]
                     if not row["mounted"] and row["route"] == ROUTE_DESKTOP
                 ],
@@ -938,10 +948,17 @@ class Session:
         resolved = self.resolve(ref, instance)
         self._refuse_unless_app_holds(resolved)
         aimed = self.link_target(resolved.instance)
-        if focus_suppressed():
+        target = aimed.path
+        owner = None if activate else self.probe_mounted(resolved, FOCUS_PROBE_TIMEOUT_SECONDS)
+        if owner is None and focus_suppressed():
+            # Checked *after* the probe on purpose. Reporting an unreachable
+            # thread without looking would be asserting the absence rather than
+            # defaulting to it, and a thread the app already shows is reachable
+            # whatever this setting says -- that case falls through below and is
+            # reported as the skip it is.
             return {
                 "instance": resolved.instance.slug,
-                "app": str(aimed.path),
+                "app": str(target),
                 "thread": resolved.thread_id,
                 "name": resolved.name,
                 "owner": None,
@@ -950,13 +967,12 @@ class Session:
                 "surfaced": False,
                 "focus": {"restored": False, "reason": "suppressed"},
                 "note": (
-                    f"{SUPPRESS_FOCUS_ENV} is set, so nothing was surfaced: this thread is "
-                    "still unreachable over IPC. Read it with read_thread, which works off "
-                    "the rollout and needs no window."
+                    f"{SUPPRESS_FOCUS_ENV} is set, so nothing was surfaced and nothing "
+                    "proved this thread already mounted: treat it as unreachable over IPC "
+                    "and read it with read_thread, which works off the rollout and needs "
+                    "no window."
                 ),
             }
-        target = aimed.path
-        owner = None if activate else self.probe_mounted(resolved, FOCUS_PROBE_TIMEOUT_SECONDS)
         if owner is not None:
             # Already rendering it: the link would re-run the app's window
             # restore for a screen that needs no changing, which is the whole
@@ -1086,9 +1102,7 @@ class Session:
         subprocess.run(argv, check=False, capture_output=True)
         return url
 
-    def frontmost_guard(
-        self, targets: Iterable[Path], live: bool = True
-    ) -> frontmost.FrontmostGuard:
+    def frontmost_guard(self, targets: Iterable[Path], *, live: bool) -> frontmost.FrontmostGuard:
         """Give the user's foreground app back after the app raises itself.
 
         Handling a `codex://` link raises Codex Desktop's window before it
@@ -1105,6 +1119,10 @@ class Session:
 
         A cold target gets the longer deadline: the link is about to launch the
         app, and a launch reaches the screen well after a raise would have.
+        `live` is required rather than defaulted because the two deadlines fail
+        differently: guessing warm on a cold app gives up before the window
+        arrives and reports `not_raised` for a raise that did happen, which is
+        the interruption nothing undoes. A caller has to have looked.
         """
         return frontmost.FrontmostGuard(
             targets,

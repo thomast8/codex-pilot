@@ -408,6 +408,10 @@ class FakeApp:
         self.connections: list[socket.socket] = []
         self.frames: list[dict] = []
         self.answer_initialize = True
+        # thread id -> owning client id, for threads this app is pretending a
+        # window renders. Empty by default, which is why threads read as
+        # unmounted here unless a test says otherwise.
+        self.owners: dict[str, str] = {}
         self._stop = threading.Event()
         self._srv: socket.socket | None = None
         self.bind()
@@ -468,6 +472,25 @@ class FakeApp:
                 return
             for msg in reader.feed(chunk):
                 self.frames.append(msg)
+                if msg.get("method") == "thread-owner-discovery":
+                    owner = self.owners.get(str(msg.get("params", {}).get("conversationId")))
+                    if owner is not None:
+                        with contextlib.suppress(OSError):
+                            conn.sendall(
+                                encode_frame(
+                                    {
+                                        "type": "response",
+                                        "requestId": msg["requestId"],
+                                        "resultType": "success",
+                                        "method": "thread-owner-discovery",
+                                        "handledByClientId": owner,
+                                        "result": {},
+                                    }
+                                )
+                            )
+                    # An unowned thread gets silence, which is what the real
+                    # router does until its own discovery timeout fires.
+                    continue
                 if msg.get("method") == "initialize" and self.answer_initialize:
                     reply = {
                         "type": "response",
@@ -874,6 +897,56 @@ def test_focus_skips_the_link_for_a_thread_the_app_already_shows(app, monkeypatc
         sess.close()
 
 
+def test_the_skip_works_through_the_real_probe_not_a_stand_in(app, monkeypatch):
+    """The same skip, with `probe_mounted` left alone and a router answering.
+
+    The other tests patch `probe_mounted` to fix its verdict, which pins what
+    `focus_thread` does with an answer but never drives the wiring that gets
+    one: the timeout reaching `owner_of`, the strike exemption travelling with
+    it, and `handledByClientId` being read off a real frame. An inverted flag
+    or a dropped argument in that chain would pass every one of them.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    app.owners[TID] = "window-from-the-wire"
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default")
+        assert out["owner"] == "window-from-the-wire"
+        assert out["opened"] is None
+        assert calls == [], "the app answered for it, so no link should have been fired"
+        assert out["focus"] == {"restored": False, "reason": "skipped_already_mounted"}
+    finally:
+        sess.close()
+
+
+def test_a_bounded_probe_does_not_retire_the_session_connection(app, monkeypatch):
+    """The exemption has to survive the trip through `owner_of`, not just `request`.
+
+    `test_ipc.py` proves `silence_counts=False` at the transport. This proves
+    the flag is still false by the time a real `focus_thread` probe sends it:
+    more consecutive unanswered probes than the strike limit, against a router
+    that never answers owner discovery, leaving the connection usable.
+    """
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: None)
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    monkeypatch.setattr(actions, "FOCUS_PROBE_TIMEOUT_SECONDS", 0.2)
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        client = sess.client(inst)
+        resolved = sess.resolve(TID, "default")
+        for _ in range(3):
+            assert sess.probe_mounted(resolved, actions.FOCUS_PROBE_TIMEOUT_SECONDS) is None
+            assert not client.is_closed
+        app.owners[TID] = "still-talking"
+        assert sess.probe_mounted(resolved, actions.FOCUS_PROBE_TIMEOUT_SECONDS) == "still-talking"
+    finally:
+        sess.close()
+
+
 def test_an_explicit_activate_still_raises_a_mounted_thread(app, monkeypatch):
     """The skip is about pointless raises, not about refusing a asked-for one.
 
@@ -998,6 +1071,31 @@ def test_the_kill_switch_fires_no_link_and_says_the_thread_is_not_surfaced(app, 
         assert out["opened"] is None
         assert out["focus"] == {"restored": False, "reason": "suppressed"}
         assert out["surfaced"] is False
+    finally:
+        sess.close()
+
+
+def test_suppression_does_not_claim_a_mounted_thread_is_unreachable(app, monkeypatch):
+    """The switch declines to surface threads; it does not make reachable ones unreachable.
+
+    A thread the app is already showing needs no link, so suppression changes
+    nothing about it -- and saying otherwise would be asserting an absence
+    nobody checked, then steering the caller off a working IPC route onto a
+    read-only one.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: "window-7")
+    monkeypatch.setenv(actions.SUPPRESS_FOCUS_ENV, "1")
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default")
+        assert calls == [], "no link either way -- it was already mounted"
+        assert out["owner"] == "window-7"
+        assert out["surfaced"] is True
+        assert out["focus"] == {"restored": False, "reason": "skipped_already_mounted"}
     finally:
         sess.close()
 

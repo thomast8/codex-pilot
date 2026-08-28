@@ -147,10 +147,12 @@ class FrontmostGuard:
         elif self.previous in self._apps:
             self.outcome = {"restored": False, "reason": "already_frontmost"}
         else:
-            # The window we are granting the app to come forward in. It rides
-            # along on the outcome because `not_raised` has two causes -- the
-            # user moved on, or the app was slower than we waited -- and only
-            # the number distinguishes them for whoever reads the result.
+            # The window we granted the app to come forward in. It rides along
+            # on the outcome because `not_raised` alone does not say how much
+            # patience it represents -- 3s for an app already running, 15s for
+            # one being launched -- and a reader cannot judge "the app was too
+            # slow" against a deadline they cannot see. It does not say *why*
+            # the raise was missed; nothing here can.
             self.outcome = {
                 "restored": False,
                 "reason": "not_raised",

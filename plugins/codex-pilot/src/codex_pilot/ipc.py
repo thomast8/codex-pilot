@@ -309,7 +309,7 @@ class IpcClient:
             raise IpcError("call initialize() before broadcasting")
         self._send(build_broadcast(method, params))
 
-    def _record_silent_timeout(self, sent_at: float) -> bool:
+    def _record_silent_timeout(self, sent_at: float, counts: bool = True) -> bool:
         """Count a timeout against the connection, and retire it at the limit.
 
         Only a timeout with *no* frame arriving for its whole duration is
@@ -318,6 +318,14 @@ class IpcClient:
         ~10s discovery timeout, but that arrives as a `no-client-found`
         response, and any broadcast in the meantime proves the socket is live.
 
+        `counts=False` is a caller whose deadline was deliberately shorter than
+        the answer -- its silence is arranged and says nothing. Note what that
+        does *not* excuse: a frame that arrived during the wait is evidence
+        about the connection no matter who set the deadline, so the reset below
+        still runs. Skipping it would let a probe that proved the socket alive
+        leave a stale strike standing, and retire a live connection one genuine
+        timeout early.
+
         Returns whether this call retired the connection. Retiring only closes
         it -- nothing is re-sent, so a request whose outcome is unknown stays
         unknown, and the replacement connection is built lazily by the caller.
@@ -325,6 +333,8 @@ class IpcClient:
         with self._lock:
             if self._last_frame >= sent_at:
                 self._strikes = 0
+                return False
+            if not counts:
                 return False
             # Count stall *windows*, not requests. Several calls can be waiting
             # on one silent connection, and scoring each of them separately made
@@ -355,7 +365,7 @@ class IpcClient:
             try:
                 resp = waiter.get(timeout=timeout)
             except queue.Empty:
-                retired = self._record_silent_timeout(sent_at) if silence_counts else False
+                retired = self._record_silent_timeout(sent_at, counts=silence_counts)
                 detail = (
                     " -- no frames arrived on this connection either, so it has been "
                     "retired; the next call re-handshakes"

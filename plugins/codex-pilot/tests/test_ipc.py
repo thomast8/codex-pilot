@@ -337,6 +337,53 @@ def test_a_frame_arriving_mid_wait_suppresses_the_strike(wired):
     assert not client.is_closed
 
 
+def test_an_exempt_probe_still_clears_a_strike_when_a_frame_arrives(wired):
+    """Exempting a probe's silence must not exempt the traffic during it.
+
+    `silence_counts=False` says "my deadline was arranged, so my silence is not
+    evidence about the connection". It says nothing about frames that *did*
+    arrive while we waited, and those are evidence no matter who set the
+    deadline. Dropping the reset along with the strike leaves a stale strike
+    standing behind a probe that just proved the socket alive, and the next
+    genuine timeout retires a live connection one short.
+    """
+    client, router = wired
+    client.initialize()
+
+    # 1. A real stall: nothing answers, nothing else arrives. One strike.
+    router.responder = lambda msg: None
+    with pytest.raises(IpcTimeout):
+        client.request("thread-owner-discovery", {"conversationId": "c1"}, timeout=0.3)
+    assert not client.is_closed
+
+    # 2. A bounded probe that goes unanswered -- but the socket talks meanwhile.
+    def silent_but_chatty(msg):
+        router.send(
+            {
+                "type": "broadcast",
+                "method": "thread-stream-state-changed",
+                "params": {"conversationId": "c1"},
+            }
+        )
+        return None
+
+    router.responder = silent_but_chatty
+    with pytest.raises(IpcTimeout):
+        client.request(
+            "thread-owner-discovery",
+            {"conversationId": "c1"},
+            timeout=0.3,
+            silence_counts=False,
+        )
+
+    # 3. One more real stall. With the strike from step 1 cleared this is the
+    #    first, not the second, and the connection lives.
+    router.responder = lambda msg: None
+    with pytest.raises(IpcTimeout):
+        client.request("thread-owner-discovery", {"conversationId": "c1"}, timeout=0.3)
+    assert not client.is_closed, "a probe that saw a frame left a stale strike behind"
+
+
 def test_a_router_error_response_resets_strikes(wired):
     """`no-client-found` for an unmounted thread is an answer, not silence."""
     client, router = wired
