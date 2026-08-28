@@ -19,12 +19,21 @@ Three things this gets right that a bare subprocess call would not:
 - **Approvals cannot be answered.** A detached run has no TTY, so an
   `on-request` policy stalls until it times out. The policy is therefore always
   explicit rather than inherited from config.
+
+The same "explicit rather than inherited" logic is why `model`, `effort` and
+`service_tier` are per-call arguments here. Left alone, `codex exec` reads
+`model`, `model_reasoning_effort` and `service_tier` from the instance's
+`config.toml` -- a file Codex Desktop owns and rewrites wholesale, so what a
+dispatch inherits changes without anyone asking. Editing that file to set up a
+turn is the thing these arguments exist to stop: it races the app, and it moves
+every other thread and interactive session at the same time.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -32,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .instances import Instance
+from .payloads import SERVICE_TIERS
 from .threads import ThreadStore
 
 DEFAULT_SANDBOX = "workspace-write"
@@ -47,6 +57,10 @@ SANDBOX_MODES = frozenset({"read-only", "workspace-write"})
 PRIVILEGED_SANDBOX = "danger-full-access"
 FULL_ACCESS_ENV = "CODEX_PILOT_ALLOW_FULL_ACCESS"
 APPROVAL_POLICIES = frozenset({"untrusted", "on-failure", "on-request", "never"})
+# Deliberately a shape and not an allowlist -- see `check_effort`. `-c` parses
+# the right-hand side as TOML, so a bare token is also what keeps a second
+# setting from riding in past the allowlists above.
+EFFORT_TOKEN = re.compile(r"[A-Za-z0-9_-]+")
 LOG_DIR_NAME = "codex-pilot-logs"
 
 # `codex exec --json` announces the thread it created as its first JSON line.
@@ -119,6 +133,40 @@ def check_approval(approval: str) -> str:
     return approval
 
 
+def check_effort(effort: str) -> str:
+    """Shape-check the reasoning effort reaching `-c model_reasoning_effort=`.
+
+    Not an allowlist, unlike everything else here. The ladder is per model and
+    comes from a server-side catalogue that changes with releases, so a fixed
+    set would refuse a rung a newer model added -- and parking a thread one rung
+    below what the work needed is the failure that would cause. What is refused
+    is a value that could be read as more than a value.
+
+    The CLI does not validate the rung either: `-c model_reasoning_effort=bogus`
+    is accepted and printed straight back as `reasoning effort: bogus`. So a
+    typo here does not fail, it dispatches at something unintended -- read
+    `thread_status` back rather than assuming the rung took.
+    """
+    if not EFFORT_TOKEN.fullmatch(effort):
+        raise DetachedError(
+            f"effort must be a bare token like 'xhigh' or 'max', got {effort!r}. "
+            "The rungs a model offers come from its own catalogue, so this is not "
+            "checked against a list -- but a value the CLI would parse as more than "
+            "an effort is refused."
+        )
+    return effort
+
+
+def check_service_tier(tier: str) -> str:
+    """Allowlist the service tier reaching `-c service_tier=`."""
+    if tier not in SERVICE_TIERS:
+        raise DetachedError(
+            f"service_tier must be one of {sorted(SERVICE_TIERS)}, got {tier!r} "
+            "('priority' is fast mode)"
+        )
+    return tier
+
+
 def check_prompt(text: str) -> str:
     """Refuse a prompt the CLI would read as something other than a prompt.
 
@@ -130,6 +178,21 @@ def check_prompt(text: str) -> str:
             "a prompt of '-' means 'read from stdin', which a detached run has none of"
         )
     return text
+
+
+def _setting_overrides(effort: str | None, service_tier: str | None) -> list[str]:
+    """The `-c` pair for whichever of the two the caller named.
+
+    Nothing is emitted for an argument left out: no default is invented here,
+    so an unasked-for dispatch keeps whatever the instance is configured for
+    rather than a rung this code picked.
+    """
+    argv: list[str] = []
+    if effort is not None:
+        argv += ["-c", f"model_reasoning_effort={check_effort(effort)}"]
+    if service_tier is not None:
+        argv += ["-c", f"service_tier={check_service_tier(service_tier)}"]
+    return argv
 
 
 @dataclass
@@ -225,7 +288,19 @@ class DetachedRunner:
         sandbox: str = DEFAULT_SANDBOX,
         approval: str = DEFAULT_APPROVAL,
         model: str | None = None,
+        effort: str | None = None,
+        service_tier: str | None = None,
     ) -> DetachedRun:
+        # Up front, because a refusal further down would come after the
+        # unarchive: the thread would be moved out of the archive for a turn
+        # that never ran. Each resume is its own process, so these have to be
+        # passed again on every turn -- the previous run's settings are gone
+        # with the process that carried them.
+        if effort is not None:
+            check_effort(effort)
+        if service_tier is not None:
+            check_service_tier(service_tier)
+
         info = self.store.describe(thread_id)
         if info.rollout is None:
             raise DetachedError(f"no thread {thread_id} in instance {self.instance.slug!r}")
@@ -277,6 +352,7 @@ class DetachedRunner:
         ]
         if model is not None:
             argv += ["--model", model]
+        argv += _setting_overrides(effort, service_tier)
         # `--` so a prompt starting with `-` is a prompt and not a flag: without
         # it the CLI parses `--help` (or any typo) as an option and the turn
         # never runs.
@@ -299,6 +375,8 @@ class DetachedRunner:
         sandbox: str = DEFAULT_SANDBOX,
         approval: str = DEFAULT_APPROVAL,
         model: str | None = None,
+        effort: str | None = None,
+        service_tier: str | None = None,
         wait_for_id: float = THREAD_ID_WAIT,
     ) -> DetachedRun:
         """Create a brand-new thread and run its first turn in `cwd`.
@@ -316,6 +394,10 @@ class DetachedRunner:
         check_sandbox(sandbox)
         check_approval(approval)
         check_prompt(text)
+        if effort is not None:
+            check_effort(effort)
+        if service_tier is not None:
+            check_service_tier(service_tier)
         cwd = cwd.expanduser().resolve()
         if not cwd.is_dir():
             raise DetachedError(
@@ -339,6 +421,7 @@ class DetachedRunner:
         ]
         if model is not None:
             argv += ["--model", model]
+        argv += _setting_overrides(effort, service_tier)
         argv += ["--cd", str(cwd), "--skip-git-repo-check", "--", check_prompt(text)]
 
         process = self._spawn(argv, cwd, log_path)

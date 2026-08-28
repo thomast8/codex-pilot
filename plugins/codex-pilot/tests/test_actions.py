@@ -44,6 +44,26 @@ def stub(tmp_path: Path, lines: list[str], sleep: float = 0.0, exit_code: int = 
     return path
 
 
+def recording_stub(tmp_path: Path, record: Path, lines: list[str]) -> Path:
+    """The same fake `codex`, but it writes its argv out first.
+
+    Needed wherever the assertion is about what the CLI was told rather than
+    about what came back.
+    """
+    path = tmp_path / f"codex-recording-stub-{abs(hash(tuple(lines))) % 10**8}"
+    emit = "\n".join(f"printf '%s\\n' '{line}'" for line in lines)
+    path.write_text(
+        "#!/bin/sh\n"
+        f'python3 -c "\n'
+        "import json,sys\n"
+        f"json.dump({{'argv': sys.argv[1:]}}, open('{record}','w'))\n"
+        '" "$@"\n'
+        f"{emit}\n"
+    )
+    path.chmod(0o755)
+    return path
+
+
 @pytest.fixture
 def home(tmp_path: Path) -> Path:
     h = tmp_path / "codexhome"
@@ -1158,3 +1178,45 @@ def test_a_cold_instance_with_no_bundle_at_all_refuses(monkeypatch):
     inst = Instance(slug="default", codex_home=Path("/h"), app_path=None, is_default=True)
     with pytest.raises(UnboundLinkError, match="no app is listening"):
         sess.link_target(inst)
+
+
+# -- effort and service tier reach the dispatch, not the shared config --------
+
+
+def test_start_thread_passes_effort_and_tier_to_the_cli(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    sess, _ = session(home, tmp_path, recording_stub(tmp_path, rec, [STARTED]))
+    sess.start_thread("build it", cwd=str(work), effort="xhigh", service_tier="priority")
+    sess._runs[TID].wait(timeout=15)
+    argv = json.loads(rec.read_text())["argv"]
+    assert "model_reasoning_effort=xhigh" in argv
+    assert "service_tier=priority" in argv
+    sess.close()
+
+
+def test_send_message_passes_effort_and_tier_on_the_detached_route(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    write_rollout(home, TID, work)
+    rec = tmp_path / "rec.json"
+    sess, _ = session(home, tmp_path, recording_stub(tmp_path, rec, ["resumed"]))
+    sess.send_message(TID, "go", effort="max", service_tier="flex")
+    sess._runs[TID].wait(timeout=15)
+    argv = json.loads(rec.read_text())["argv"]
+    assert "model_reasoning_effort=max" in argv
+    assert "service_tier=flex" in argv
+    sess.close()
+
+
+def test_send_message_refuses_settings_it_cannot_apply_on_the_desktop_route(home, tmp_path):
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={TID: (APP_PID, "codex")})
+    # The IPC route carries no per-turn settings, so honouring these would mean
+    # silently sending the turn at whatever the thread was already on -- the
+    # caller asked for xhigh and would have no way to know it did not get it.
+    for kwargs in ({"effort": "xhigh"}, {"service_tier": "priority"}, {"model": "gpt-5.6-sol"}):
+        with pytest.raises(ActionError, match="edit_thread"):
+            sess.send_message(TID, "hello", **kwargs)
+    sess.close()

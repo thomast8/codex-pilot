@@ -21,14 +21,14 @@ in [`docs/protocol.md`](docs/protocol.md).
 
 | Tool | |
 | --- | --- |
-| `start_thread` | create a thread, optionally making it a worktree and branch, and start its first turn |
+| `start_thread` | create a thread, optionally making it a worktree and branch, and start its first turn — at a model, reasoning effort and service tier you name per dispatch |
 | `list_threads` | every thread across every installed Codex instance, with its route |
 | `thread_status` | busy/idle, current turn, settings, and anything the thread is waiting on — plus what the rollout shows when the app will not stream |
-| `send_message` | start a turn on an existing thread; routes itself over IPC or a detached resume |
+| `send_message` | start a turn on an existing thread; routes itself over IPC or a detached resume, and a detached one takes per-turn model, effort and service tier |
 | `steer_turn` | inject into a *running* turn without restarting it |
 | `stop_turn` | interrupt a turn, or terminate a detached run and its process group |
 | `respond` | answer an approval, permission request, tool question or MCP elicitation |
-| `edit_thread` | model, reasoning effort, plan mode, fast mode, sandbox, approvals; or compact |
+| `edit_thread` | model, reasoning effort, plan mode, fast mode, sandbox, approvals on a thread the app owns; or compact |
 | `set_goal` | give a thread a standing objective |
 | `follow_thread` / `collect_events` | learn when a turn finished, without polling — covers detached runs too, and reports each follow's health |
 | `focus_thread` | make the app mount a thread it is holding but not showing |
