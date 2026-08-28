@@ -43,7 +43,7 @@ from .follow import (
     EVENT_TURN_COMPLETED,
     EVENT_TURN_STARTED,
 )
-from .instances import Instance
+from .instances import Instance, discover_instances
 from .ipc import IpcError
 from .threads import ThreadError
 
@@ -115,10 +115,29 @@ def install_signal_handlers() -> None:
 
 
 def build_session(codex_home: Path | None) -> Session:
-    """Pin a single instance when asked, otherwise discover them all."""
+    """Pin a single instance when asked, otherwise discover them all.
+
+    A pinned home is looked up among the discovered instances first and used
+    whole when one matches. Built by hand it carried none of what discovery
+    knows: no `app_path`, so a detached resume fell back to whatever `codex` is
+    on PATH and a deep link had nothing to aim at; and `is_default=True` for
+    any home at all, which offers a clone the uid-keyed tmpdir socket belonging
+    to whichever default-home app happens to be running.
+
+    A home nothing claims still has to be built by hand, but not as the default
+    one -- the default home is always among the discovered instances, so
+    reaching that line means this is some other home.
+
+    `--instance` is mutually exclusive with `--codex-home`, so nothing selects
+    by the slug this changes.
+    """
     if codex_home is None:
         return Session()
-    instance = Instance(slug="default", codex_home=codex_home, app_path=None, is_default=True)
+    pinned = codex_home.expanduser()
+    for found in discover_instances():
+        if found.codex_home.expanduser() == pinned:
+            return Session(instances=[found])
+    instance = Instance(slug="pinned", codex_home=pinned, app_path=None, is_default=False)
     return Session(instances=[instance])
 
 

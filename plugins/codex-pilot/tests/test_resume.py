@@ -14,7 +14,7 @@ import pytest
 
 from codex_pilot.instances import Instance
 from codex_pilot.resume import DetachedError, DetachedRunner, LockedError
-from codex_pilot.threads import ThreadStore
+from codex_pilot.threads import ServingApp, ThreadStore
 
 TID = "01a039f5-2b49-7ef3-9b43-92673a44dd43"
 
@@ -213,16 +213,18 @@ def test_reports_the_archived_thread_it_unarchived(home, tmp_path, monkeypatch):
     assert calls == [["unarchive", TID]]
 
 
-def test_binary_defaults_to_the_instance_app_when_present(tmp_path):
-    app = tmp_path / "ChatGPT.app"
+def make_bundle(root: Path, name: str) -> Path:
+    app = root / f"{name}.app"
     binary = app / "Contents" / "Resources" / "codex"
     binary.parent.mkdir(parents=True)
     binary.write_text("#!/bin/sh\nexit 0\n")
     binary.chmod(0o755)
-    home = tmp_path / "h"
-    (home / "thread-writer-locks").mkdir(parents=True)
-    inst = Instance(slug="default", codex_home=home, app_path=app, is_default=True)
-    r = DetachedRunner(
+    return app
+
+
+def quiet_runner(home: Path, inst: Instance) -> DetachedRunner:
+    (home / "thread-writer-locks").mkdir(parents=True, exist_ok=True)
+    return DetachedRunner(
         inst,
         ThreadStore(
             home,
@@ -230,24 +232,112 @@ def test_binary_defaults_to_the_instance_app_when_present(tmp_path):
             app_process_probe=lambda socks: set(),
         ),
     )
+
+
+def aiming(monkeypatch, found: ServingApp) -> None:
+    monkeypatch.setattr("codex_pilot.resume.serving_app", lambda paths, *a, **kw: found)
+
+
+def test_binary_defaults_to_the_instance_app_when_present(tmp_path, monkeypatch):
+    aiming(monkeypatch, ServingApp(bundle=None))
+    app = make_bundle(tmp_path, "ChatGPT")
+    home = tmp_path / "h"
+    inst = Instance(slug="default", codex_home=home, app_path=app, is_default=True)
     # The app writes the rollout store; resuming with a different build risks
     # a format mismatch.
-    assert r.codex_binary == binary
+    assert quiet_runner(home, inst).codex_binary == app / "Contents" / "Resources" / "codex"
 
 
-def test_binary_falls_back_to_path_when_no_app_bundle(tmp_path):
+def test_binary_falls_back_to_path_when_no_app_bundle(tmp_path, monkeypatch):
+    aiming(monkeypatch, ServingApp(bundle=None))
+    home = tmp_path / "h"
+    inst = Instance(slug="default", codex_home=home, app_path=None, is_default=True)
+    assert quiet_runner(home, inst).codex_binary.name == "codex"
+
+
+def test_the_bundle_serving_the_home_outranks_the_one_claiming_it(tmp_path, monkeypatch):
+    # Measured on 2026-08-28: ChatGPT Veridue.app stamps CODEX_HOME=~/.codex and
+    # so claims the default instance, while /Applications/ChatGPT.app is the
+    # process listening on that home's socket. The listener wrote the rollout
+    # store, so its binary is the one that resumes it.
+    serving = make_bundle(tmp_path, "ChatGPT")
+    claimant = make_bundle(tmp_path, "ChatGPT Veridue")
+    aiming(monkeypatch, ServingApp(bundle=serving))
+    home = tmp_path / "h"
+    inst = Instance(slug="default", codex_home=home, app_path=claimant, is_default=True)
+    assert quiet_runner(home, inst).codex_binary == serving / "Contents" / "Resources" / "codex"
+
+
+def test_a_cold_socket_falls_back_to_the_claiming_bundle(tmp_path, monkeypatch):
+    # The ordinary state on this route: it runs when nothing holds the thread,
+    # and often when no app is running at all. Nothing is serving the home then,
+    # so the Info.plist claim is the best answer left.
+    aiming(monkeypatch, ServingApp(bundle=None))
+    claimant = make_bundle(tmp_path, "ChatGPT Veridue")
+    home = tmp_path / "h"
+    inst = Instance(slug="default", codex_home=home, app_path=claimant, is_default=True)
+    assert quiet_runner(home, inst).codex_binary == claimant / "Contents" / "Resources" / "codex"
+
+
+def test_an_unanswerable_probe_resumes_anyway_rather_than_refusing(tmp_path, monkeypatch):
+    # Deliberately unlike `link_target`, which raises here. An unaimed deep link
+    # *is* the bug it was fixing; resuming with the claimed bundle is at worst
+    # what this did before, and refusing every detached run because `ps` hiccuped
+    # would take out the route entirely.
+    aiming(monkeypatch, ServingApp.unavailable())
+    claimant = make_bundle(tmp_path, "ChatGPT Veridue")
+    home = tmp_path / "h"
+    inst = Instance(slug="default", codex_home=home, app_path=claimant, is_default=True)
+    assert quiet_runner(home, inst).codex_binary == claimant / "Contents" / "Resources" / "codex"
+
+
+def test_a_serving_bundle_with_no_usable_binary_falls_through(tmp_path, monkeypatch):
+    # A bundle can be mid-update, or shipped without the CLI. Naming it in argv
+    # would fail the spawn outright; the claimant is still worth trying.
+    serving = tmp_path / "ChatGPT.app"
+    serving.mkdir()
+    aiming(monkeypatch, ServingApp(bundle=serving))
+    claimant = make_bundle(tmp_path, "ChatGPT Veridue")
+    home = tmp_path / "h"
+    inst = Instance(slug="default", codex_home=home, app_path=claimant, is_default=True)
+    assert quiet_runner(home, inst).codex_binary == claimant / "Contents" / "Resources" / "codex"
+
+
+def test_an_explicit_binary_is_never_probed_for(tmp_path, monkeypatch):
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "codex_pilot.resume.serving_app",
+        lambda paths, *a, **kw: calls.append(paths) or ServingApp(bundle=None),
+    )
     home = tmp_path / "h"
     (home / "thread-writer-locks").mkdir(parents=True)
+    stub = tmp_path / "mycodex"
+    stub.write_text("")
     inst = Instance(slug="default", codex_home=home, app_path=None, is_default=True)
-    r = DetachedRunner(
+    runner = DetachedRunner(
         inst,
-        ThreadStore(
-            home,
-            lock_holder_probe=lambda p: {},
-            app_process_probe=lambda socks: set(),
-        ),
+        ThreadStore(home, lock_holder_probe=lambda p: {}, app_process_probe=lambda s: set()),
+        codex_binary=stub,
     )
-    assert r.codex_binary.name == "codex"
+    assert runner.codex_binary == stub
+    assert calls == []
+
+
+def test_the_binary_is_re_resolved_rather_than_frozen_at_construction(tmp_path, monkeypatch):
+    # A Session caches one runner for its whole life. The app quits, relaunches
+    # and updates underneath it, so a binary decided once goes quietly stale.
+    first = make_bundle(tmp_path, "ChatGPT")
+    second = make_bundle(tmp_path, "ChatGPT Updated")
+    serving = [first]
+    monkeypatch.setattr(
+        "codex_pilot.resume.serving_app", lambda paths, *a, **kw: ServingApp(bundle=serving[0])
+    )
+    home = tmp_path / "h"
+    inst = Instance(slug="default", codex_home=home, app_path=None, is_default=True)
+    runner = quiet_runner(home, inst)
+    assert runner.codex_binary == first / "Contents" / "Resources" / "codex"
+    serving[0] = second
+    assert runner.codex_binary == second / "Contents" / "Resources" / "codex"
 
 
 def test_env_is_inherited_apart_from_codex_home(home, tmp_path, monkeypatch):

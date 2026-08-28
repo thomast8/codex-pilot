@@ -42,7 +42,7 @@ from pathlib import Path
 
 from .instances import Instance
 from .payloads import SERVICE_TIERS
-from .threads import ThreadStore
+from .threads import ThreadStore, serving_app
 
 DEFAULT_SANDBOX = "workspace-write"
 DEFAULT_APPROVAL = "never"
@@ -258,14 +258,37 @@ class DetachedRunner:
     ) -> None:
         self.instance = instance
         self.store = store
-        self.codex_binary = codex_binary or self._default_binary(instance)
+        self._binary_override = codex_binary
         self.log_dir = log_dir or (instance.codex_home / LOG_DIR_NAME)
 
-    @staticmethod
-    def _default_binary(instance: Instance) -> Path:
-        """The instance's own codex, else whatever is on PATH."""
-        if instance.app_path is not None:
-            bundled = instance.app_path / "Contents" / "Resources" / "codex"
+    @property
+    def codex_binary(self) -> Path:
+        """The codex of the bundle behind this home, else whatever is on PATH.
+
+        The app that is *serving* the instance outranks the one that claims it.
+        `app_path` is read off an Info.plist, and on a machine where a clone
+        stamps the default home the claimant and the server are different apps
+        -- the binary that wrote the rollout store is the one that should
+        resume it, and the two bundles update independently.
+
+        Unlike `link_target`, an unanswerable probe does not refuse here. An
+        unaimed deep link *is* that bug, whereas resuming with the claimed
+        bundle is at worst what this did before, and refusing every detached
+        run because `ps` hiccuped would take out the route entirely. So both
+        "nothing listening" and "could not tell" fall through to the claim.
+
+        Resolved per access rather than cached at construction: a Session keeps
+        one runner for its whole life, and over days the app quits, relaunches
+        and updates underneath it. Two lsof sweeps per detached run is nothing
+        beside resuming with the wrong build.
+        """
+        if self._binary_override is not None:
+            return self._binary_override
+        serving = serving_app(self.instance.socket_candidates()).bundle
+        for app in (serving, self.instance.app_path):
+            if app is None:
+                continue
+            bundled = app / "Contents" / "Resources" / "codex"
             if bundled.is_file() and os.access(bundled, os.X_OK):
                 return bundled
         return Path("codex")

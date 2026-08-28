@@ -645,6 +645,16 @@ place under the same id. Three details matter:
 - **Use the instance's own `codex`**, from
   `<App>.app/Contents/Resources/codex`, not the one on PATH. That binary wrote
   the rollout store and here it is ahead of PATH (0.149.0-alpha.4.3 vs 0.147.0).
+  Which bundle is "the instance's own" is the same question the deep link asks
+  above, and it has the same two answers: the app listening on the instance's
+  socket, else the bundle stamped with that `CODEX_HOME` — the *unstamped* one
+  for the default home, since a clone may stamp it too. Measured 2026-08-28:
+  `ChatGPT Veridue.app` stamps `~/.codex`, so reading the plists alone hands the
+  clone's binary to a store `/Applications/ChatGPT.app` is serving.
+- **A probe that could not run does not stop the resume**, unlike the link.
+  There the unaimed link *is* the bug; here the claimed bundle is at worst what
+  a plist-only reading would have picked anyway, and refusing every detached run
+  because `lsof` or `ps` hiccuped would take out the route altogether.
 - **Set `CODEX_HOME` explicitly** to the instance's home, or the turn lands in
   whichever instance the ambient environment points at.
 - **Set the approval policy explicitly.** A detached run has no TTY, so an
