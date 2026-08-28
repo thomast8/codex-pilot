@@ -64,6 +64,13 @@ driven by neither route until something surfaces it — that is what `focus_thre
 is for. Remodex documents the same boundary: *"Codex Desktop only accepts an
 external stream after that thread's route is mounted."*
 
+Surfacing costs the user their screen, so it happens as little as possible. A
+thread the app is already showing is not surfaced again, the raise that does
+happen is undone once the window is seen to have risen (with a longer deadline
+when the link had to launch the app), and `CODEX_PILOT_SUPPRESS_FOCUS` turns it
+off entirely at the price of leaving those threads unreachable over IPC —
+`read_thread` still answers off the rollout.
+
 **A lock holder is not always the app, and the name will not tell you.** A
 detached `codex exec` holds the same lock, and `lsof` reports its command as
 `codex` exactly like the app's own `codex app-server` child. What separates
@@ -221,6 +228,17 @@ wrapper, so the follower surface cannot reach it.
 makes threads reachable without the app rendering them, at the cost of running a
 second runtime and holding the locks. codex-pilot is a pure follower by choice:
 lighter, no contention, but bounded by what the app will surface.
+
+Reading its source rather than assuming, the trade is worse than it looks for
+the problem you would adopt it to solve. Its ownership is local bookkeeping
+claimed nowhere on the wire; co-existence is an after-the-fact yield that only
+notices a peer *once that peer broadcasts*, so a first push can land on a thread
+Desktop is already driving; ownership expires on a 20s freshness timer; and with
+no bus to find it binds the socket path itself and becomes the router. Against
+"never contend for the lock" that is the wrong direction. Decisively, it refuses
+outright (`conversation-not-owned`) any thread it did not create — so inverting
+the writer would do nothing for the app-held threads whose raises are the actual
+cost.
 
 ## Development
 

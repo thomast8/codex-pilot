@@ -49,6 +49,15 @@ BUNDLE_PATH = re.compile(r'bundle path="([^"]+)"')
 # under a second on a warm app; the ceiling is for a cold or busy one, and
 # exceeding it costs nothing but a skipped restore.
 RAISE_TIMEOUT_SECONDS = 3.0
+
+# What a *cold* app gets instead. The link launches Codex when nothing is
+# serving the instance, and a launch is not a raise: the window can arrive
+# several seconds after `open` returns, long past the warm deadline, and a
+# raise the guard stopped watching for is one nothing ever undoes. Waiting
+# costs the caller only when it just asked for a launch it was waiting on
+# anyway.
+COLD_RAISE_TIMEOUT_SECONDS = 15.0
+
 POLL_SECONDS = 0.1
 
 # Reactivation is asynchronous too, so "restored" is only reported once the app
@@ -138,7 +147,17 @@ class FrontmostGuard:
         elif self.previous in self._apps:
             self.outcome = {"restored": False, "reason": "already_frontmost"}
         else:
-            self.outcome = {"restored": False, "reason": "not_raised"}
+            # The window we granted the app to come forward in. It rides along
+            # on the outcome because `not_raised` alone does not say how much
+            # patience it represents -- 3s for an app already running, 15s for
+            # one being launched -- and a reader cannot judge "the app was too
+            # slow" against a deadline they cannot see. It does not say *why*
+            # the raise was missed; nothing here can.
+            self.outcome = {
+                "restored": False,
+                "reason": "not_raised",
+                "waited_seconds": self._timeout,
+            }
         return self
 
     def __exit__(

@@ -8,6 +8,7 @@ without a Codex Desktop install.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -223,10 +224,51 @@ def test_a_negative_wait_is_floored_without_claiming_it_was_capped(stub_session:
     assert "note" not in result
 
 
+def test_the_committed_version_is_consistent_too():
+    """The same five files, as git has them rather than as the disk has them.
+
+    The check above reads the working tree, so it passes while a bump is only
+    half committed -- which is not hypothetical: 0.2.2 went out with four files
+    staged and the root `marketplace.json` left behind, and this suite was
+    green the whole time. Comparing HEAD's blobs to each other catches exactly
+    that, and stays quiet during ordinary work: edit all five and the committed
+    copies still agree with one another until the commit lands.
+    """
+    paths = {
+        "pyproject.toml": "plugins/codex-pilot/pyproject.toml",
+        "plugin.json": "plugins/codex-pilot/.claude-plugin/plugin.json",
+        "marketplace.json": ".claude-plugin/marketplace.json",
+        "mcp_server.py": "plugins/codex-pilot/src/codex_pilot/mcp_server.py",
+        "uv.lock": "plugins/codex-pilot/uv.lock",
+    }
+    root = REPO.parent.parent
+    try:
+        blobs = {
+            name: subprocess.run(
+                ["git", "show", f"HEAD:{path}"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            for name, path in paths.items()
+        }
+    except (OSError, subprocess.CalledProcessError) as exc:
+        pytest.skip(f"not a usable git checkout: {exc}")
+
+    committed = tomllib.loads(blobs["pyproject.toml"])["project"]["version"]
+    assert json.loads(blobs["plugin.json"])["version"] == committed
+    assert json.loads(blobs["marketplace.json"])["version"] == committed
+    assert f'version="{committed}"' in blobs["mcp_server.py"]
+    assert f'name = "codex-pilot"\nversion = "{committed}"' in blobs["uv.lock"]
+
+
 @pytest.mark.anyio
 async def test_the_served_version_matches_what_ships(empty_home: Path):
-    """Four places state the version; the handshake is the one a client sees, so
-    a drifting literal there means nobody can tell which build they have."""
+    """Five places state the version; the handshake is the one a client sees, so
+    a drifting literal there means nobody can tell which build they have. The
+    fifth is `uv.lock`, checked below because `uv` rewrites it from
+    `pyproject.toml` and a stale one leaves every working tree dirty."""
     pyproject = tomllib.loads((REPO / "pyproject.toml").read_text())
     expected = pyproject["project"]["version"]
     plugin = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text())
@@ -235,6 +277,7 @@ async def test_the_served_version_matches_what_ships(empty_home: Path):
     )
     assert plugin["version"] == expected
     assert marketplace["version"] == expected
+    assert f'name = "codex-pilot"\nversion = "{expected}"' in (REPO / "uv.lock").read_text()
 
     async with (
         stdio_client(server_params(empty_home)) as (read, write),

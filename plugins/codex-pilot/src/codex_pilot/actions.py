@@ -28,7 +28,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import frontmost, payloads
 from . import ipc as ipc_module
@@ -76,6 +76,42 @@ ROUTE_UNKNOWN = "unknown"
 # answers in ~0.4s. Probing serially is therefore unusable on a real
 # instance; requests are multiplexed by id, so they go concurrently.
 CENSUS_WORKERS = 8
+
+# What `focus_thread` will wait to learn a thread is already mounted before it
+# gives up asking and fires the link anyway. A mounted thread answers in ~0.4s,
+# so this is headroom rather than a guess; the router's ~10s no-client-found is
+# deliberately not waited for, because by then the link would have been the
+# cheaper way to find out.
+FOCUS_PROBE_TIMEOUT_SECONDS = 1.0
+
+# Set to turn every deep link off. The raise is the app's own behaviour and
+# cannot be declined, so the only complete answer is not to fire the link --
+# which costs the threads it would have surfaced: they stay unreachable over
+# IPC, and the rollout is the tier that still works. Callers are told that
+# rather than handed something that looks like a focus which worked.
+SUPPRESS_FOCUS_ENV = "CODEX_PILOT_SUPPRESS_FOCUS"
+
+
+# Set to any other value to suppress. These spellings read as off, because
+# `CODEX_PILOT_SUPPRESS_FOCUS=0` meaning *on* is the classic footgun, and
+# someone reaching for this switch is reaching for it in a hurry.
+_OFF = {"", "0", "false", "no", "off"}
+
+
+def focus_suppressed() -> bool:
+    return os.environ.get(SUPPRESS_FOCUS_ENV, "").strip().lower() not in _OFF
+
+
+class LinkTarget(NamedTuple):
+    """A bundle to aim a deep link at, and whether it is already running.
+
+    The two travel together because the second is only knowable at the moment
+    the first is resolved -- both come out of one `serving_app` probe -- and
+    separating them would mean probing twice or guessing.
+    """
+
+    path: Path
+    live: bool
 
 
 class ActionError(Exception):
@@ -603,11 +639,22 @@ class Session:
 
     # -- owner --------------------------------------------------------------
 
-    def owner_of(self, resolved: ResolvedThread) -> str:
-        """The clientId of the window that owns this thread."""
+    def owner_of(self, resolved: ResolvedThread, timeout: float | None = None) -> str:
+        """The clientId of the window that owns this thread.
+
+        `timeout` bounds the wait below the router's own ~10s discovery answer,
+        for a caller that only wants the cheap positive. Silence then means "did
+        not answer in time", not "the connection is dead", so it is exempt from
+        the strike counter.
+        """
         client = self.client(resolved.instance)
         try:
-            response = client.request(OWNER_DISCOVERY, payloads.owner_discovery(resolved.thread_id))
+            response = client.request(
+                OWNER_DISCOVERY,
+                payloads.owner_discovery(resolved.thread_id),
+                timeout=timeout,
+                silence_counts=timeout is None,
+            )
         except RouterError as exc:
             if exc.error == "no-client-found":
                 # Same reply, three different situations. Which one it is
@@ -647,10 +694,21 @@ class Session:
             raise ActionError(f"owner discovery returned no client id: {response}")
         return owner
 
-    def probe_mounted(self, resolved: ResolvedThread) -> str | None:
-        """The owning client id if the app is mounted on this thread, else None."""
+    def probe_mounted(self, resolved: ResolvedThread, timeout: float | None = None) -> str | None:
+        """The owning client id if the app is mounted on this thread, else None.
+
+        `None` is "not provably mounted", which is weaker than "unmounted": an
+        unreachable router, a refusal, or -- with `timeout` set -- an answer
+        that did not arrive in time all land here alongside a genuine
+        no-client-found. Callers must treat it as absence of proof and take the
+        safe branch, never as proof of absence.
+
+        The probe is lopsided. A mounted thread answers in ~0.4s; an unmounted
+        one costs the router's full ~10s discovery timeout before it says so.
+        A caller that only wants the cheap positive passes a `timeout`.
+        """
         try:
-            return self.owner_of(resolved)
+            return self.owner_of(resolved, timeout=timeout)
         except (UnclaimedThreadError, NoOwnerError):
             return None
         except (ActionError, IpcError):
@@ -716,7 +774,7 @@ class Session:
     def sync_threads(
         self,
         threads: list[str] | None = None,
-        mount: bool = True,
+        mount: bool = False,
         instance: str | None = None,
         settle_seconds: float = 6.0,
     ) -> dict[str, Any]:
@@ -745,6 +803,24 @@ class Session:
         mount what this one could not.
         """
         before = self.census(threads, instance)
+        if mount and before["unmounted"] and focus_suppressed():
+            # The census is still the honest half of the answer; what is
+            # withheld is the mounting, and the caller is told which.
+            return {
+                **before,
+                "focused": [],
+                "mounted_by_sync": [],
+                "focus": {"restored": False, "reason": "suppressed"},
+                # Not classified any further: the per-thread checks below never
+                # ran, so this says the sweep declined to mount them, not that
+                # they were mountable. One of these may also be held by another
+                # writer, which an unsuppressed sweep would have said instead.
+                "skipped": [
+                    self._skip(row, "suppressed", f"{SUPPRESS_FOCUS_ENV} is set; not attempted")
+                    for row in before["threads"]
+                    if not row["mounted"] and row["route"] == ROUTE_DESKTOP
+                ],
+            }
         if not mount or not before["unmounted"]:
             return {**before, "focused": [], "mounted_by_sync": [], "focus": None, "skipped": []}
 
@@ -754,6 +830,9 @@ class Session:
         # and a ps sweep, and every thread in a sweep shares its instance's
         # answer.
         targets: dict[str, Path] = {}
+        # One cold app in the sweep sets the pace for the batch: the guard is
+        # per batch, so it has to outlast the slowest window it is waiting on.
+        all_live = True
         # Rows rather than `unmounted`, because an id alone has lost its
         # instance: thread ids are unique within a CODEX_HOME and not across
         # them, so re-resolving bare could bind the wrong app -- or refuse as
@@ -787,7 +866,9 @@ class Session:
             slug = resolved.instance.slug
             if slug not in targets:
                 try:
-                    targets[slug] = self.link_target(resolved.instance)
+                    aimed = self.link_target(resolved.instance)
+                    targets[slug] = aimed.path
+                    all_live = all_live and aimed.live
                 except UnboundLinkError as exc:
                     # Per instance rather than per thread, but skipped the same
                     # way: a sweep can span instances, and one whose app cannot
@@ -808,7 +889,7 @@ class Session:
         # should be put back once at the end rather than fought over per thread.
         # A sweep can span instances, so the guard watches every bundle it is
         # about to raise rather than assuming there is only one.
-        with self.frontmost_guard({target for _, target in pending}) as guard:
+        with self.frontmost_guard({target for _, target in pending}, live=all_live) as guard:
             for resolved, target in pending:
                 self._open_thread_link(resolved, target)
         # Settle *after* the guard, not inside it: the app mounts on its own
@@ -866,16 +947,61 @@ class Session:
         """
         resolved = self.resolve(ref, instance)
         self._refuse_unless_app_holds(resolved)
-        target = self.link_target(resolved.instance)
-        with self.frontmost_guard([target]) as guard:
+        aimed = self.link_target(resolved.instance)
+        target = aimed.path
+        owner = None if activate else self.probe_mounted(resolved, FOCUS_PROBE_TIMEOUT_SECONDS)
+        if owner is None and focus_suppressed():
+            # Checked *after* the probe on purpose. Reporting an unreachable
+            # thread without looking would be asserting the absence rather than
+            # defaulting to it, and a thread the app already shows is reachable
+            # whatever this setting says -- that case falls through below and is
+            # reported as the skip it is.
+            return {
+                "instance": resolved.instance.slug,
+                "app": str(target),
+                "thread": resolved.thread_id,
+                "name": resolved.name,
+                "owner": None,
+                "opened": None,
+                "activated": False,
+                "surfaced": False,
+                "focus": {"restored": False, "reason": "suppressed"},
+                "note": (
+                    f"{SUPPRESS_FOCUS_ENV} is set, so nothing was surfaced and nothing "
+                    "proved this thread already mounted: treat it as unreachable over IPC "
+                    "and read it with read_thread, which works off the rollout and needs "
+                    "no window."
+                ),
+            }
+        if owner is not None:
+            # Already rendering it: the link would re-run the app's window
+            # restore for a screen that needs no changing, which is the whole
+            # cost of a focus and none of its effect.
+            return {
+                "instance": resolved.instance.slug,
+                "app": str(target),
+                "thread": resolved.thread_id,
+                "name": resolved.name,
+                "owner": owner,
+                "opened": None,
+                "activated": False,
+                "surfaced": True,
+                "focus": {"restored": False, "reason": "skipped_already_mounted"},
+                "note": "already mounted; the app answers for this thread now",
+            }
+        with self.frontmost_guard([target], live=aimed.live) as guard:
             url = self._open_thread_link(resolved, target, activate)
         return {
             "instance": resolved.instance.slug,
             "app": str(target),
             "thread": resolved.thread_id,
             "name": resolved.name,
+            # Not proof it was unmounted -- only that nothing proved otherwise
+            # inside the probe's second. See `probe_mounted`.
+            "owner": None,
             "opened": url,
             "activated": activate,
+            "surfaced": True,
             "focus": guard.outcome,
             "note": "give the app a moment, then retry the call that failed",
         }
@@ -905,8 +1031,13 @@ class Session:
                 f"(`ps -o command= -p {holder.pid}`) and retry once `lsof` is usable."
             )
 
-    def link_target(self, instance: Instance) -> Path:
-        """The bundle this instance's deep links must be handed to.
+    def link_target(self, instance: Instance) -> LinkTarget:
+        """The bundle this instance's deep links must be handed to, and its state.
+
+        `live` says whether an app is currently serving the instance's socket.
+        It decides nothing about *where* the link goes -- both branches below
+        return a real bundle -- only how long the caller should expect to wait
+        for the window, since a cold bundle has to start before it can rise.
 
         Aiming the link is not a refinement, it is the difference between the
         link working and doing nothing. `codex://` is claimed by every Codex
@@ -936,7 +1067,7 @@ class Session:
         """
         found = serving_app(instance.socket_candidates())
         if found.bundle is not None:
-            return found.bundle
+            return LinkTarget(found.bundle, live=True)
         if not found.known:
             raise UnboundLinkError(
                 f"could not tell which app is serving instance {instance.slug!r} "
@@ -948,7 +1079,7 @@ class Session:
         cold = stock_app() if instance.is_default else None
         cold = cold or instance.app_path
         if cold is not None:
-            return cold
+            return LinkTarget(cold, live=False)
         raise UnboundLinkError(
             f"no app is listening on instance {instance.slug!r}'s socket "
             f"({instance.codex_home}) and no installed bundle is known to serve it, so "
@@ -971,7 +1102,7 @@ class Session:
         subprocess.run(argv, check=False, capture_output=True)
         return url
 
-    def frontmost_guard(self, targets: Iterable[Path]) -> frontmost.FrontmostGuard:
+    def frontmost_guard(self, targets: Iterable[Path], *, live: bool) -> frontmost.FrontmostGuard:
         """Give the user's foreground app back after the app raises itself.
 
         Handling a `codex://` link raises Codex Desktop's window before it
@@ -985,8 +1116,20 @@ class Session:
         that caused it. Watching every installed Codex bundle instead would
         misread a user sitting in a *different* instance as already being where
         we are sending them, and leave them there.
+
+        A cold target gets the longer deadline: the link is about to launch the
+        app, and a launch reaches the screen well after a raise would have.
+        `live` is required rather than defaulted because the two deadlines fail
+        differently: guessing warm on a cold app gives up before the window
+        arrives and reports `not_raised` for a raise that did happen, which is
+        the interruption nothing undoes. A caller has to have looked.
         """
-        return frontmost.FrontmostGuard(targets)
+        return frontmost.FrontmostGuard(
+            targets,
+            timeout=(
+                frontmost.RAISE_TIMEOUT_SECONDS if live else frontmost.COLD_RAISE_TIMEOUT_SECONDS
+            ),
+        )
 
     # -- mutating verbs -----------------------------------------------------
 

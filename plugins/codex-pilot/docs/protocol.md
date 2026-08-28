@@ -550,26 +550,47 @@ That makes focusing an interruption of whoever is at the keyboard, not a
 background operation, and it is why the mounting advice everywhere else is
 "mount the set you mean to drive, once" rather than "focus as you go".
 
-### remodex hits the same wall, and mostly sidesteps it — corroboration
+### remodex hits the same wall, and rations the raise rather than escaping it — corroboration
 
 Worth knowing because it is the obvious "how does anyone else do this" question.
-remodex does not avoid the raise; it avoids *needing* it. Its bridge drives its
-own `codex app-server` over stdio, so the writer is remodex, not the desktop
-app, and Codex Desktop is a viewer it pushes live conversation state into over
-this same IPC bus. A viewer never has to answer owner discovery, so nothing has
-to be mounted.
+An earlier reading of this recorded that remodex avoids *needing* the raise. Its
+source says otherwise, and the correction matters because it bounds what any
+approach here can achieve.
 
-Where it does deep-link, it reports exactly the symptom documented here: its
-refresher carries a `navigationOnly` mode whose comment says the mid-run and
-completion refreshes "would repeatedly deep-link and steal focus", and its
-AppleScript helper follows the `open` with an explicit `activate`, since a
-phone-driven thread appearing on the Mac is the point there. It also probes with
-`lsappinfo` rather than System Events, for the same reason as here: a background
-agent may have no automation permission.
+Its bridge does drive its own `codex app-server` over stdio, so the writer is
+remodex rather than the desktop app, and it pushes live conversation state into
+Desktop over this same bus (`thread-stream-state-changed`, v11 — the version we
+pin too). But Desktop *displays* a pushed thread only once its renderer has
+mounted that thread's route; before that it drops the snapshots as unfollowed,
+and a new thread gets no more than a sidebar entry, from a `thread-unarchived`
+broadcast. So remodex fires a real `codex://threads/<id>` deep link **once per
+thread** to satisfy exactly the precondition documented above, and its
+AppleScript follows the `open` with an unconditional `activate` — a harder raise
+than ours, not a softer one.
 
-The lesson generalises to the lock, not to focus: whoever holds the writer drives
-without mounting anything. That is our detached route, and the mounting problem
-is confined to threads the app itself holds.
+What it does afterwards is the part worth copying. It records the mount and
+never navigates for that thread again: `handleFollowerStateChanged` populates a
+`followedThreadIds` set, and its comment states the reasoning — Codex emits that
+"only after the thread route mounts and its renderer calls
+set-active-conversation", which is "the authoritative proof that Desktop will
+accept the owner's snapshots instead of dropping them as unfollowed." Its
+`navigationOnly` mode exists for the same reason: the comment says the mid-run
+and completion refreshes "would repeatedly deep-link and steal focus". It also
+probes with `lsappinfo` rather than System Events, for the same reason as here:
+a background agent may have no automation permission.
+
+That proof arrives for free there because the roles are inverted. remodex is the
+owner, so Desktop announces its mount as a follower. We are the follower, so
+nothing announces it to us and the equivalent has to be asked for — which is
+what `focus_thread`'s bounded owner-discovery probe does before it fires a link.
+
+Two lessons, then. The one about focus is that the raise is rationed, not
+escaped: at most one per thread, never for a thread already mounted. The one
+about the lock still stands — whoever holds the writer drives without mounting
+anything, which is our detached route — but note it would not help here even if
+adopted: remodex refuses outright (`conversation-not-owned`) any thread it did
+not create, so an inverted writer reaches none of the app-held threads whose
+raises are the cost.
 
 ### The link is not bound to an instance, so it has to be aimed — verified
 

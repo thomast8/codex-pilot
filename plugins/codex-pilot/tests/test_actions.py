@@ -10,6 +10,7 @@ that lets an orchestrator notice a detached run finished.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import shutil
 import socket
@@ -21,7 +22,14 @@ from pathlib import Path
 
 import pytest
 
-from codex_pilot.actions import ActionError, ResolvedThread, Session, UnboundLinkError
+from codex_pilot import actions, frontmost, mcp_server
+from codex_pilot.actions import (
+    ActionError,
+    LinkTarget,
+    ResolvedThread,
+    Session,
+    UnboundLinkError,
+)
 from codex_pilot.follow import EVENT_RUN_FAILED, EVENT_TURN_COMPLETED
 from codex_pilot.framing import FrameReader, encode_frame
 from codex_pilot.frontmost import OPEN
@@ -400,6 +408,10 @@ class FakeApp:
         self.connections: list[socket.socket] = []
         self.frames: list[dict] = []
         self.answer_initialize = True
+        # thread id -> owning client id, for threads this app is pretending a
+        # window renders. Empty by default, which is why threads read as
+        # unmounted here unless a test says otherwise.
+        self.owners: dict[str, str] = {}
         self._stop = threading.Event()
         self._srv: socket.socket | None = None
         self.bind()
@@ -460,6 +472,25 @@ class FakeApp:
                 return
             for msg in reader.feed(chunk):
                 self.frames.append(msg)
+                if msg.get("method") == "thread-owner-discovery":
+                    owner = self.owners.get(str(msg.get("params", {}).get("conversationId")))
+                    if owner is not None:
+                        with contextlib.suppress(OSError):
+                            conn.sendall(
+                                encode_frame(
+                                    {
+                                        "type": "response",
+                                        "requestId": msg["requestId"],
+                                        "resultType": "success",
+                                        "method": "thread-owner-discovery",
+                                        "handledByClientId": owner,
+                                        "result": {},
+                                    }
+                                )
+                            )
+                    # An unowned thread gets silence, which is what the real
+                    # router does until its own discovery timeout fires.
+                    continue
                 if msg.get("method") == "initialize" and self.answer_initialize:
                     reply = {
                         "type": "response",
@@ -742,7 +773,7 @@ def test_sync_threads_gives_the_screen_back_once_for_the_whole_sweep(app, monkey
 
     monkeypatch.setattr(sess._stop, "wait", lambda seconds: events.append(("settle", "")))
     try:
-        out = sess.sync_threads(settle_seconds=0.0)
+        out = sess.sync_threads(mount=True, settle_seconds=0.0)
 
         assert sorted(out["focused"]) == sorted([TID, second])
         assert len(probes) == 1, f"one instance, one probe -- got {len(probes)}"
@@ -779,6 +810,15 @@ def test_sync_threads_reports_no_focus_when_it_mounts_nothing(app, monkeypatch):
         assert out["skipped"] == []
     finally:
         sess.close()
+
+
+def _seed_rollout(app) -> None:
+    """Give the store a rollout for TID, so `resolve` has something to find."""
+    seed = app.home / "sessions" / "2026" / "08" / "27"
+    seed.mkdir(parents=True, exist_ok=True)
+    (seed / f"rollout-2026-08-27T10-00-00-{TID}.jsonl").write_text(
+        json.dumps({"type": "session_meta", "payload": {"cwd": "/w", "id": TID}}) + "\n"
+    )
 
 
 def test_focus_thread_gives_the_screen_back(app, monkeypatch):
@@ -827,6 +867,266 @@ def test_focus_thread_gives_the_screen_back(app, monkeypatch):
         assert out["focus"] == {"restored": False, "reason": "already_frontmost"}
     finally:
         sess.close()
+
+
+def test_focus_skips_the_link_for_a_thread_the_app_already_shows(app, monkeypatch):
+    """A raise buys nothing when the window is already rendering the thread.
+
+    The deep link is how the app navigates, so firing one at a thread already
+    mounted re-runs `ensurePrimaryWindowVisible` for a screen that needs no
+    changing: the whole cost, none of the effect. Remodex reaches the same
+    conclusion from the other side of the bus, suppressing navigation once
+    Desktop has announced it is following.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "codex_pilot.actions.subprocess.run",
+        lambda argv, **kw: calls.append(argv),
+    )
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: calls.append(argv) or "")
+    monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: "window-7")
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default")
+        assert calls == [], "a mounted thread must cost no subprocess at all"
+        assert out["opened"] is None
+        assert out["owner"] == "window-7"
+        assert out["focus"] == {"restored": False, "reason": "skipped_already_mounted"}
+    finally:
+        sess.close()
+
+
+def test_the_skip_works_through_the_real_probe_not_a_stand_in(app, monkeypatch):
+    """The same skip, with `probe_mounted` left alone and a router answering.
+
+    The other tests patch `probe_mounted` to fix its verdict, which pins what
+    `focus_thread` does with an answer but never drives the wiring that gets
+    one: the timeout reaching `owner_of`, the strike exemption travelling with
+    it, and `handledByClientId` being read off a real frame. An inverted flag
+    or a dropped argument in that chain would pass every one of them.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    app.owners[TID] = "window-from-the-wire"
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default")
+        assert out["owner"] == "window-from-the-wire"
+        assert out["opened"] is None
+        assert calls == [], "the app answered for it, so no link should have been fired"
+        assert out["focus"] == {"restored": False, "reason": "skipped_already_mounted"}
+    finally:
+        sess.close()
+
+
+def test_a_bounded_probe_does_not_retire_the_session_connection(app, monkeypatch):
+    """The exemption has to survive the trip through `owner_of`, not just `request`.
+
+    `test_ipc.py` proves `silence_counts=False` at the transport. This proves
+    the flag is still false by the time a real `focus_thread` probe sends it:
+    more consecutive unanswered probes than the strike limit, against a router
+    that never answers owner discovery, leaving the connection usable.
+    """
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: None)
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    monkeypatch.setattr(actions, "FOCUS_PROBE_TIMEOUT_SECONDS", 0.2)
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        client = sess.client(inst)
+        resolved = sess.resolve(TID, "default")
+        for _ in range(3):
+            assert sess.probe_mounted(resolved, actions.FOCUS_PROBE_TIMEOUT_SECONDS) is None
+            assert not client.is_closed
+        app.owners[TID] = "still-talking"
+        assert sess.probe_mounted(resolved, actions.FOCUS_PROBE_TIMEOUT_SECONDS) == "still-talking"
+    finally:
+        sess.close()
+
+
+def test_an_explicit_activate_still_raises_a_mounted_thread(app, monkeypatch):
+    """The skip is about pointless raises, not about refusing a asked-for one.
+
+    `activate=True` is a caller saying it wants the window in front, which is a
+    different request from "make the app answer for this thread" -- and one the
+    mounted state does not already satisfy.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "codex_pilot.actions.subprocess.run",
+        lambda argv, **kw: calls.append(argv),
+    )
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: "window-7")
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default", activate=True)
+        assert [OPEN, "-a", str(STUB_APP), f"codex://threads/{TID}"] in calls
+        assert out["opened"] == f"codex://threads/{TID}"
+    finally:
+        sess.close()
+
+
+def test_a_thread_that_cannot_be_probed_is_focused_rather_than_assumed_mounted(app, monkeypatch):
+    """`probe_mounted` returns None for "no" and for "could not tell" alike.
+
+    Reading that as mounted would skip the one call that fixes an unreachable
+    thread, and every retry would skip it again for the same non-reason. So the
+    unprobeable case fires the link: the response never claims the thread was
+    unmounted, only that it was surfaced.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "codex_pilot.actions.subprocess.run",
+        lambda argv, **kw: calls.append(argv),
+    )
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: None)
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default")
+        assert [OPEN, "-g", "-a", str(STUB_APP), f"codex://threads/{TID}"] in calls
+        assert out["opened"] == f"codex://threads/{TID}"
+        assert out["owner"] is None
+    finally:
+        sess.close()
+
+
+def test_a_cold_app_gets_longer_to_come_forward_than_a_warm_one(app, monkeypatch):
+    """A launch is slower than a raise, and the wait has to know the difference.
+
+    The guard only restores once it has *seen* Codex come forward. Three seconds
+    covers an app already running; an app starting from closed can take several,
+    and giving up first leaves the interruption standing with nothing to undo it
+    later. So the deadline follows whether anything is serving the socket.
+    """
+    monkeypatch.setattr(
+        "codex_pilot.actions.subprocess.run",
+        lambda argv, **kw: None,
+    )
+    monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: None)
+    # Real deadlines, scaled down: the point is which one is chosen, and waiting
+    # out fifteen actual seconds would prove nothing extra.
+    monkeypatch.setattr(frontmost, "RAISE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(frontmost, "COLD_RAISE_TIMEOUT_SECONDS", 0.2)
+
+    # The user sits in Mail throughout and Codex never comes forward, so the
+    # guard runs its deadline out and reports how long that was.
+    def fake_run(argv):
+        if argv[1:2] == ["front"]:
+            return "ASN:0x0-0x1:"
+        if argv[1:2] == ["info"]:
+            return '[ NULL ]  ASN:0x0-0x1:\n    bundle path="/System/Applications/Mail.app"\n'
+        return ""
+
+    monkeypatch.setattr("codex_pilot.frontmost._run", fake_run)
+
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+
+        monkeypatch.setattr(
+            "codex_pilot.actions.serving_app",
+            lambda paths, *a, **kw: ServingApp(bundle=STUB_APP),
+        )
+        warm = sess.focus_thread(TID, instance="default")
+
+        # Nothing listening: the link will have to launch the app itself.
+        monkeypatch.setattr(
+            "codex_pilot.actions.serving_app",
+            lambda paths, *a, **kw: ServingApp(bundle=None, known=True),
+        )
+        cold = sess.focus_thread(TID, instance="default")
+
+        assert warm["focus"]["waited_seconds"] == frontmost.RAISE_TIMEOUT_SECONDS
+        assert cold["focus"]["waited_seconds"] == frontmost.COLD_RAISE_TIMEOUT_SECONDS
+        assert cold["focus"]["waited_seconds"] > warm["focus"]["waited_seconds"]
+    finally:
+        sess.close()
+
+
+def test_the_kill_switch_fires_no_link_and_says_the_thread_is_not_surfaced(app, monkeypatch):
+    """A user who cannot afford the interruption can turn it off entirely.
+
+    The honest part is the return value. Suppressing the focus does not make
+    the thread reachable -- it stays exactly as undriveable over IPC as it was
+    -- so the response has to say that rather than come back looking like a
+    focus that worked. Reading it as success is how a caller ends up retrying
+    an IPC verb forever against a thread nothing will ever answer for.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: calls.append(argv) or "")
+    monkeypatch.setenv(actions.SUPPRESS_FOCUS_ENV, "1")
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default")
+        assert calls == [], "suppressed means no link and no probing of the screen"
+        assert out["opened"] is None
+        assert out["focus"] == {"restored": False, "reason": "suppressed"}
+        assert out["surfaced"] is False
+    finally:
+        sess.close()
+
+
+def test_suppression_does_not_claim_a_mounted_thread_is_unreachable(app, monkeypatch):
+    """The switch declines to surface threads; it does not make reachable ones unreachable.
+
+    A thread the app is already showing needs no link, so suppression changes
+    nothing about it -- and saying otherwise would be asserting an absence
+    nobody checked, then steering the caller off a working IPC route onto a
+    read-only one.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: "window-7")
+    monkeypatch.setenv(actions.SUPPRESS_FOCUS_ENV, "1")
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default")
+        assert calls == [], "no link either way -- it was already mounted"
+        assert out["owner"] == "window-7"
+        assert out["surfaced"] is True
+        assert out["focus"] == {"restored": False, "reason": "skipped_already_mounted"}
+    finally:
+        sess.close()
+
+
+def test_without_the_kill_switch_nothing_changes(app, monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: None)
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default")
+        assert [OPEN, "-g", "-a", str(STUB_APP), f"codex://threads/{TID}"] in calls
+        assert out["surfaced"] is True
+    finally:
+        sess.close()
+
+
+def test_mounting_is_opt_in_on_every_surface():
+    """The old default focused every unmounted thread it found.
+
+    With no `threads` argument that is all of them, so a question which reads
+    like a read-only one -- what is reachable? -- was answered by taking the
+    user's screen once per thread. Asserted on the signatures rather than on a
+    sweep, because a sweep with nothing to mount passes whatever the default
+    is, and the default is the whole point.
+    """
+    assert inspect.signature(Session.sync_threads).parameters["mount"].default is False
+    assert inspect.signature(mcp_server.sync_threads).parameters["mount"].default is False
 
 
 def test_health_from_the_instance_that_owns_the_thread_wins(app):
@@ -1142,7 +1442,8 @@ def test_the_link_is_aimed_at_the_app_serving_the_instance_not_its_app_path(monk
     """
     sess = aiming(monkeypatch, ServingApp(bundle=STOCK))
     inst = Instance(slug="default", codex_home=Path("/h"), app_path=CLONE, is_default=True)
-    assert sess.link_target(inst) == STOCK
+    # Serving the socket, so it is already up: the raise will be prompt.
+    assert sess.link_target(inst) == LinkTarget(STOCK, live=True)
 
 
 def test_an_unanswerable_probe_refuses_rather_than_firing_an_unaimed_link(monkeypatch):
@@ -1164,7 +1465,8 @@ def test_a_cold_instance_is_aimed_at_a_bundle_stamped_with_its_home(monkeypatch)
     # CODEX_HOME by construction, so it serves it.
     sess = aiming(monkeypatch, ServingApp(bundle=None))
     inst = Instance(slug="personal", codex_home=Path("/h"), app_path=CLONE, is_default=False)
-    assert sess.link_target(inst) == CLONE
+    # Cold, so the link has to launch it and the window arrives late.
+    assert sess.link_target(inst) == LinkTarget(CLONE, live=False)
 
 
 def test_a_cold_default_prefers_the_stock_bundle_over_a_clone_sharing_its_home(monkeypatch):
@@ -1173,7 +1475,7 @@ def test_a_cold_default_prefers_the_stock_bundle_over_a_clone_sharing_its_home(m
     sess = aiming(monkeypatch, ServingApp(bundle=None))
     monkeypatch.setattr("codex_pilot.actions.stock_app", lambda: STOCK)
     inst = Instance(slug="default", codex_home=Path("/h"), app_path=CLONE, is_default=True)
-    assert sess.link_target(inst) == STOCK
+    assert sess.link_target(inst) == LinkTarget(STOCK, live=False)
 
 
 def test_a_cold_instance_with_no_bundle_at_all_refuses(monkeypatch):
@@ -1267,7 +1569,7 @@ def test_sync_threads_skips_a_thread_it_cannot_resolve_and_mounts_the_rest(app, 
             )
 
     try:
-        out = sess.sync_threads(settle_seconds=0.0)
+        out = sess.sync_threads(mount=True, settle_seconds=0.0)
 
         assert sorted(out["focused"]) == sorted([TID, second])
         assert phantom not in out["focused"]
