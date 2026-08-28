@@ -284,11 +284,22 @@ class IpcClient:
         params: dict[str, Any],
         target_client_id: str | None = None,
         timeout: float | None = None,
+        silence_counts: bool = True,
     ) -> dict[str, Any]:
+        """Send a request and wait for its answer.
+
+        `silence_counts=False` is for a caller whose timeout is deliberately
+        shorter than the answer it is asking for -- a bounded mountedness probe,
+        where no reply inside a second is the useful signal rather than a fault.
+        Such silence is arranged, so it says nothing about the connection and
+        must not count toward retiring it. Everything else is unchanged, and the
+        default keeps the ordinary meaning: silence on a request that should
+        have been answered is evidence the socket has stopped talking.
+        """
         if self.client_id is None:
             raise IpcError("call initialize() before sending requests")
         env = build_request(method, params, target_client_id=target_client_id)
-        resp = self._exchange(env, timeout or self._timeout)
+        resp = self._exchange(env, timeout or self._timeout, silence_counts=silence_counts)
         if resp.get("resultType") == "error":
             raise RouterError(str(resp.get("error")), method)
         return resp
@@ -331,7 +342,9 @@ class IpcClient:
         self.close()
         return True
 
-    def _exchange(self, envelope: dict[str, Any], timeout: float) -> dict[str, Any]:
+    def _exchange(
+        self, envelope: dict[str, Any], timeout: float, silence_counts: bool = True
+    ) -> dict[str, Any]:
         rid = str(envelope["requestId"])
         waiter: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
         with self._lock:
@@ -342,7 +355,7 @@ class IpcClient:
             try:
                 resp = waiter.get(timeout=timeout)
             except queue.Empty:
-                retired = self._record_silent_timeout(sent_at)
+                retired = self._record_silent_timeout(sent_at) if silence_counts else False
                 detail = (
                     " -- no frames arrived on this connection either, so it has been "
                     "retired; the next call re-handshakes"

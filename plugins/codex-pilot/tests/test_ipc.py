@@ -251,6 +251,69 @@ def test_one_silent_timeout_is_not_enough(wired):
     assert not client.is_closed
 
 
+def test_a_deliberately_short_probe_never_retires_the_connection(wired):
+    """Silence that we engineered is evidence about the request, not the socket.
+
+    The strike counter exists to notice a connection that has stopped talking.
+    A probe whose deadline is set to expire *before* the router's own ~10s
+    discovery answer has arranged its own silence, so counting it would retire
+    a healthy connection for doing exactly what it was asked to do. Three in a
+    row, well past STALE_STRIKE_LIMIT, must still leave the client open.
+    """
+    client, router = wired
+    client.initialize()
+    router.responder = lambda msg: None
+
+    for _ in range(3):
+        with pytest.raises(IpcTimeout):
+            client.request(
+                "thread-owner-discovery",
+                {"conversationId": "c1"},
+                timeout=0.3,
+                silence_counts=False,
+            )
+
+    assert not client.is_closed
+
+
+def test_the_late_answer_to_an_abandoned_probe_is_harmless(wired):
+    """The router still answers a probe we stopped waiting for, ~10s later.
+
+    By then nothing is pending under that id. The frame must be dropped without
+    disturbing anything -- and because any frame at all counts as liveness, it
+    should leave the connection healthier than it found it, not worse.
+    """
+    client, router = wired
+    client.initialize()
+    held: list[dict[str, Any]] = []
+    router.responder = lambda msg: held.append(msg) or None
+
+    with pytest.raises(IpcTimeout):
+        client.request(
+            "thread-owner-discovery",
+            {"conversationId": "c1"},
+            timeout=0.3,
+            silence_counts=False,
+        )
+
+    # The answer the router owed us, arriving after we gave up on it.
+    router.send(
+        {
+            "type": "response",
+            "requestId": held[-1]["requestId"],
+            "resultType": "error",
+            "error": "no-client-found",
+        }
+    )
+    time.sleep(0.1)
+    assert not client.is_closed
+
+    router.responder = router._default_responder
+    assert client.request("thread-owner-discovery", {"conversationId": "c2"})["resultType"] == (
+        "success"
+    ), "the connection must still be usable after an abandoned probe"
+
+
 def test_a_frame_arriving_mid_wait_suppresses_the_strike(wired):
     """Traffic proves the socket is alive even when this request goes unanswered."""
     client, router = wired
