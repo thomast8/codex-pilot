@@ -14,14 +14,16 @@ stop discards what a turn had in flight; an approval runs a command. Read
 | Situation | Use |
 | --- | --- |
 | Thread needs network, or wider write access | `edit_thread` (`sandboxPolicy`) |
-| New work, no thread for it yet | `start_thread` (never `codex exec`) |
-| Thread exists and is idle, you have new work | `send_message` |
+| A new parcel of work | `start_thread` (never `codex exec`), even if an idle thread could take it |
+| More of the parcel a thread is already on | `send_message` |
+| A turn is running and you have not looked at it | `read_thread` |
 | Turn is running and heading the wrong way | `steer_turn` |
 | Turn is running and should stop | `stop_turn` |
 | Thread is waiting on an approval or a question | `respond` |
 | Change model, reasoning, plan mode, fast mode, sandbox | `edit_thread` (`update_settings`) |
 | Give it a standing objective across turns | `set_goal` |
-| Context is getting long | `edit_thread` (`compact`) |
+| Reusing one thread across parcels | `edit_thread` (`compact`) between them |
+| A thread's parcel is finished and harvested | archive it — in the app, or `codex archive` |
 | Read what a thread said, any thread | `read_thread` |
 | Find out which threads are reachable | `sync_threads` |
 
@@ -39,7 +41,8 @@ The one deliberate exception is `collect_events(wait_seconds=N)`, which blocks
 because being told is the point, and it is capped at 120 seconds.
 
 So never reach for a blocking route to "just get the answer". Start the work,
-do something else, and collect the result when the thread reports idle.
+do something else, look in on it while it is still running, and collect the
+result when the thread reports idle.
 
 ## Starting new threads
 
@@ -69,6 +72,77 @@ codex-pilot does not create worktrees itself, on purpose: where they belong is a
 per-repo convention, not something this plugin should decide. Codex Desktop does
 create its own, but not for threads started from here — see *Parallel work* below
 for which mechanism applies.
+
+### One thread per parcel of work
+
+**Prefer a new thread for a new parcel, even when an idle one could take it.**
+`send_message` is for continuing what a thread is already doing: a fix to what it
+just built, a question about its own output, the next step of the same slice.
+Work that is not that gets `start_thread`.
+
+The reason is context, and it does not announce itself. A thread carries
+everything it has done, so a fresh task sent to an old one starts out crowded
+with a previous task's files, dead ends and decisions, and it inherits that
+thread's `cwd`, worktree and branch whether or not the new work belongs there.
+A new thread starts clean, in the directory the work actually belongs to, and
+runs alongside the old one instead of queueing behind it.
+
+**When you do keep one thread across parcels, compact between them:**
+
+    edit_thread(thread, "compact")
+
+Do it at a seam: the thread idle, one parcel finished, the next not yet sent.
+Compact goes over IPC, so the app has to own the thread and be showing it, and a
+detached run cannot be compacted at all until the app has it (`focus_thread`
+once it is idle). Nothing here reports how full a thread's context is, so this
+has to be a habit tied to the shape of the work rather than a reaction to a
+gauge that does not exist.
+
+### Archive a thread when its parcel is done
+
+A thread per parcel means threads accumulate, and they are not free while they
+sit there. The app holds a writer lock on **every** thread it has open and
+mounts only a few of them, so each finished thread left open is one more
+lock-holder that neither route can drive until something surfaces it — the pile
+that makes `sync_threads` expensive and every `focus_thread` a flash. Archiving
+takes a thread out of that set and releases its lock.
+
+Nothing is lost by it. The rollout moves to `archived_sessions/`, `read_thread`
+reads it there exactly as before, and the thread's `route` becomes `detached`
+because nothing holds it any more. It is not one-way either: `send_message`
+unarchives on the way through and reports `unarchived: true`, resuming the
+thread detached. So archive after you have harvested, not instead of harvesting.
+
+**There are two different "archived" states and only one of them is ours.**
+`archived` on `thread_status` means the rollout sits under `archived_sessions/`.
+The app has its own notion, at the level of what it calls a *task*, and it is
+not visible from here: a thread can be archived in Codex Desktop while its
+rollout is still under `sessions/` with the app holding its writer lock, which
+reads as a perfectly ordinary `route: desktop` thread. Observed 2026-08-28.
+Focusing one of those does not show the conversation — the window lands on
+Codex's "This task is archived / Unarchive and open" wall, and the thread still
+answers owner discovery as mounted while showing it. So a focus that seems to do
+nothing useful may have worked exactly as asked; look at the app before assuming
+the tooling failed.
+
+**codex-pilot has no archive verb; there are two routes and the lock decides
+which.**
+
+- **The app holds it** → archive it in Codex Desktop. The app releases the
+  thread as it archives, which is why this works while the CLI route does not.
+- **Nothing holds it** (a `start_thread` run that has exited, route `detached`)
+  → the instance's own binary:
+
+      CODEX_HOME=<that instance's home> "<App>.app/Contents/Resources/codex" archive <thread-id>
+
+  Bind both halves to one instance, as with every other shell-out here. Against
+  a thread the app has open it fails with `failed to archive session`, which is
+  the lock talking.
+
+Archive threads *you* started, once their work is harvested and their branch is
+committed and pushed — archiving does not preserve a worktree, and Codex clears
+its own worktree root without warning. Never archive a thread the user has open
+in front of them: that is their window, not your housekeeping.
 
 ### After it finishes
 
@@ -105,8 +179,13 @@ Codex allows one writer per thread, and `send_message` picks accordingly:
 - **App holds it but is not *showing* it** → neither route works. The app locks
   every thread it has open but only answers for the one a window is rendering,
   so this is common. `UnclaimedThreadError` says so; call `focus_thread`, wait a
-  couple of seconds, and retry. If focusing does not help, then suspect protocol
-  drift after an app update and run `scripts/extract_registry.py --check`.
+  couple of seconds, and retry. If focusing does not help and more than one
+  Codex bundle is installed, suspect the deep link went to the wrong app before
+  you suspect anything else — every bundle claims the `codex://` scheme and
+  macOS picks one handler, so the link can land in an app whose `CODEX_HOME`
+  has never heard of that thread, and nothing reports it. Only then suspect
+  protocol drift after an app update, and run `scripts/extract_registry.py
+  --check`.
 
 - **The lock state could not be established** (`route: unknown`, or
   `lock_known: false`) → the holder could not be classified, or `lsof` could not
@@ -129,6 +208,50 @@ writer is a `codex exec` run, that is `route: detached_running`, and it is
 working normally — the turn is being appended to the rollout the whole time.
 Do not press Retry to force it. Read `log_path` (if the run is ours) or the
 rollout; the app renders the whole turn once the writer exits.
+
+### Focusing takes the screen, and hands it back
+
+`focus_thread` raises Codex Desktop over whatever the user is working in. That
+part is not ours to prevent: the deep link is the app's own navigation route,
+and handling one runs `ensurePrimaryWindowVisible` — restore, show, focus on the
+primary window — *before* it navigates. `-g`, which is what `activate=false`
+does, only stops macOS activating the app on the launch side.
+
+What the plugin does instead is give the screen back. It notes the frontmost app,
+fires the link, waits for a Codex window to actually come forward, and
+reactivates what was displaced; `sync_threads` does it once for the whole sweep
+rather than per thread. The result is on `focus` in both return values:
+`{"restored": true, "app": "..."}`, or `restored: false` with a reason, which is
+the honest half of the feature —
+
+- `already_frontmost` — the user was in Codex to begin with; nothing was taken.
+- `not_raised` — no Codex window came forward within a few seconds, or the user
+  moved on to something else meanwhile. Reactivating on that basis would drag
+  them out of wherever they went, so it does not. Note the third case this
+  covers: a cold or busy app that raises *after* the guard stopped watching,
+  where the interruption still lands and nothing undoes it.
+- `not_confirmed` — the reactivation was issued and the app never came back to
+  the front. Running the command is not the same as winning the foreground, and
+  this says which happened.
+- `frontmost_unknown` / `no_known_bundle` / `activate_failed` — the probe or the
+  reactivation failed outright. The screen is wherever the app left it.
+
+So this turns being yanked away into a flash, which is better and is still an
+interruption. Focus deliberately, and rarely:
+
+- **Never focus just to look.** `read_thread` answers "what is it doing" off
+  disk, for any thread, mounted or not, without touching the app. Focusing is
+  for when you need to *drive* the thread over IPC: steer, respond,
+  `edit_thread`, compact, or a follow that must stream.
+- **Focus once, in a batch, for the threads you actually intend to drive.**
+  Mounting is additive, and `sync_threads` restores the screen once for the
+  whole sweep, so mounting five threads together costs one flash — the same
+  five focused one at a time as you get to them cost five.
+- **`sync_threads(mount=true)` focuses every unmounted thread it finds**, and
+  with no `threads` argument that is all of them. Name the threads you mean.
+- If it is not worth interrupting the user for, it is not worth focusing for.
+  Read the rollout and leave the app where it is. The restore is a mitigation,
+  not a licence.
 
 ## Approvals
 
@@ -176,7 +299,8 @@ means the pending set could not be read at all.
 When it is false, `disk` reports what the rollout still shows.
 `disk.phase: "mid_turn"` is a thread left inside a turn — with a large
 `age_seconds` that is a stalled agent, and the move is `focus_thread` (which
-navigates in the background and does not steal the screen) or a look at the app.
+raises the app's window and hands the screen back after, see below) or a look
+at the app.
 `disk.phase: "idle"` means it finished its last turn, so a null state there is
 much less interesting. `disk: null` means even that was unreadable.
 
@@ -203,7 +327,8 @@ even when it stopped nothing, both for an already-idle thread and for an
 
 `update_settings` applies to the **next** turn, not the running one.
 
-- `model`, `effort` (reasoning), `personality`, `summary`
+- `model`, `effort` (reasoning), `personality`, `summary` — see *Models and
+  reasoning effort* below before naming a value for either
 - `serviceTier` — `priority` is fast mode; also `default`, `flex`, `scale`
 - `collaborationMode` — plan mode. Needs both halves:
   `{"mode": "plan", "settings": {"model": "<model>"}}`. `{"mode": "plan"}` alone
@@ -217,6 +342,83 @@ even when it stopped nothing, both for an already-idle thread and for an
 - `multiAgentMode`, `cwd` — note that multi-agent means *subagents inside the
   thread*, sharing its working directory. It is not a way to get parallel work
   in separate worktrees; see *Parallel work* below.
+
+### Models and reasoning effort
+
+**Never assert from memory which models exist or how high the effort ladder
+goes.** Both come from a server-side catalogue that changes with releases, and
+each model advertises its own ladder, so anything written down here is a
+snapshot and yours may already differ. Saying "that isn't a real level" without
+looking is how a thread ends up parked one rung below what the work needed.
+
+Ask the instance instead. Its own `codex` binary answers, and this is a read:
+
+```sh
+{ printf '%s\n' \
+  '{"id":1,"method":"initialize","params":{"clientInfo":{"name":"probe","title":"probe","version":"0"}}}' \
+  '{"id":2,"method":"model/list","params":{"includeHidden":true}}'; sleep 5; } \
+  | CODEX_HOME=<that instance's home> "<App>.app/Contents/Resources/codex" app-server
+```
+
+Keep stdin open, hence the `sleep`; the server answers and a closed pipe cuts it
+off first. Bind both halves to one instance, as everywhere else here: its own
+bundle rather than the `codex` on PATH, which is usually an older build, *and*
+its `CODEX_HOME`, since the catalogue follows the account that home is signed
+into. Run bare against a second instance you get the default home's answer, with
+no error to tell you. Each entry gives `model`,
+`displayName`, `defaultReasoningEffort`, `supportedReasoningEfforts` (with a
+sentence describing each rung), `serviceTiers` and `hidden`.
+
+What is stable enough to rely on is the shape:
+
+- The ladder runs **low → medium → high → xhigh → max → ultra**, and how far it
+  goes is per model. `ultra` is not a synonym for `max`: it is described as
+  maximum reasoning *with automatic task delegation*, and on this machine only
+  the newest multi-agent models offered it, while several older ones stopped at
+  `xhigh`. (The app's own settings enum also carries `none` and `minimal`, but
+  no model in the catalogue advertised them.)
+- Defaults differ per model, and a thread you did not configure is not
+  necessarily on the default anyway: threads inherit `model`,
+  `model_reasoning_effort` and `service_tier` from the user's
+  `~/.codex/config.toml`. Read `thread_status` to see what a thread is actually
+  on rather than assuming.
+- The picker in the app shows a *subset*, controlled by a setting, so a rung
+  missing from the UI can still be a valid value to send.
+
+`docs/protocol.md` holds a dated reading of the catalogue and the query's full
+output shape. It is there to show what the answer looks like, not to save you
+the call.
+
+Set effort and model to the work, deliberately, rather than leaving whatever was
+inherited: a defect brief or production code is worth `xhigh` or `max`, a
+mechanical edit is not. After setting, read `thread_status` back on the next turn
+to confirm it took; an effort a model does not support has no promised behaviour.
+
+### Changing settings on a thread that is already working
+
+`update_settings` lands on the **next** turn, so there are two ways to move a
+running turn onto a different effort, model or service tier, and steering is not
+one of them: `steer_turn` sends text and nothing else, joining the turn already
+under way with the settings it started on. (The app's own steer signature does
+carry a `serviceTier` argument, decoded from the bundle and never exercised;
+codex-pilot does not send one, so do not plan around it.)
+
+- **Wait for the boundary.** Let `turn_completed` arrive, then
+  `edit_thread(..., "update_settings", {...})`, then `send_message` the next
+  piece of work. Free, and the default.
+- **Cut the turn short.** `stop_turn`, then `update_settings`, then
+  `send_message("continue where you left off: ...")`. The new turn runs under
+  the new settings. This costs whatever the stopped turn had in flight and had
+  not yet written, so it is worth it when a turn is visibly under-powered for
+  what it turned out to be — not as a routine way to fiddle with settings.
+
+Say which one you are doing and why, since the second one throws work away.
+
+Both routes need the app to own the thread, because `update_settings` is an IPC
+verb. On a detached run `stop_turn` works and the settings change that follows
+does not: the thread is then held by nobody and shown by no window. Either
+`focus_thread` it once it is idle and pay the foreground interruption, or accept
+the settings it was started with and choose better at `start_thread` time.
 
 ## Several Codex apps
 
@@ -256,7 +458,10 @@ the event, 3 timed out without it.
 
 Between the two, prefer draining with `wait_seconds=0` whenever you are already
 doing other work, and a background watch whenever you have nothing to do but
-wait.
+wait. On a turn you mean to supervise, make that watch a timed one that wakes
+you partway through (`--timeout`, no `--until`); `--until turn_completed` parks
+you until the end, which is right only for a turn you are content to leave
+unattended.
 
 A follow only streams while the app has the thread **mounted**. If a follow stays
 silent on an app-owned thread, `focus_thread` and retry.
@@ -264,6 +469,48 @@ silent on an app-owned thread, `focus_thread` and retry.
 Runs started by `start_thread` need no follow: they are watched as processes, and
 their exit arrives on the same stream as `turn_completed` (or `run_failed`), so
 one `collect_events` covers both kinds.
+
+## Watch the work, do not just wait for the result
+
+A turn heading the wrong way is cheap to fix in its first minute and expensive in
+its twentieth. So look in on any turn whose direction matters while it is still
+running. Waiting for `turn_completed` and reading the result is what you do with
+a turn you were happy to let run unattended, not the default for everything.
+
+It takes two sources, because neither is enough alone:
+
+- **Events say *when*.** `collect_events` reports turn boundaries and approval
+  requests and carries no content whatsoever, so it can never tell you a turn is
+  going wrong. Silence from it means "still running", not "still on track".
+- **`read_thread` says *what*.** The rollout gains each item as the turn
+  completes it, so a read mid-turn shows the messages and tool calls so far. It
+  reads disk and never goes near the app, which makes it the safe probe: it
+  works on every route, running or not, and cannot disturb the writer. For a run
+  `start_thread` made, `log_path` is the same story as JSONL.
+
+Make it a deliberate check-in, not a poll. On a turn expected to run for minutes,
+read it once it has had time to commit to an approach, then again if it is still
+going, doing other work in between. The anti-polling rules elsewhere here are
+about hammering the app for state; reading the rollout is not that.
+
+If you have nothing else to do meanwhile, background a watch with a `--timeout`
+shorter than the turn and no `--until`: it streams events, then exits 0 on the
+timeout, which wakes you for the look-in instead of parking you until the thread
+is finished.
+
+Then act on what you saw:
+
+- **App-owned thread going wrong** → `steer_turn`. It lands in the running turn,
+  so the correction arrives while the work is still cheap to redo. This is the
+  whole reason to look.
+- **Detached run going wrong** → it cannot be steered. Either `stop_turn` it and
+  start the work again with instructions that rule out what it just did, or let
+  it finish and correct on the next turn. Decide which; do not drift into the
+  second by default.
+- **Wrong from the first instruction rather than drifting** → stop it and rewrite
+  the task. A steer that fights a bad brief loses.
+- **On track** → leave it alone. A steer that only restates the task interrupts a
+  working turn for nothing.
 
 ## Queued follow-ups are not available
 
@@ -392,7 +639,7 @@ Two rules that follow:
 
 ## Orchestrating several threads
 
-The loop is start, follow, wait once, harvest.
+The loop is start, follow, wait once, look in, harvest.
 
 1. **A worktree per slice, then `start_thread` in each** — one you made, not one
    under Codex's worktree root (see *Parallel work* above). Keep the returned
@@ -400,22 +647,32 @@ The loop is start, follow, wait once, harvest.
    in Codex's own worktrees, that is the user's move in the app, and you drive the
    threads it produces.
 2. **`follow_thread` the ones the app has mounted** — `sync_threads` tells you
-   which those are, and mounts the rest if you ask. A follow is a subscription to
-   the app's stream, so it only streams for a thread Codex Desktop is rendering.
+   which those are, and mounts the rest if you ask, at the cost of one flash of
+   the Codex window for the sweep, so name the ones you will actually drive. A
+   follow is a subscription to the app's stream, so it only streams for a thread
+   Codex Desktop is rendering.
    You do *not* need it for `start_thread` runs: those are watched as processes
    and report on their own.
 3. **Wait once, not per thread.** One `collect_events(wait_seconds=60)` covers
    every followed thread and every detached run, across every instance. Pass the
    previous `cursor` so you only see what is new; a non-zero `dropped` means
    re-read state rather than trusting the list.
-4. **`turn_completed` means that thread is free.** For a detached run its `data`
+4. **Look in on the long ones before they finish.** One `read_thread` per
+   thread that has been running a while shows what each is actually doing, off
+   disk, without touching the app or any thread's writer. Steer the app-owned
+   ones that are drifting; on a detached run, stop it and restart the slice with
+   a better brief rather than harvesting a wrong answer later.
+5. **`turn_completed` means that thread is free.** For a detached run its `data`
    carries `route: "detached"` and the exit code; `run_failed` means it exited
    non-zero, so read `log_path` before assuming the work happened — unless its
    `stopped` is true, which means you stopped it yourself.
-5. **Harvest with `read_thread`**, not by re-running the agent. It works
+6. **Harvest with `read_thread`**, not by re-running the agent. It works
    whether or not the app ever mounted the thread. (`rollout` from
    `thread_status`/`list_threads` is the same file if you want it raw, and
    `log_path` is the JSONL for a run started here.)
+7. **Archive what you harvested**, once its branch is pushed. Threads you
+   started otherwise stay in the app's open set, holding locks and crowding the
+   mount problem every later step has to work around.
 
 Do not poll `thread_status` in a loop. Nothing pushes into a Claude Code
 session, so you do have to *call* `collect_events` — but events accumulate while

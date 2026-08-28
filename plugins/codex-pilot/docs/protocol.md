@@ -397,6 +397,21 @@ Consequences, all verified:
   `thread-store conflict: thread <id> already has an active writer` (code -32600).
 - With no lock, `codex exec resume` works and continues the thread in place under
   the same session id, restoring full history from disk.
+- **The app's "archived" is not the rollout's.** Verified 2026-08-28: a thread
+  the app showed as "This task is archived" had its rollout under `sessions/`
+  (not `archived_sessions/`), no archived marker in `session_index.jsonl`, and
+  an app-held writer lock — so `list_threads` reported an unremarkable
+  `route: desktop`, and it answered owner discovery as mounted while the window
+  rendered the archive wall rather than the conversation. Nothing in `~/.codex`
+  carries that state (the local sqlite stores are `goals_1`, `logs_2`,
+  `memories_1`, `queue_1`, `state_5`, `thread_history_1`, none with a thread
+  archive flag), so it is account- or app-level state this plugin cannot read.
+  Consequence for callers: `archived` here answers "is the rollout filed away",
+  never "will the app show it".
+- Archiving does not put a thread out of reach: the rollout moves under
+  `archived_sessions/` and the transcript reader finds it there. Verified on
+  2026-08-28 — `read_thread` on an archived id returned its entries with
+  `route: detached`, the lock being gone.
 - Archiving in the app releases the lock and moves the rollout to
   `archived_sessions/`; `codex unarchive <id>` then makes it resumable.
 - `codex mcp-server`'s `codex-reply` cannot resume *any* thread it did not create
@@ -433,6 +448,54 @@ Verified live in one call: `effort` low→high, `collaborationMode` default→**
 - `modelProvider` and `activePermissionProfile` appear in a snapshot's
   `latestThreadSettings` but are **not** accepted as update params.
 
+## The model catalogue and the effort ladder — verified, and it drifts
+
+Neither the model list nor the reasoning-effort ladder is a fixed enum, and both
+move with releases. The app-server schema types `ReasoningEffort` as any non-empty
+string, "advertised by the model"; the real constraint is each model's own
+`supportedReasoningEfforts`, delivered by `model/list`. Anything below is a
+reading, not a specification — re-run the query rather than trusting it.
+
+Ask the instance's own binary (a read; it opens no thread and takes no lock):
+
+```sh
+{ printf '%s\n' \
+  '{"id":1,"method":"initialize","params":{"clientInfo":{"name":"probe","title":"probe","version":"0"}}}' \
+  '{"id":2,"method":"model/list","params":{"includeHidden":true}}'; sleep 5; } \
+  | CODEX_HOME=<that instance's home> "<App>.app/Contents/Resources/codex" app-server
+```
+
+The `sleep` matters: the server answers on an open stdin and a closed pipe cuts
+it off before the response. Bind the bundle and the home to the same instance:
+the catalogue depends on the account the home is signed into, so a bare run
+against a second instance answers for `~/.codex` and says nothing about it.
+
+Run against `/Applications/ChatGPT.app` with `CODEX_HOME=~/.codex` on
+**2026-08-28**, nine models came back:
+
+| model | default effort | efforts | tiers |
+| --- | --- | --- | --- |
+| `gpt-5.6-sol` (isDefault) | low | low…ultra | priority |
+| `gpt-5.6-terra` | medium | low…ultra | priority |
+| `gpt-5.6-luna` | medium | low…max | priority |
+| `gpt-reserve` (hidden) | medium | low…max | priority |
+| `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini` | medium | low…xhigh | priority / none |
+| `gpt-5.3-codex-spark` | high | low…xhigh | none |
+| `codex-auto-review` (hidden) | medium | low…max | priority |
+
+So the full ladder is **low, medium, high, xhigh, max, ultra**, with `ultra`
+("maximum reasoning with automatic task delegation") only on the two
+`multiAgentVersion: v2` models. The desktop settings enum decoded from the
+bundle is wider still — `none, minimal, low, medium, high, xhigh, max, ultra` —
+while its picker shows a configurable subset (`enabledReasoningEfforts`, default
+`low, medium, high, xhigh, ultra`, with `ultra` behind
+`showUltraInModelPickerSlider`). A rung absent from the UI is not absent from
+the protocol.
+
+Note also that a model advertises which service tiers it offers, and that is
+narrower than the settable enum above: every model here advertised `priority`
+(displayed as "Fast", "1.5x speed, increased usage") or nothing at all.
+
 ## Goals and slash commands — verified
 
 `thread/goal/set|clear|get` are app-server methods with no `thread-follower-*`
@@ -467,6 +530,69 @@ remains the second thing to check, not the first.
 
 The same rule governs stream state: a follow on an unrendered thread yields
 nothing at all, not even after `thread-stream-following-status-requested`.
+
+### Surfacing a thread cannot be done quietly — decoded
+
+The deep link raises the window, whatever the caller does. In the bundle, the
+`open-url` handler queues the route and then awaits `ensurePrimaryWindowVisible`
+*before* navigating; that callback resolves to `ensureWindow`, which is
+`e.isMinimized() && e.restore(), e.show(), e.focus()` on the primary window. So
+`open -g codex://threads/<id>` suppresses only the launch-side activation macOS
+would do; the app raises itself a moment later regardless.
+
+That makes focusing an interruption of whoever is at the keyboard, not a
+background operation, and it is why the mounting advice everywhere else is
+"mount the set you mean to drive, once" rather than "focus as you go".
+
+### remodex hits the same wall, and mostly sidesteps it — corroboration
+
+Worth knowing because it is the obvious "how does anyone else do this" question.
+remodex does not avoid the raise; it avoids *needing* it. Its bridge drives its
+own `codex app-server` over stdio, so the writer is remodex, not the desktop
+app, and Codex Desktop is a viewer it pushes live conversation state into over
+this same IPC bus. A viewer never has to answer owner discovery, so nothing has
+to be mounted.
+
+Where it does deep-link, it reports exactly the symptom documented here: its
+refresher carries a `navigationOnly` mode whose comment says the mid-run and
+completion refreshes "would repeatedly deep-link and steal focus", and its
+AppleScript helper follows the `open` with an explicit `activate`, since a
+phone-driven thread appearing on the Mac is the point there. It also probes with
+`lsappinfo` rather than System Events, for the same reason as here: a background
+agent may have no automation permission.
+
+The lesson generalises to the lock, not to focus: whoever holds the writer drives
+without mounting anything. That is our detached route, and the mounting problem
+is confined to threads the app itself holds.
+
+### The link is not bound to an instance — decoded
+
+Worth knowing before trusting a focus on a machine with more than one Codex
+install. Every bundle here declares `codex` in its `CFBundleURLTypes`: the stock
+`/Applications/ChatGPT.app` alongside the two Doppel clones. Only one app can be
+LaunchServices' handler for a scheme, so `open codex://threads/<id>` goes
+wherever that resolves and not necessarily to the instance that owns the thread.
+When it lands in an app whose `CODEX_HOME` has no such thread, nothing happens
+and nothing says so — the thread simply stays unmounted, which reads exactly
+like protocol drift.
+
+The clones do carry a unique scheme each (`DOPPEL_URL_SCHEME` in their
+`LSEnvironment`, e.g. `codex-secondary`, `codex-veridue`, also declared in
+`CFBundleURLTypes`), so a per-instance link is available for them; the stock
+bundle has no unique scheme, and two bundles can share one `CODEX_HOME`, so
+"open it with *this* app" is not simply `open -a <instance.app_path>` — that
+could ask a second app to open a rollout the first one holds. Unresolved on
+purpose; not exercised.
+
+The mitigation for the raise is after the fact, since nothing can decline
+another app's raise: note the frontmost app (`lsappinfo`, which needs no accessibility grant),
+fire the link, wait for a Codex bundle to actually be in front, then `open -a`
+the displaced app. Verified end to end on 2026-08-28 against a live app — user
+in Mail, `focus_thread` on a mounted thread, Codex raised and Mail was back
+1.16s later with the thread still mounted. A restore that cannot be attributed
+is skipped rather than guessed: if no Codex window is seen in front within the
+window, the user may simply have moved on, and reactivating then would be the
+same rudeness in the other direction.
 
 ## The detached route — verified
 
