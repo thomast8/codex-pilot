@@ -28,7 +28,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import frontmost, payloads
 from . import ipc as ipc_module
@@ -83,6 +83,18 @@ CENSUS_WORKERS = 8
 # deliberately not waited for, because by then the link would have been the
 # cheaper way to find out.
 FOCUS_PROBE_TIMEOUT_SECONDS = 1.0
+
+
+class LinkTarget(NamedTuple):
+    """A bundle to aim a deep link at, and whether it is already running.
+
+    The two travel together because the second is only knowable at the moment
+    the first is resolved -- both come out of one `serving_app` probe -- and
+    separating them would mean probing twice or guessing.
+    """
+
+    path: Path
+    live: bool
 
 
 class ActionError(Exception):
@@ -783,6 +795,9 @@ class Session:
         # and a ps sweep, and every thread in a sweep shares its instance's
         # answer.
         targets: dict[str, Path] = {}
+        # One cold app in the sweep sets the pace for the batch: the guard is
+        # per batch, so it has to outlast the slowest window it is waiting on.
+        all_live = True
         # Rows rather than `unmounted`, because an id alone has lost its
         # instance: thread ids are unique within a CODEX_HOME and not across
         # them, so re-resolving bare could bind the wrong app -- or refuse as
@@ -816,7 +831,9 @@ class Session:
             slug = resolved.instance.slug
             if slug not in targets:
                 try:
-                    targets[slug] = self.link_target(resolved.instance)
+                    aimed = self.link_target(resolved.instance)
+                    targets[slug] = aimed.path
+                    all_live = all_live and aimed.live
                 except UnboundLinkError as exc:
                     # Per instance rather than per thread, but skipped the same
                     # way: a sweep can span instances, and one whose app cannot
@@ -837,7 +854,7 @@ class Session:
         # should be put back once at the end rather than fought over per thread.
         # A sweep can span instances, so the guard watches every bundle it is
         # about to raise rather than assuming there is only one.
-        with self.frontmost_guard({target for _, target in pending}) as guard:
+        with self.frontmost_guard({target for _, target in pending}, live=all_live) as guard:
             for resolved, target in pending:
                 self._open_thread_link(resolved, target)
         # Settle *after* the guard, not inside it: the app mounts on its own
@@ -895,7 +912,8 @@ class Session:
         """
         resolved = self.resolve(ref, instance)
         self._refuse_unless_app_holds(resolved)
-        target = self.link_target(resolved.instance)
+        aimed = self.link_target(resolved.instance)
+        target = aimed.path
         owner = None if activate else self.probe_mounted(resolved, FOCUS_PROBE_TIMEOUT_SECONDS)
         if owner is not None:
             # Already rendering it: the link would re-run the app's window
@@ -912,7 +930,7 @@ class Session:
                 "focus": {"restored": False, "reason": "skipped_already_mounted"},
                 "note": "already mounted; the app answers for this thread now",
             }
-        with self.frontmost_guard([target]) as guard:
+        with self.frontmost_guard([target], live=aimed.live) as guard:
             url = self._open_thread_link(resolved, target, activate)
         return {
             "instance": resolved.instance.slug,
@@ -953,8 +971,13 @@ class Session:
                 f"(`ps -o command= -p {holder.pid}`) and retry once `lsof` is usable."
             )
 
-    def link_target(self, instance: Instance) -> Path:
-        """The bundle this instance's deep links must be handed to.
+    def link_target(self, instance: Instance) -> LinkTarget:
+        """The bundle this instance's deep links must be handed to, and its state.
+
+        `live` says whether an app is currently serving the instance's socket.
+        It decides nothing about *where* the link goes -- both branches below
+        return a real bundle -- only how long the caller should expect to wait
+        for the window, since a cold bundle has to start before it can rise.
 
         Aiming the link is not a refinement, it is the difference between the
         link working and doing nothing. `codex://` is claimed by every Codex
@@ -984,7 +1007,7 @@ class Session:
         """
         found = serving_app(instance.socket_candidates())
         if found.bundle is not None:
-            return found.bundle
+            return LinkTarget(found.bundle, live=True)
         if not found.known:
             raise UnboundLinkError(
                 f"could not tell which app is serving instance {instance.slug!r} "
@@ -996,7 +1019,7 @@ class Session:
         cold = stock_app() if instance.is_default else None
         cold = cold or instance.app_path
         if cold is not None:
-            return cold
+            return LinkTarget(cold, live=False)
         raise UnboundLinkError(
             f"no app is listening on instance {instance.slug!r}'s socket "
             f"({instance.codex_home}) and no installed bundle is known to serve it, so "
@@ -1019,7 +1042,9 @@ class Session:
         subprocess.run(argv, check=False, capture_output=True)
         return url
 
-    def frontmost_guard(self, targets: Iterable[Path]) -> frontmost.FrontmostGuard:
+    def frontmost_guard(
+        self, targets: Iterable[Path], live: bool = True
+    ) -> frontmost.FrontmostGuard:
         """Give the user's foreground app back after the app raises itself.
 
         Handling a `codex://` link raises Codex Desktop's window before it
@@ -1033,8 +1058,16 @@ class Session:
         that caused it. Watching every installed Codex bundle instead would
         misread a user sitting in a *different* instance as already being where
         we are sending them, and leave them there.
+
+        A cold target gets the longer deadline: the link is about to launch the
+        app, and a launch reaches the screen well after a raise would have.
         """
-        return frontmost.FrontmostGuard(targets)
+        return frontmost.FrontmostGuard(
+            targets,
+            timeout=(
+                frontmost.RAISE_TIMEOUT_SECONDS if live else frontmost.COLD_RAISE_TIMEOUT_SECONDS
+            ),
+        )
 
     # -- mutating verbs -----------------------------------------------------
 

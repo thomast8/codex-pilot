@@ -21,7 +21,14 @@ from pathlib import Path
 
 import pytest
 
-from codex_pilot.actions import ActionError, ResolvedThread, Session, UnboundLinkError
+from codex_pilot import frontmost
+from codex_pilot.actions import (
+    ActionError,
+    LinkTarget,
+    ResolvedThread,
+    Session,
+    UnboundLinkError,
+)
 from codex_pilot.follow import EVENT_RUN_FAILED, EVENT_TURN_COMPLETED
 from codex_pilot.framing import FrameReader, encode_frame
 from codex_pilot.frontmost import OPEN
@@ -916,6 +923,59 @@ def test_a_thread_that_cannot_be_probed_is_focused_rather_than_assumed_mounted(a
         sess.close()
 
 
+def test_a_cold_app_gets_longer_to_come_forward_than_a_warm_one(app, monkeypatch):
+    """A launch is slower than a raise, and the wait has to know the difference.
+
+    The guard only restores once it has *seen* Codex come forward. Three seconds
+    covers an app already running; an app starting from closed can take several,
+    and giving up first leaves the interruption standing with nothing to undo it
+    later. So the deadline follows whether anything is serving the socket.
+    """
+    monkeypatch.setattr(
+        "codex_pilot.actions.subprocess.run",
+        lambda argv, **kw: None,
+    )
+    monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: None)
+    # Real deadlines, scaled down: the point is which one is chosen, and waiting
+    # out fifteen actual seconds would prove nothing extra.
+    monkeypatch.setattr(frontmost, "RAISE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(frontmost, "COLD_RAISE_TIMEOUT_SECONDS", 0.2)
+
+    # The user sits in Mail throughout and Codex never comes forward, so the
+    # guard runs its deadline out and reports how long that was.
+    def fake_run(argv):
+        if argv[1:2] == ["front"]:
+            return "ASN:0x0-0x1:"
+        if argv[1:2] == ["info"]:
+            return '[ NULL ]  ASN:0x0-0x1:\n    bundle path="/System/Applications/Mail.app"\n'
+        return ""
+
+    monkeypatch.setattr("codex_pilot.frontmost._run", fake_run)
+
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+
+        monkeypatch.setattr(
+            "codex_pilot.actions.serving_app",
+            lambda paths, *a, **kw: ServingApp(bundle=STUB_APP),
+        )
+        warm = sess.focus_thread(TID, instance="default")
+
+        # Nothing listening: the link will have to launch the app itself.
+        monkeypatch.setattr(
+            "codex_pilot.actions.serving_app",
+            lambda paths, *a, **kw: ServingApp(bundle=None, known=True),
+        )
+        cold = sess.focus_thread(TID, instance="default")
+
+        assert warm["focus"]["waited_seconds"] == frontmost.RAISE_TIMEOUT_SECONDS
+        assert cold["focus"]["waited_seconds"] == frontmost.COLD_RAISE_TIMEOUT_SECONDS
+        assert cold["focus"]["waited_seconds"] > warm["focus"]["waited_seconds"]
+    finally:
+        sess.close()
+
+
 def test_health_from_the_instance_that_owns_the_thread_wins(app):
     """Health was merged flat with last-writer-wins across instances.
 
@@ -1229,7 +1289,8 @@ def test_the_link_is_aimed_at_the_app_serving_the_instance_not_its_app_path(monk
     """
     sess = aiming(monkeypatch, ServingApp(bundle=STOCK))
     inst = Instance(slug="default", codex_home=Path("/h"), app_path=CLONE, is_default=True)
-    assert sess.link_target(inst) == STOCK
+    # Serving the socket, so it is already up: the raise will be prompt.
+    assert sess.link_target(inst) == LinkTarget(STOCK, live=True)
 
 
 def test_an_unanswerable_probe_refuses_rather_than_firing_an_unaimed_link(monkeypatch):
@@ -1251,7 +1312,8 @@ def test_a_cold_instance_is_aimed_at_a_bundle_stamped_with_its_home(monkeypatch)
     # CODEX_HOME by construction, so it serves it.
     sess = aiming(monkeypatch, ServingApp(bundle=None))
     inst = Instance(slug="personal", codex_home=Path("/h"), app_path=CLONE, is_default=False)
-    assert sess.link_target(inst) == CLONE
+    # Cold, so the link has to launch it and the window arrives late.
+    assert sess.link_target(inst) == LinkTarget(CLONE, live=False)
 
 
 def test_a_cold_default_prefers_the_stock_bundle_over_a_clone_sharing_its_home(monkeypatch):
@@ -1260,7 +1322,7 @@ def test_a_cold_default_prefers_the_stock_bundle_over_a_clone_sharing_its_home(m
     sess = aiming(monkeypatch, ServingApp(bundle=None))
     monkeypatch.setattr("codex_pilot.actions.stock_app", lambda: STOCK)
     inst = Instance(slug="default", codex_home=Path("/h"), app_path=CLONE, is_default=True)
-    assert sess.link_target(inst) == STOCK
+    assert sess.link_target(inst) == LinkTarget(STOCK, live=False)
 
 
 def test_a_cold_instance_with_no_bundle_at_all_refuses(monkeypatch):

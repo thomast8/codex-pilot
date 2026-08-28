@@ -139,7 +139,7 @@ def test_does_not_restore_when_the_user_moved_somewhere_else() -> None:
     runner = FakeRunner([MAIL, ZED])
     with guard(runner) as g:
         pass
-    assert g.outcome == {"restored": False, "reason": "not_raised"}
+    assert g.outcome == {"restored": False, "reason": "not_raised", "waited_seconds": 0.5}
     assert runner.activated == []
 
 
@@ -225,8 +225,42 @@ def test_paces_its_polling_and_stops_at_the_deadline() -> None:
     g = FrontmostGuard({CODEX}, run=runner, sleep=sleep, now=now, timeout=0.5, interval=0.1)
     with g:
         pass
-    assert g.outcome == {"restored": False, "reason": "not_raised"}
+    assert g.outcome == {"restored": False, "reason": "not_raised", "waited_seconds": 0.5}
     assert sleeps == [0.1] * 5, "expected one sleep per interval up to the deadline"
+
+
+def test_a_missed_raise_says_how_long_it_actually_waited() -> None:
+    """`not_raised` alone cannot be acted on, because it has two causes.
+
+    Either the user moved somewhere else, or the app was slower than the window
+    we gave it -- and which one it was depends entirely on how long that window
+    was. A cold launch gets a longer one than a warm app, so the number has to
+    travel with the outcome rather than be inferred from a constant the reader
+    would have to guess at.
+    """
+    runner = FakeRunner([MAIL, ZED])
+    sleep, now = fake_clock(limit=200)
+    g = FrontmostGuard({CODEX}, run=runner, sleep=sleep, now=now, timeout=15.0, interval=0.1)
+    with g:
+        pass
+    assert g.outcome == {"restored": False, "reason": "not_raised", "waited_seconds": 15.0}
+
+
+def test_a_longer_deadline_really_does_wait_longer() -> None:
+    """The cold-launch window is only worth having if the raise still lands.
+
+    An app starting from closed can take several seconds to show a window; the
+    3s default gives up before then and the interruption is never undone. With
+    the longer deadline the same late raise is caught and restored.
+    """
+    # Codex arrives on the 40th look -- 4s in, past the warm deadline.
+    fronts: list[Path | None] = [MAIL] * 40 + [CODEX]
+    runner = FakeRunner(fronts)
+    sleep, now = fake_clock(limit=400)
+    g = FrontmostGuard({CODEX}, run=runner, sleep=sleep, now=now, timeout=15.0, interval=0.1)
+    with g:
+        pass
+    assert g.outcome == {"restored": True, "app": str(MAIL)}
 
 
 def test_installed_apps_finds_every_bundle_under_the_search_dirs(tmp_path) -> None:
