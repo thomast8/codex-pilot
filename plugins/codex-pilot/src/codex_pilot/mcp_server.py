@@ -588,7 +588,7 @@ def collect_events(
 )
 def sync_threads(
     threads: list[str] | None = None,
-    mount: bool = True,
+    mount: bool = False,
     instance: str | None = None,
 ) -> dict[str, Any]:
     try:

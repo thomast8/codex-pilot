@@ -84,6 +84,17 @@ CENSUS_WORKERS = 8
 # cheaper way to find out.
 FOCUS_PROBE_TIMEOUT_SECONDS = 1.0
 
+# Set to turn every deep link off. The raise is the app's own behaviour and
+# cannot be declined, so the only complete answer is not to fire the link --
+# which costs the threads it would have surfaced: they stay unreachable over
+# IPC, and the rollout is the tier that still works. Callers are told that
+# rather than handed something that looks like a focus which worked.
+SUPPRESS_FOCUS_ENV = "CODEX_PILOT_SUPPRESS_FOCUS"
+
+
+def focus_suppressed() -> bool:
+    return bool(os.environ.get(SUPPRESS_FOCUS_ENV))
+
 
 class LinkTarget(NamedTuple):
     """A bundle to aim a deep link at, and whether it is already running.
@@ -757,7 +768,7 @@ class Session:
     def sync_threads(
         self,
         threads: list[str] | None = None,
-        mount: bool = True,
+        mount: bool = False,
         instance: str | None = None,
         settle_seconds: float = 6.0,
     ) -> dict[str, Any]:
@@ -786,6 +797,20 @@ class Session:
         mount what this one could not.
         """
         before = self.census(threads, instance)
+        if mount and focus_suppressed():
+            # The census is still the honest half of the answer; what is
+            # withheld is the mounting, and the caller is told which.
+            return {
+                **before,
+                "focused": [],
+                "mounted_by_sync": [],
+                "focus": {"restored": False, "reason": "suppressed"},
+                "skipped": [
+                    self._skip(row, "suppressed", f"{SUPPRESS_FOCUS_ENV} is set")
+                    for row in before["threads"]
+                    if not row["mounted"] and row["route"] == ROUTE_DESKTOP
+                ],
+            }
         if not mount or not before["unmounted"]:
             return {**before, "focused": [], "mounted_by_sync": [], "focus": None, "skipped": []}
 
@@ -913,6 +938,23 @@ class Session:
         resolved = self.resolve(ref, instance)
         self._refuse_unless_app_holds(resolved)
         aimed = self.link_target(resolved.instance)
+        if focus_suppressed():
+            return {
+                "instance": resolved.instance.slug,
+                "app": str(aimed.path),
+                "thread": resolved.thread_id,
+                "name": resolved.name,
+                "owner": None,
+                "opened": None,
+                "activated": False,
+                "surfaced": False,
+                "focus": {"restored": False, "reason": "suppressed"},
+                "note": (
+                    f"{SUPPRESS_FOCUS_ENV} is set, so nothing was surfaced: this thread is "
+                    "still unreachable over IPC. Read it with read_thread, which works off "
+                    "the rollout and needs no window."
+                ),
+            }
         target = aimed.path
         owner = None if activate else self.probe_mounted(resolved, FOCUS_PROBE_TIMEOUT_SECONDS)
         if owner is not None:
@@ -927,6 +969,7 @@ class Session:
                 "owner": owner,
                 "opened": None,
                 "activated": False,
+                "surfaced": True,
                 "focus": {"restored": False, "reason": "skipped_already_mounted"},
                 "note": "already mounted; the app answers for this thread now",
             }
@@ -942,6 +985,7 @@ class Session:
             "owner": None,
             "opened": url,
             "activated": activate,
+            "surfaced": True,
             "focus": guard.outcome,
             "note": "give the app a moment, then retry the call that failed",
         }

@@ -10,6 +10,7 @@ that lets an orchestrator notice a detached run finished.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import shutil
 import socket
@@ -21,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_pilot import frontmost
+from codex_pilot import actions, frontmost, mcp_server
 from codex_pilot.actions import (
     ActionError,
     LinkTarget,
@@ -749,7 +750,7 @@ def test_sync_threads_gives_the_screen_back_once_for_the_whole_sweep(app, monkey
 
     monkeypatch.setattr(sess._stop, "wait", lambda seconds: events.append(("settle", "")))
     try:
-        out = sess.sync_threads(settle_seconds=0.0)
+        out = sess.sync_threads(mount=True, settle_seconds=0.0)
 
         assert sorted(out["focused"]) == sorted([TID, second])
         assert len(probes) == 1, f"one instance, one probe -- got {len(probes)}"
@@ -974,6 +975,60 @@ def test_a_cold_app_gets_longer_to_come_forward_than_a_warm_one(app, monkeypatch
         assert cold["focus"]["waited_seconds"] > warm["focus"]["waited_seconds"]
     finally:
         sess.close()
+
+
+def test_the_kill_switch_fires_no_link_and_says_the_thread_is_not_surfaced(app, monkeypatch):
+    """A user who cannot afford the interruption can turn it off entirely.
+
+    The honest part is the return value. Suppressing the focus does not make
+    the thread reachable -- it stays exactly as undriveable over IPC as it was
+    -- so the response has to say that rather than come back looking like a
+    focus that worked. Reading it as success is how a caller ends up retrying
+    an IPC verb forever against a thread nothing will ever answer for.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: calls.append(argv) or "")
+    monkeypatch.setenv(actions.SUPPRESS_FOCUS_ENV, "1")
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default")
+        assert calls == [], "suppressed means no link and no probing of the screen"
+        assert out["opened"] is None
+        assert out["focus"] == {"restored": False, "reason": "suppressed"}
+        assert out["surfaced"] is False
+    finally:
+        sess.close()
+
+
+def test_without_the_kill_switch_nothing_changes(app, monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: None)
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default")
+        assert [OPEN, "-g", "-a", str(STUB_APP), f"codex://threads/{TID}"] in calls
+        assert out["surfaced"] is True
+    finally:
+        sess.close()
+
+
+def test_mounting_is_opt_in_on_every_surface():
+    """The old default focused every unmounted thread it found.
+
+    With no `threads` argument that is all of them, so a question which reads
+    like a read-only one -- what is reachable? -- was answered by taking the
+    user's screen once per thread. Asserted on the signatures rather than on a
+    sweep, because a sweep with nothing to mount passes whatever the default
+    is, and the default is the whole point.
+    """
+    assert inspect.signature(Session.sync_threads).parameters["mount"].default is False
+    assert inspect.signature(mcp_server.sync_threads).parameters["mount"].default is False
 
 
 def test_health_from_the_instance_that_owns_the_thread_wins(app):
@@ -1416,7 +1471,7 @@ def test_sync_threads_skips_a_thread_it_cannot_resolve_and_mounts_the_rest(app, 
             )
 
     try:
-        out = sess.sync_threads(settle_seconds=0.0)
+        out = sess.sync_threads(mount=True, settle_seconds=0.0)
 
         assert sorted(out["focused"]) == sorted([TID, second])
         assert phantom not in out["focused"]
