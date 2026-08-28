@@ -113,17 +113,22 @@ because nothing holds it any more. It is not one-way either: `send_message`
 unarchives on the way through and reports `unarchived: true`, resuming the
 thread detached. So archive after you have harvested, not instead of harvesting.
 
-**There are two different "archived" states and only one of them is ours.**
-`archived` on `thread_status` means the rollout sits under `archived_sessions/`.
-The app has its own notion, at the level of what it calls a *task*, and it is
-not visible from here: a thread can be archived in Codex Desktop while its
-rollout is still under `sessions/` with the app holding its writer lock, which
-reads as a perfectly ordinary `route: desktop` thread. Observed 2026-08-28.
-Focusing one of those does not show the conversation — the window lands on
-Codex's "This task is archived / Unarchive and open" wall, and the thread still
-answers owner discovery as mounted while showing it. So a focus that seems to do
-nothing useful may have worked exactly as asked; look at the app before assuming
-the tooling failed.
+**"This task is archived" on screen is not evidence that it is.** That wall is
+gated by the window's own navigation state, not by the thread: decoded from the
+bundle, an `archivedConversationPreview` flag on the route renders it, and the
+app has an explicit handler that clears the flag — so it can outlive the
+navigation that set it and greet a perfectly live thread. Measured 2026-08-28 on
+a thread showing that screen: its rollout was under `sessions/`, the app's own
+live listing for its cwd contained it, and all 390 archived rows did not. It
+also kept answering owner discovery as mounted the whole time. So do not read
+that screen as a fact about the thread, and do not read a focus that lands on it
+as a failed focus. Clicking any other chat clears it.
+
+Archived-ness itself is a single state seen from two sides, and they agree: a
+thread the app lists as archived has its rollout under `archived_sessions/`,
+which is exactly what `archived` on `thread_status` reports. If you want the
+app's own list rather than the disk's, the app-server answers it over the same
+probe used for the model catalogue: `thread/list` with `{"archived": true}`.
 
 **codex-pilot has no archive verb; there are two routes and the lock decides
 which.**

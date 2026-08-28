@@ -397,17 +397,23 @@ Consequences, all verified:
   `thread-store conflict: thread <id> already has an active writer` (code -32600).
 - With no lock, `codex exec resume` works and continues the thread in place under
   the same session id, restoring full history from disk.
-- **The app's "archived" is not the rollout's.** Verified 2026-08-28: a thread
-  the app showed as "This task is archived" had its rollout under `sessions/`
-  (not `archived_sessions/`), no archived marker in `session_index.jsonl`, and
-  an app-held writer lock — so `list_threads` reported an unremarkable
-  `route: desktop`, and it answered owner discovery as mounted while the window
-  rendered the archive wall rather than the conversation. Nothing in `~/.codex`
-  carries that state (the local sqlite stores are `goals_1`, `logs_2`,
-  `memories_1`, `queue_1`, `state_5`, `thread_history_1`, none with a thread
-  archive flag), so it is account- or app-level state this plugin cannot read.
-  Consequence for callers: `archived` here answers "is the rollout filed away",
-  never "will the app show it".
+- **The archived screen is a property of the window, not of the thread.**
+  Verified 2026-08-28, and worth stating because the obvious reading is wrong.
+  A thread the app was rendering as "This task is archived / Unarchive and open"
+  had its rollout under `sessions/`, no marker in `session_index.jsonl`, an
+  app-held writer lock and a plain `route: desktop`, and it answered owner
+  discovery as mounted throughout. Asked over the app-server,
+  `thread/list {"archived": true}` returned 390 threads across four pages and
+  that thread was in none of them, while `thread/list` filtered to its own `cwd`
+  returned it as live. Decoded, the screen is gated by an
+  `archivedConversationPreview` flag carried in the renderer's navigation state,
+  with an explicit handler that writes it back to false -- so it can persist
+  across a navigation and be shown over a thread that is not archived at all.
+- **The two views of archived-ness do agree.** `thread/list {"archived": true}`
+  and the rollout's location are one state seen from two sides: sampling three
+  ids from that list, each had its rollout under `archived_sessions/` and none
+  under `sessions/`. So `archived` on `thread_status` is a faithful answer; the
+  screen simply was not asking the same question.
 - Archiving does not put a thread out of reach: the rollout moves under
   `archived_sessions/` and the transcript reader finds it there. Verified on
   2026-08-28 — `read_thread` on an archived id returned its entries with
