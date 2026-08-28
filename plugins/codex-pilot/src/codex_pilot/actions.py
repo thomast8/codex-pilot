@@ -731,27 +731,78 @@ class Session:
         Threads being written by one of our own detached runs are skipped: they
         are not the app's to mount, and focusing one would put a second writer
         on the rollout.
+
+        Nothing a single thread does aborts the sweep. A thread can be listed
+        and still be unmountable -- a lock fd is enough for `list_threads` to
+        report it, while `resolve` needs a rollout or an index entry, which the
+        app has not necessarily written yet -- the holder can change between the
+        census and the mount, turning a `desktop` row into somebody else's, and
+        an instance whose serving app cannot be named has no link to aim. None
+        of those is a fact about the other threads, so none of them costs those
+        threads: each comes back in `skipped` with a reason rather than being
+        raised over the ones that would have mounted, or dropped as if it had
+        never been listed. Several are transient, and the next sweep may well
+        mount what this one could not.
         """
         before = self.census(threads, instance)
         if not mount or not before["unmounted"]:
-            return {**before, "focused": [], "mounted_by_sync": [], "focus": None}
+            return {**before, "focused": [], "mounted_by_sync": [], "focus": None, "skipped": []}
 
-        pending = []
+        pending: list[tuple[ResolvedThread, Path]] = []
+        skipped: list[dict[str, Any]] = []
         # One probe per instance, not per thread: aiming a link costs an lsof
         # and a ps sweep, and every thread in a sweep shares its instance's
         # answer.
         targets: dict[str, Path] = {}
-        for thread_id in before["unmounted"]:
-            resolved = self.resolve(thread_id)
-            if self.live_run(resolved.thread_id) is not None:
+        # Rows rather than `unmounted`, because an id alone has lost its
+        # instance: thread ids are unique within a CODEX_HOME and not across
+        # them, so re-resolving bare could bind the wrong app -- or refuse as
+        # ambiguous -- for an id two instances happen to share.
+        for row in before["threads"]:
+            if row["mounted"] or row["route"] != ROUTE_DESKTOP:
                 continue
-            self._refuse_unless_app_holds(resolved)
+            try:
+                resolved = self.resolve(row["thread"], row["instance"])
+            except ThreadError as exc:
+                skipped.append(self._skip(row, "unresolvable", str(exc)))
+                continue
+            if self.live_run(resolved.thread_id) is not None:
+                # `route_for` consults the run map first, so this only catches a
+                # run of ours that took the lock since the census -- which is
+                # exactly when it matters.
+                skipped.append(
+                    self._skip(
+                        row,
+                        ROUTE_RUNNING,
+                        "one of our own detached runs took the writer lock since the census; "
+                        "it is not the app's to mount until that run exits",
+                    )
+                )
+                continue
+            try:
+                self._refuse_unless_app_holds(resolved)
+            except ActionError as exc:
+                skipped.append(self._skip(row, "refused", str(exc)))
+                continue
             slug = resolved.instance.slug
             if slug not in targets:
-                targets[slug] = self.link_target(resolved.instance)
+                try:
+                    targets[slug] = self.link_target(resolved.instance)
+                except UnboundLinkError as exc:
+                    # Per instance rather than per thread, but skipped the same
+                    # way: a sweep can span instances, and one whose app cannot
+                    # be named is no reason to leave the others unmounted.
+                    skipped.append(self._skip(row, "unaimable", str(exc)))
+                    continue
             pending.append((resolved, targets[slug]))
         if not pending:
-            return {**before, "focused": [], "mounted_by_sync": [], "focus": None}
+            return {
+                **before,
+                "focused": [],
+                "mounted_by_sync": [],
+                "focus": None,
+                "skipped": skipped,
+            }
 
         # One guard around the sweep: each link raises the app, and the user
         # should be put back once at the end rather than fought over per thread.
@@ -772,6 +823,22 @@ class Session:
             "focused": focused,
             "mounted_by_sync": gained,
             "focus": guard.outcome,
+            "skipped": skipped,
+        }
+
+    @staticmethod
+    def _skip(row: dict[str, Any], reason: str, detail: str) -> dict[str, Any]:
+        """One thread the sweep passed over, said in full.
+
+        Both halves matter: the tag is what a caller can branch on, and the
+        message is the only place the particular reason survives -- a skip
+        reported without it is barely better than the silent drop.
+        """
+        return {
+            "instance": row["instance"],
+            "thread": row["thread"],
+            "reason": reason,
+            "detail": detail,
         }
 
     def focus_thread(

@@ -268,8 +268,15 @@ interruption. Focus deliberately, and rarely:
   Mounting is additive, and `sync_threads` restores the screen once for the
   whole sweep, so mounting five threads together costs one flash — the same
   five focused one at a time as you get to them cost five.
-- **`sync_threads(mount=true)` focuses every unmounted thread it finds**, and
+- **`sync_threads(mount=true)` focuses every unmounted thread it can**, and
   with no `threads` argument that is all of them. Name the threads you mean.
+  The ones it could not mount come back in `skipped` with a reason rather than
+  failing the sweep: `unresolvable` (listed off a writer lock, but with nothing
+  on disk to bind it to yet — often a thread the app has only just made, and
+  worth retrying), `detached_running` (one of our own runs holds it),
+  `refused` (someone else's writer does) and `unaimable` (its instance's
+  serving app could not be named, so there is no link to aim). Nothing in
+  `skipped` was mounted.
 - If it is not worth interrupting the user for, it is not worth focusing for.
   Read the rollout and leave the app where it is. The restore is a mitigation,
   not a licence.
@@ -645,7 +652,8 @@ what it already did is the mistake it exists to prevent.
 **Mounting is a set, not a spotlight.** The app keeps a bounded set of threads
 mounted and answers only for those; a thread it holds without rendering sends no
 stream state at all, so a follow on one is silently empty. `sync_threads` tells
-you which are mounted, and with `mount=true` brings the rest forward.
+you which are mounted, and with `mount=true` brings forward every one of the
+rest it can — check `skipped` for the ones it could not, and why.
 
 **Do not cycle through threads to "check" them.** Mounting is additive —
 bringing one forward evicts none of the others — so `sync_threads` is a one-off
