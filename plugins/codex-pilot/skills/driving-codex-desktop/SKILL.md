@@ -184,13 +184,12 @@ Codex allows one writer per thread, and `send_message` picks accordingly:
 - **App holds it but is not *showing* it** → neither route works. The app locks
   every thread it has open but only answers for the one a window is rendering,
   so this is common. `UnclaimedThreadError` says so; call `focus_thread`, wait a
-  couple of seconds, and retry. If focusing does not help and more than one
-  Codex bundle is installed, suspect the deep link went to the wrong app before
-  you suspect anything else — every bundle claims the `codex://` scheme and
-  macOS picks one handler, so the link can land in an app whose `CODEX_HOME`
-  has never heard of that thread, and nothing reports it. Only then suspect
-  protocol drift after an app update, and run `scripts/extract_registry.py
-  --check`.
+  couple of seconds, and retry. The link is aimed at the app actually serving
+  that instance, so a focus that does no good is no longer the "wrong app on a
+  multi-install machine" case it used to be. If the window came forward showing
+  "This task is archived", that is the navigation-state wall above and not a
+  failed focus. Only past both is protocol drift after an app update worth
+  suspecting, which `scripts/extract_registry.py --check` answers.
 
 - **The lock state could not be established** (`route: unknown`, or
   `lock_known: false`) → the holder could not be classified, or `lsof` could not
@@ -216,6 +215,14 @@ rollout; the app renders the whole turn once the writer exits.
 
 ### Focusing takes the screen, and hands it back
 
+`focus_thread` reports the bundle it aimed at on `app`. On a machine with more
+than one Codex install that is worth reading: `codex://` is claimed by every
+bundle and macOS picks one handler, so an unaimed link can land in an app whose
+`CODEX_HOME` has never heard of the thread and say nothing about it. If no app
+is serving the instance and none can be named for it, the call refuses instead
+of firing a link that would go somewhere arbitrary — launch that instance's
+Codex Desktop and retry.
+
 `focus_thread` raises Codex Desktop over whatever the user is working in. That
 part is not ours to prevent: the deep link is the app's own navigation route,
 and handling one runs `ensurePrimaryWindowVisible` — restore, show, focus on the
@@ -223,9 +230,12 @@ primary window — *before* it navigates. `-g`, which is what `activate=false`
 does, only stops macOS activating the app on the launch side.
 
 What the plugin does instead is give the screen back. It notes the frontmost app,
-fires the link, waits for a Codex window to actually come forward, and
-reactivates what was displaced; `sync_threads` does it once for the whole sweep
-rather than per thread. The result is on `focus` in both return values:
+fires the link, waits for the Codex window it aimed at to actually come forward,
+and reactivates what was displaced; `sync_threads` does it once for the whole
+sweep rather than per thread. Because the link names one bundle, a user sitting
+in a *different* Codex instance counts as displaced and gets put back, rather
+than being read as already where they were being sent. The result is on `focus`
+in both return values:
 `{"restored": true, "app": "..."}`, or `restored: false` with a reason, which is
 the honest half of the feature —
 
@@ -238,7 +248,7 @@ the honest half of the feature —
 - `not_confirmed` — the reactivation was issued and the app never came back to
   the front. Running the command is not the same as winning the foreground, and
   this says which happened.
-- `frontmost_unknown` / `no_known_bundle` / `activate_failed` — the probe or the
+- `frontmost_unknown` / `activate_failed` — the probe or the
   reactivation failed outright. The screen is wherever the app left it.
 
 So this turns being yanked away into a flash, which is better and is still an

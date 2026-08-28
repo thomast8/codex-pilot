@@ -21,10 +21,12 @@ reads as "front unknown" and skips the restore.
 One caveat about the paths it reports: they are not always the path you would
 guess. Safari comes back under `/System/Volumes/Preboot/Cryptexes/App/...`
 rather than `/Applications`, and `open -a` accepts that form back (observed
-2026-08-28). Recognising a *Codex* bundle is a set membership test against the
-globbed install paths, so if macOS ever reported one of those under a different
-normalisation the raise would go unrecognised and nothing would be restored --
-the safe direction, and it has matched on every real run so far.
+2026-08-28). Recognising the raise is a set membership test against the bundles
+the caller says it is about to raise -- the link is aimed with `open -a`, so
+that is exactly one app per instance -- and if macOS ever reported one of those
+under a different normalisation the raise would go unrecognised and nothing
+would be restored: the safe direction, and it has matched on every real run so
+far.
 """
 
 from __future__ import annotations

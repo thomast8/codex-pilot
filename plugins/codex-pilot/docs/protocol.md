@@ -571,24 +571,61 @@ The lesson generalises to the lock, not to focus: whoever holds the writer drive
 without mounting anything. That is our detached route, and the mounting problem
 is confined to threads the app itself holds.
 
-### The link is not bound to an instance — decoded
+### The link is not bound to an instance, so it has to be aimed — verified
 
-Worth knowing before trusting a focus on a machine with more than one Codex
-install. Every bundle here declares `codex` in its `CFBundleURLTypes`: the stock
-`/Applications/ChatGPT.app` alongside the two Doppel clones. Only one app can be
-LaunchServices' handler for a scheme, so `open codex://threads/<id>` goes
-wherever that resolves and not necessarily to the instance that owns the thread.
-When it lands in an app whose `CODEX_HOME` has no such thread, nothing happens
-and nothing says so — the thread simply stays unmounted, which reads exactly
-like protocol drift.
+`codex://` names a thread, not an app. Every bundle here declares the scheme in
+its `CFBundleURLTypes` — the stock `/Applications/ChatGPT.app` alongside both
+Doppel clones — and only one app can be LaunchServices' handler for a scheme, so
+an unaimed `open codex://threads/<id>` goes wherever that resolves rather than to
+the instance that owns the thread. When it lands in an app whose `CODEX_HOME` has
+no such thread, nothing happens and nothing says so: the thread stays unmounted,
+which reads exactly like protocol drift.
 
-The clones do carry a unique scheme each (`DOPPEL_URL_SCHEME` in their
+Measured on 2026-08-28, with both apps running. A thread belonging to the
+`personal` instance (`~/.codex-secondary`), fired unaimed, raised
+`/Applications/ChatGPT.app` — the default instance's app, which has never heard
+of it. The same link as `open -g -a "<...>/ChatGPT Personal.app"` raised
+ChatGPT Personal.app 0.22s later instead. So **`open -a <bundle>` does deliver a
+custom-scheme URL to an app that is not the scheme's handler**, which is the fact
+the fix rests on, and it was worth checking rather than assuming.
+
+The aimed link mounts, not merely raises: a top-level user thread the default
+instance held without rendering (`01a047db`, `thread_source: user`) answered
+owner discovery 1.7s after one aimed `focus_thread`, having been silent before
+it.
+
+The clones do each carry a unique scheme (`DOPPEL_URL_SCHEME` in their
 `LSEnvironment`, e.g. `codex-secondary`, `codex-veridue`, also declared in
-`CFBundleURLTypes`), so a per-instance link is available for them; the stock
-bundle has no unique scheme, and two bundles can share one `CODEX_HOME`, so
-"open it with *this* app" is not simply `open -a <instance.app_path>` — that
-could ask a second app to open a rollout the first one holds. Unresolved on
-purpose; not exercised.
+`CFBundleURLTypes`), so a per-instance *link* exists for them — but not for the
+stock bundle, so it cannot be the general answer. Naming the bundle covers every
+instance uniformly.
+
+**Which bundle is the app listening on the instance's socket, not
+`Instance.app_path`.** `app_path` is whichever bundle stamped that `CODEX_HOME`,
+and two bundles can stamp one: here `ChatGPT Veridue.app` stamps `~/.codex` while
+`/Applications/ChatGPT.app` is the app actually serving it, so `open -a
+<app_path>` would ask a second app to open a rollout the first one holds — the
+two-writer direction. The socket listener cannot be wrong about that, and it is
+the same probe that already separates the app's writer from a `codex exec` one:
+lsof over the socket path reports the listener alone, and its executable path
+carries the bundle. A clone renames its binary
+(`.../ChatGPT Personal.app/Contents/MacOS/ChatGPT.real`), so it is the first
+`.app` path component that identifies it, never the executable name.
+
+When nothing is listening the link still has to name an app — focusing a thread
+nothing holds is allowed, and the link is what launches the app. A cold home has
+no first writer to collide with, so any bundle stamped with that `CODEX_HOME`
+serves it: the *unstamped* bundle for the default home, since a clone may have
+stamped it too, and `app_path` otherwise. Failing that, the call refuses. There
+is no unaimed link worth firing, and a probe that could not run is reported as
+such rather than as "no app".
+
+Narrowing the link also narrows the raise. The frontmost guard below is told the
+one bundle it is about to raise instead of every Codex bundle installed, which
+matters for a user sitting in a *different* instance: watching all of them read
+that as `already_frontmost` and left them there. Verified 2026-08-28 — a focus on
+a `default` thread while ChatGPT Personal.app was in front raised
+`/Applications/ChatGPT.app` and put Personal.app back.
 
 The mitigation for the raise is after the fact, since nothing can decline
 another app's raise: note the frontmost app (`lsappinfo`, which needs no accessibility grant),

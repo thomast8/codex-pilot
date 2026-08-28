@@ -12,7 +12,7 @@ import socket
 import tempfile
 from pathlib import Path
 
-from codex_pilot.instances import Instance, discover_instances, slug_for
+from codex_pilot.instances import Instance, discover_instances, slug_for, stock_app
 
 
 def make_app(root: Path, name: str, codex_home: str | None) -> Path:
@@ -158,3 +158,37 @@ def test_a_plain_file_at_the_socket_path_is_not_mistaken_for_a_socket(tmp_path):
 def test_socket_path_is_none_when_nothing_exists(tmp_path):
     inst = Instance(slug="personal", codex_home=tmp_path / "gone", app_path=None, is_default=False)
     assert inst.socket_path() is None
+
+
+# -- the bundle that serves the default home ----------------------------------
+
+
+def test_the_stock_bundle_is_the_unstamped_one(tmp_path):
+    """Being unstamped is what identifies it: no CODEX_HOME means the default one."""
+    apps = tmp_path / "Applications"
+    apps.mkdir()
+    make_app(apps, "ChatGPT Personal", "/h/.codex-secondary")
+    stock = make_app(apps, "ChatGPT", None)
+    assert stock_app([apps]) == stock
+
+
+def test_a_clone_stamped_with_the_default_home_is_not_the_stock_bundle(tmp_path):
+    """The case that makes this worth deriving separately.
+
+    A clone may stamp `~/.codex`, and `discover_instances` then records *it* as
+    the default instance's `app_path` -- so a cold default would be launched as
+    the clone. The unstamped bundle is the one the user means.
+    """
+    apps = tmp_path / "Applications"
+    apps.mkdir()
+    clone = make_app(apps, "ChatGPT Veridue", "/h/.codex")
+    stock = make_app(apps, "ChatGPT", None)
+    assert discover_instances([apps], default_home=Path("/h/.codex"))[0].app_path == clone
+    assert stock_app([apps]) == stock
+
+
+def test_no_stock_bundle_is_reported_as_absent(tmp_path):
+    apps = tmp_path / "Applications"
+    apps.mkdir()
+    make_app(apps, "ChatGPT Personal", "/h/.codex-secondary")
+    assert stock_app([apps]) is None

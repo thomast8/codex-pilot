@@ -115,6 +115,24 @@ def installed_apps(search_dirs: list[Path] | None = None) -> list[Path]:
     return out
 
 
+def stock_app(search_dirs: list[Path] | None = None) -> Path | None:
+    """The unstamped ChatGPT bundle, which is the one that serves the default home.
+
+    `discover_instances` drops it on purpose -- it keys by CODEX_HOME and the
+    default home is registered whether or not a bundle is installed -- so the
+    default instance's `app_path` ends up being whichever *clone* stamped
+    `~/.codex`, if any. That is the wrong bundle to name when the app is cold:
+    a machine with only a stock install has no `app_path` at all, and one where
+    a clone shares the default home would launch the clone. Being unstamped is
+    what identifies the stock install, so it is worth deriving separately
+    rather than reading off an instance.
+    """
+    for app in installed_apps(search_dirs):
+        if _codex_home_from_plist(app) is None:
+            return app
+    return None
+
+
 def discover_instances(
     search_dirs: list[Path] | None = None, default_home: Path | None = None
 ) -> list[Instance]:

@@ -21,14 +21,15 @@ from pathlib import Path
 
 import pytest
 
-from codex_pilot.actions import ActionError, ResolvedThread, Session
+from codex_pilot.actions import ActionError, ResolvedThread, Session, UnboundLinkError
 from codex_pilot.follow import EVENT_RUN_FAILED, EVENT_TURN_COMPLETED
 from codex_pilot.framing import FrameReader, encode_frame
 from codex_pilot.frontmost import OPEN
 from codex_pilot.instances import Instance
 from codex_pilot.ipc import IpcError
 from codex_pilot.resume import DetachedError, DetachedRunner
-from codex_pilot.threads import ThreadStore
+from codex_pilot.threads import ServingApp, ThreadStore
+from conftest import STUB_APP
 
 TID = "01a03f10-e3e1-7b30-9dfc-7c659c4d7434"
 STARTED = f'{{"type": "thread.started", "thread_id": "{TID}"}}'
@@ -672,7 +673,7 @@ def test_sync_threads_gives_the_screen_back_once_for_the_whole_sweep(app, monkey
     second = "01a03f10-e3e1-7b30-9dfc-7c659c4d7435"
     events: list[tuple[str, str]] = []
     mail = "/System/Applications/Mail.app"
-    codex = "/Applications/ChatGPT.app"
+    codex = str(STUB_APP)
     fronts = [mail, codex]
 
     monkeypatch.setattr(
@@ -691,7 +692,13 @@ def test_sync_threads_gives_the_screen_back_once_for_the_whole_sweep(app, monkey
         return ""
 
     monkeypatch.setattr("codex_pilot.frontmost._run", fake_run)
-    monkeypatch.setattr("codex_pilot.actions.installed_apps", lambda: [Path(codex)])
+    # Aiming a link costs an lsof and a full ps sweep, and every thread in this
+    # sweep shares one instance -- so it is asked once, not once per thread.
+    probes: list[object] = []
+    monkeypatch.setattr(
+        "codex_pilot.actions.serving_app",
+        lambda paths, *a, **kw: probes.append(paths) or ServingApp(bundle=STUB_APP),
+    )
 
     # Two threads the app holds a lock on: route 'desktop', so they are the
     # app's to mount -- and the fake app never answers owner discovery, so both
@@ -718,6 +725,7 @@ def test_sync_threads_gives_the_screen_back_once_for_the_whole_sweep(app, monkey
         out = sess.sync_threads(settle_seconds=0.0)
 
         assert sorted(out["focused"]) == sorted([TID, second])
+        assert len(probes) == 1, f"one instance, one probe -- got {len(probes)}"
         assert out["focus"] == {"restored": True, "app": mail}
         opens = [e for e in events if e[0] == "open"]
         restores = [e for e in events if e[0] == "restore"]
@@ -759,7 +767,7 @@ def test_focus_thread_gives_the_screen_back(app, monkeypatch):
         lambda argv, **kw: calls.append(argv),
     )
     mail = "/System/Applications/Mail.app"
-    codex = "/Applications/ChatGPT.app"
+    codex = str(STUB_APP)
     fronts = [mail, codex]
 
     def fake_run(argv):
@@ -774,7 +782,6 @@ def test_focus_thread_gives_the_screen_back(app, monkeypatch):
         return ""
 
     monkeypatch.setattr("codex_pilot.frontmost._run", fake_run)
-    monkeypatch.setattr("codex_pilot.actions.installed_apps", lambda: [Path(codex)])
     sess, inst = live_session(app)
     try:
         seed = app.home / "sessions" / "2026" / "08" / "27"
@@ -783,14 +790,15 @@ def test_focus_thread_gives_the_screen_back(app, monkeypatch):
             json.dumps({"type": "session_meta", "payload": {"cwd": "/w", "id": TID}}) + "\n"
         )
         out = sess.focus_thread(TID, instance="default")
-        assert [OPEN, "-g", f"codex://threads/{TID}"] in calls
+        assert [OPEN, "-g", "-a", codex, f"codex://threads/{TID}"] in calls
+        assert out["app"] == codex
         assert out["activated"] is False
         assert out["focus"] == {"restored": True, "app": mail}
         assert calls[-1] == [OPEN, "-a", mail]
 
         fronts[:] = [codex]
         out = sess.focus_thread(TID, instance="default", activate=True)
-        assert [OPEN, f"codex://threads/{TID}"] in calls
+        assert [OPEN, "-a", codex, f"codex://threads/{TID}"] in calls
         # Already in Codex: nothing was taken, so nothing is handed back.
         assert out["focus"] == {"restored": False, "reason": "already_frontmost"}
     finally:
@@ -1086,3 +1094,67 @@ def test_focus_still_works_on_a_thread_nothing_holds(home, tmp_path):
     sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={})
     assert sess.focus_thread(TID)["thread"] == TID
     sess.close()
+
+
+# -- aiming the deep link -----------------------------------------------------
+
+STOCK = Path("/Applications/ChatGPT.app")
+CLONE = Path("/Users/x/Applications/ChatGPT Veridue.app")
+
+
+def aiming(monkeypatch, found: ServingApp) -> Session:
+    monkeypatch.setattr("codex_pilot.actions.serving_app", lambda paths, *a, **kw: found)
+    return Session(instances=[])
+
+
+def test_the_link_is_aimed_at_the_app_serving_the_instance_not_its_app_path(monkeypatch):
+    """The bundle that claimed a CODEX_HOME is not always the one serving it.
+
+    Measured here: `ChatGPT Veridue.app` stamps `~/.codex`, so it is what
+    `discover_instances` records as the default instance's `app_path`, while
+    `/Applications/ChatGPT.app` is the process actually listening on that
+    instance's socket. Aiming at `app_path` would ask a second app to open a
+    rollout the first one already holds -- the two-writer direction.
+    """
+    sess = aiming(monkeypatch, ServingApp(bundle=STOCK))
+    inst = Instance(slug="default", codex_home=Path("/h"), app_path=CLONE, is_default=True)
+    assert sess.link_target(inst) == STOCK
+
+
+def test_an_unanswerable_probe_refuses_rather_than_firing_an_unaimed_link(monkeypatch):
+    """The unaimed link is the bug, so it is not the fallback.
+
+    It would be handed to whichever app LaunchServices resolves `codex://` to,
+    and a wrong one leaves the thread unmounted with nothing said -- which is
+    indistinguishable from protocol drift.
+    """
+    sess = aiming(monkeypatch, ServingApp.unavailable())
+    inst = Instance(slug="personal", codex_home=Path("/h"), app_path=CLONE, is_default=False)
+    with pytest.raises(UnboundLinkError, match="could not tell which app"):
+        sess.link_target(inst)
+
+
+def test_a_cold_instance_is_aimed_at_a_bundle_stamped_with_its_home(monkeypatch):
+    # Nothing is serving the home, so there is no first writer to collide with
+    # and the link is what launches the app. `app_path` is stamped with this
+    # CODEX_HOME by construction, so it serves it.
+    sess = aiming(monkeypatch, ServingApp(bundle=None))
+    inst = Instance(slug="personal", codex_home=Path("/h"), app_path=CLONE, is_default=False)
+    assert sess.link_target(inst) == CLONE
+
+
+def test_a_cold_default_prefers_the_stock_bundle_over_a_clone_sharing_its_home(monkeypatch):
+    # Both serve `~/.codex`, but the clone is only there because it stamped the
+    # default home; the stock app is the one the user means by "default".
+    sess = aiming(monkeypatch, ServingApp(bundle=None))
+    monkeypatch.setattr("codex_pilot.actions.stock_app", lambda: STOCK)
+    inst = Instance(slug="default", codex_home=Path("/h"), app_path=CLONE, is_default=True)
+    assert sess.link_target(inst) == STOCK
+
+
+def test_a_cold_instance_with_no_bundle_at_all_refuses(monkeypatch):
+    sess = aiming(monkeypatch, ServingApp(bundle=None))
+    monkeypatch.setattr("codex_pilot.actions.stock_app", lambda: None)
+    inst = Instance(slug="default", codex_home=Path("/h"), app_path=None, is_default=True)
+    with pytest.raises(UnboundLinkError, match="no app is listening"):
+        sess.link_target(inst)

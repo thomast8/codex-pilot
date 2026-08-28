@@ -25,6 +25,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,7 @@ from typing import Any
 from . import frontmost, payloads
 from . import ipc as ipc_module
 from .follow import EVENT_RUN_FAILED, EVENT_TURN_COMPLETED, FollowManager, SeqCounter
-from .instances import Instance, discover_instances, installed_apps
+from .instances import Instance, discover_instances, stock_app
 from .ipc import IpcClient, IpcError, IpcUnavailable, RouterError
 from .resume import DetachedRun, DetachedRunner, scan_for_thread_id
 from .threads import (
@@ -41,6 +42,7 @@ from .threads import (
     ThreadInfo,
     ThreadStore,
     UnknownThreadError,
+    serving_app,
 )
 
 OWNER_DISCOVERY = "thread-owner-discovery"
@@ -119,6 +121,18 @@ class ForeignWriterError(ActionError):
     hold, and resuming would put a second writer on the rollout. The only thing
     to do is wait for the holder to exit -- or, when it is one of our own runs,
     stop it. `_refuse_if_held_elsewhere` phrases both.
+    """
+
+
+class UnboundLinkError(ActionError):
+    """The deep link cannot be aimed at the instance that owns the thread.
+
+    `codex://` is claimed by every installed Codex bundle and LaunchServices
+    resolves it to exactly one of them, so firing it unaimed hands the link to
+    whichever app that happens to be. When that app's CODEX_HOME has no such
+    thread, nothing happens and nothing says so -- the thread stays unmounted,
+    which reads exactly like protocol drift. Refusing is the only honest
+    alternative: there is no unaimed link worth firing.
     """
 
 
@@ -723,25 +737,34 @@ class Session:
             return {**before, "focused": [], "mounted_by_sync": [], "focus": None}
 
         pending = []
+        # One probe per instance, not per thread: aiming a link costs an lsof
+        # and a ps sweep, and every thread in a sweep shares its instance's
+        # answer.
+        targets: dict[str, Path] = {}
         for thread_id in before["unmounted"]:
             resolved = self.resolve(thread_id)
             if self.live_run(resolved.thread_id) is not None:
                 continue
             self._refuse_unless_app_holds(resolved)
-            pending.append(resolved)
+            slug = resolved.instance.slug
+            if slug not in targets:
+                targets[slug] = self.link_target(resolved.instance)
+            pending.append((resolved, targets[slug]))
         if not pending:
             return {**before, "focused": [], "mounted_by_sync": [], "focus": None}
 
         # One guard around the sweep: each link raises the app, and the user
         # should be put back once at the end rather than fought over per thread.
-        with self.frontmost_guard() as guard:
-            for resolved in pending:
-                self._open_thread_link(resolved)
+        # A sweep can span instances, so the guard watches every bundle it is
+        # about to raise rather than assuming there is only one.
+        with self.frontmost_guard({target for _, target in pending}) as guard:
+            for resolved, target in pending:
+                self._open_thread_link(resolved, target)
         # Settle *after* the guard, not inside it: the app mounts on its own
         # time, and the user should not spend that time in a window they did
         # not ask for.
         self._stop.wait(settle_seconds)
-        focused = [r.thread_id for r in pending]
+        focused = [r.thread_id for r, _ in pending]
         after = self.census(threads, instance)
         gained = sorted(set(after["mounted"]) - set(before["mounted"]))
         return {
@@ -776,10 +799,12 @@ class Session:
         """
         resolved = self.resolve(ref, instance)
         self._refuse_unless_app_holds(resolved)
-        with self.frontmost_guard() as guard:
-            url = self._open_thread_link(resolved, activate)
+        target = self.link_target(resolved.instance)
+        with self.frontmost_guard([target]) as guard:
+            url = self._open_thread_link(resolved, target, activate)
         return {
             "instance": resolved.instance.slug,
+            "app": str(target),
             "thread": resolved.thread_id,
             "name": resolved.name,
             "opened": url,
@@ -813,15 +838,73 @@ class Session:
                 f"(`ps -o command= -p {holder.pid}`) and retry once `lsof` is usable."
             )
 
-    def _open_thread_link(self, resolved: ResolvedThread, activate: bool = False) -> str:
-        """Fire the deep link and nothing else, so a batch can share one guard."""
+    def link_target(self, instance: Instance) -> Path:
+        """The bundle this instance's deep links must be handed to.
+
+        Aiming the link is not a refinement, it is the difference between the
+        link working and doing nothing. `codex://` is claimed by every Codex
+        bundle installed, LaunchServices resolves it to one of them, and a
+        thread that lives in another instance's CODEX_HOME lands in an app that
+        has never heard of it. `open -a <bundle>` overrides that binding, and
+        that it delivers a `codex://` URL to an app which is *not* the scheme's
+        handler is the fact the whole approach rests on -- measured against two
+        live apps on 2026-08-28, see `docs/protocol.md`.
+
+        Whichever app is *serving the instance's socket* is the target, not
+        `Instance.app_path`: that is whichever stamped bundle claimed the
+        CODEX_HOME, and two bundles can claim one. On this machine it names
+        `ChatGPT Veridue.app` for the default instance while
+        `/Applications/ChatGPT.app` is the app actually serving it -- opening
+        the first would ask a second app for a rollout the first one holds.
+
+        When nothing is listening there is no such app to ask, and the link
+        still has to name one: focusing a thread nothing holds is allowed, and
+        it is the deep link that launches the app in the first place. A cold
+        home has no first writer to collide with, so any bundle *stamped* with
+        that CODEX_HOME serves it safely -- the stock bundle for the default
+        home, since a clone may share it, and `app_path` otherwise.
+
+        Anything short of a bundle raises. There is no fallback worth having:
+        the unaimed link is precisely the bug.
+        """
+        found = serving_app(instance.socket_candidates())
+        if found.bundle is not None:
+            return found.bundle
+        if not found.known:
+            raise UnboundLinkError(
+                f"could not tell which app is serving instance {instance.slug!r} "
+                f"({instance.codex_home}), so the deep link cannot be aimed at it. "
+                "Firing it unaimed would hand the thread to whichever app "
+                "LaunchServices resolves `codex://` to, and a wrong one fails "
+                "silently. Retry once `lsof` and `ps` are usable."
+            )
+        cold = stock_app() if instance.is_default else None
+        cold = cold or instance.app_path
+        if cold is not None:
+            return cold
+        raise UnboundLinkError(
+            f"no app is listening on instance {instance.slug!r}'s socket "
+            f"({instance.codex_home}) and no installed bundle is known to serve it, so "
+            "there is nothing to aim the link at. Launch that instance's Codex Desktop "
+            "and retry."
+        )
+
+    def _open_thread_link(
+        self, resolved: ResolvedThread, target: Path, activate: bool = False
+    ) -> str:
+        """Fire the deep link and nothing else, so a batch can share one guard.
+
+        The target comes in rather than being resolved here so that a sweep can
+        aim every thread of one instance from a single probe, and so that the
+        guard can be told which bundles are about to rise.
+        """
         url = f"codex://threads/{resolved.thread_id}"
-        opener = frontmost.OPEN
-        argv = [opener, url] if activate else [opener, "-g", url]
+        background = [] if activate else ["-g"]
+        argv = [frontmost.OPEN, *background, "-a", str(target), url]
         subprocess.run(argv, check=False, capture_output=True)
         return url
 
-    def frontmost_guard(self) -> frontmost.FrontmostGuard:
+    def frontmost_guard(self, targets: Iterable[Path]) -> frontmost.FrontmostGuard:
         """Give the user's foreground app back after the app raises itself.
 
         Handling a `codex://` link raises Codex Desktop's window before it
@@ -829,14 +912,14 @@ class Session:
         keyboard. The guard puts them back. It is deliberately per *batch*:
         mounting five threads should cost one flash, not five.
 
-        It takes no instance, deliberately. `codex://` is claimed by every
-        installed Codex bundle and LaunchServices picks the handler, so which
-        window actually rises is not ours to predict; narrowing to the
-        instance's own `app_path` would mean failing to recognise the raise and
-        never restoring. Watching all of them keeps the attribution honest
-        without ever reactivating on the strength of a change we did not cause.
+        It is told exactly which bundles are about to rise, which is only
+        possible because the link is aimed: an `open -a` names the app that
+        will come forward, so the raise can be attributed to the one bundle
+        that caused it. Watching every installed Codex bundle instead would
+        misread a user sitting in a *different* instance as already being where
+        we are sending them, and leave them there.
         """
-        return frontmost.FrontmostGuard(installed_apps())
+        return frontmost.FrontmostGuard(targets)
 
     # -- mutating verbs -----------------------------------------------------
 

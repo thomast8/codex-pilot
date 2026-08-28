@@ -237,6 +237,32 @@ def _subtree(roots: set[int], parents: dict[int, int]) -> set[int]:
     return seen
 
 
+def _socket_listeners(socket_paths: list[Path]) -> set[int] | None:
+    """The pids listening on whichever of these socket paths exist.
+
+    Only the *listener* is reported for a socket pathname -- a connected
+    client's fd is not bound to it, verified with a client attached -- so this
+    is the app serving the instance and never a caller of ours.
+
+    An empty set is an answer: no app is listening, so no app is there. None is
+    not an answer: a path could not be stat'd or lsof could not be run, and
+    nothing follows from that.
+    """
+    live: list[Path] = []
+    for candidate in socket_paths:
+        try:
+            if candidate.is_socket():
+                live.append(candidate)
+        except OSError:
+            return None
+    if not live:
+        return set()
+    out = _run_lsof(live)
+    if out is None:
+        return None
+    return {int(line[1:]) for line in out.splitlines() if line[:1] == "p" and line[1:].isdigit()}
+
+
 def _app_processes(socket_paths: list[Path]) -> set[int] | None:
     """The pids that make up the Codex Desktop instance serving these sockets.
 
@@ -262,25 +288,110 @@ def _app_processes(socket_paths: list[Path]) -> set[int] | None:
     anything holding a lock is another writer. None is not an answer: lsof or
     ps could not be run, and nothing may be concluded from that.
     """
-    live: list[Path] = []
-    for candidate in socket_paths:
-        try:
-            if candidate.is_socket():
-                live.append(candidate)
-        except OSError:
-            return None
-    if not live:
-        return set()
-    out = _run_lsof(live)
-    if out is None:
+    roots = _socket_listeners(socket_paths)
+    if roots is None:
         return None
-    roots = {int(line[1:]) for line in out.splitlines() if line[:1] == "p" and line[1:].isdigit()}
     if not roots:
         return set()
     parents = _process_parents()
     if parents is None:
         return None
     return _subtree(roots, parents)
+
+
+@dataclass(frozen=True)
+class ServingApp:
+    """Which app bundle is answering for one instance, and whether we could tell.
+
+    Three states, because the remedies differ. A `bundle` is the answer. No
+    bundle with `known=True` means nothing is listening on the instance's
+    socket -- the app is not running, and the remedy is to launch it. `known=
+    False` is not a finding about the app at all: lsof or ps could not be run,
+    and the only honest response is to say so rather than to fall back on a
+    link that goes wherever LaunchServices sends it.
+    """
+
+    bundle: Path | None
+    known: bool = True
+
+    @classmethod
+    def unavailable(cls) -> ServingApp:
+        return cls(bundle=None, known=False)
+
+
+def _process_command(pid: int) -> str | None:
+    """Executable path of one pid, or None if ps could not answer for it."""
+    try:
+        done = subprocess.run(
+            ["ps", "-o", "comm=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    command = done.stdout.strip()
+    return command if done.returncode == 0 and command else None
+
+
+def bundle_of(executable: str) -> Path | None:
+    """The `.app` a running executable belongs to, or None if it is not in one.
+
+    The first `.app` component wins, which is what makes this work for a clone:
+    Doppel renames the binary, so the Personal clone's listener reports
+    `.../ChatGPT Personal.app/Contents/MacOS/ChatGPT.real` and only the bundle
+    component identifies it.
+    """
+    parts = Path(executable).parts
+    for index, part in enumerate(parts):
+        if part.endswith(".app"):
+            return Path(*parts[: index + 1])
+    return None
+
+
+def serving_app(
+    socket_paths: list[Path],
+    listeners: Callable[[list[Path]], set[int] | None] = _socket_listeners,
+    command_of: Callable[[int], str | None] = _process_command,
+) -> ServingApp:
+    """The bundle of the app serving this instance, found through its socket.
+
+    Needed because `codex://` is not bound to an instance. Every Codex bundle
+    on the machine claims the scheme, LaunchServices picks exactly one handler,
+    and a deep link for a thread that lives in another instance's CODEX_HOME
+    lands in an app that has never heard of it -- silently, since the thread
+    simply stays unmounted. Verified on 2026-08-28: a `personal` thread's bare
+    link raised `/Applications/ChatGPT.app`.
+
+    The socket is the right question to ask because it is the same one that
+    already decides which writer is the app's. `Instance.app_path` is not:
+    it is whichever stamped bundle claimed the CODEX_HOME, and two bundles can
+    stamp the same one. On this machine `ChatGPT Veridue.app` stamps `~/.codex`
+    while `/Applications/ChatGPT.app` is the app actually serving it, so
+    `open -a <app_path>` would ask a second app to open a rollout the first one
+    holds -- the two-writer direction. The listener cannot be wrong about that.
+
+    Disagreeing listeners are reported as unknown rather than picked between:
+    two apps on one instance's sockets is a state we have no answer for.
+    """
+    pids = listeners(socket_paths)
+    if pids is None:
+        return ServingApp.unavailable()
+    if not pids:
+        return ServingApp(bundle=None)
+    bundles = set()
+    for pid in pids:
+        command = command_of(pid)
+        if command is None:
+            return ServingApp.unavailable()
+        bundle = bundle_of(command)
+        if bundle is None:
+            return ServingApp.unavailable()
+        bundles.add(bundle)
+    if len(bundles) != 1:
+        return ServingApp.unavailable()
+    return ServingApp(bundle=bundles.pop())
 
 
 class ThreadStore:

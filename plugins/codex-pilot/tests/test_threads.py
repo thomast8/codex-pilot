@@ -437,3 +437,55 @@ def test_a_store_with_no_holders_never_pays_for_the_app_probe(home):
     assert census.known is True
     assert census.holders == {}
     assert calls == []
+
+
+# -- aiming the deep link ---------------------------------------------------
+
+STOCK = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+# A Doppel clone renames the executable, so only the bundle component names it.
+CLONE = "/Users/x/Applications/ChatGPT Personal.app/Contents/MacOS/ChatGPT.real"
+
+
+def serving(pids, commands):
+    from codex_pilot.threads import serving_app
+
+    return serving_app([Path("/sock")], lambda paths: pids, lambda pid: commands.get(pid))
+
+
+def test_the_serving_bundle_is_the_one_the_listener_belongs_to():
+    assert serving({7}, {7: STOCK}).bundle == Path("/Applications/ChatGPT.app")
+
+
+def test_a_clone_is_named_by_its_bundle_not_its_renamed_binary():
+    # `ChatGPT.real` is not a bundle name and shares none with the stock app;
+    # taking the first `.app` component is what keeps the two apart.
+    assert serving({7}, {7: CLONE}).bundle == Path("/Users/x/Applications/ChatGPT Personal.app")
+
+
+def test_nothing_listening_is_an_answer():
+    # The app is not running. That is a fact about the app, and the caller can
+    # act on it -- unlike a probe that failed.
+    found = serving(set(), {})
+    assert (found.bundle, found.known) == (None, True)
+
+
+def test_a_probe_that_could_not_run_is_not_an_answer():
+    from codex_pilot.threads import ServingApp, serving_app
+
+    assert serving_app([Path("/sock")], lambda paths: None) == ServingApp.unavailable()
+
+
+def test_a_listener_ps_cannot_answer_for_is_not_an_answer():
+    # The pid was there a moment ago and is not now. Reporting "no app" from
+    # that would send the caller to launch an app that is already running.
+    assert serving({7}, {}).known is False
+
+
+def test_a_listener_outside_any_bundle_is_not_an_answer():
+    assert serving({7}, {7: "/usr/bin/python3"}).known is False
+
+
+def test_two_apps_on_one_instance_are_refused_rather_than_picked_between():
+    # Two bundles serving one CODEX_HOME is a state we have no answer for, and
+    # guessing would aim the link at an app that may not hold the thread.
+    assert serving({7, 8}, {7: STOCK, 8: CLONE}).known is False
