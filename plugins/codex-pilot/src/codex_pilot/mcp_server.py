@@ -605,9 +605,16 @@ def read_thread(
         "holder is a `codex exec` run, and this is refused: asking the app to open "
         "a rollout another writer has is exactly the two-writer case the lock "
         "prevents. Wait for that run to exit, or stop_turn it if it is ours.\n\n"
-        "Navigates in the background, so it does not steal focus from whatever "
-        "the user is doing. Pass activate=true only if they asked to be shown "
-        "the thread."
+        "This takes the screen and then hands it back: the app raises its own "
+        "window when it handles the deep link, whatever activate is set to, so "
+        "the frontmost app is noted first and reactivated once Codex is up. The "
+        "`focus` field says whether that worked, confirmed by looking rather than "
+        "assumed from the command -- restored:false with a reason when the user "
+        "was already in Codex, moved on meanwhile, the probe failed, or the "
+        "reactivation never took. It is still an interruption, so focus to DRIVE "
+        "a thread, never "
+        "to look at one -- read_thread reads the rollout off disk without "
+        "touching the app."
     )
 )
 def focus_thread(

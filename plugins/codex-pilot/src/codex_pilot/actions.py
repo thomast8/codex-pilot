@@ -29,10 +29,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import frontmost, payloads
 from . import ipc as ipc_module
-from . import payloads
 from .follow import EVENT_RUN_FAILED, EVENT_TURN_COMPLETED, FollowManager, SeqCounter
-from .instances import Instance, discover_instances
+from .instances import Instance, discover_instances, installed_apps
 from .ipc import IpcClient, IpcError, IpcUnavailable, RouterError
 from .resume import DetachedRun, DetachedRunner, scan_for_thread_id
 from .threads import (
@@ -720,20 +720,36 @@ class Session:
         """
         before = self.census(threads, instance)
         if not mount or not before["unmounted"]:
-            return {**before, "focused": [], "mounted_by_sync": []}
+            return {**before, "focused": [], "mounted_by_sync": [], "focus": None}
 
-        focused = []
+        pending = []
         for thread_id in before["unmounted"]:
             resolved = self.resolve(thread_id)
             if self.live_run(resolved.thread_id) is not None:
                 continue
-            self.focus_thread(thread_id)
-            focused.append(thread_id)
-        if focused:
-            self._stop.wait(settle_seconds)
+            self._refuse_unless_app_holds(resolved)
+            pending.append(resolved)
+        if not pending:
+            return {**before, "focused": [], "mounted_by_sync": [], "focus": None}
+
+        # One guard around the sweep: each link raises the app, and the user
+        # should be put back once at the end rather than fought over per thread.
+        with self.frontmost_guard() as guard:
+            for resolved in pending:
+                self._open_thread_link(resolved)
+        # Settle *after* the guard, not inside it: the app mounts on its own
+        # time, and the user should not spend that time in a window they did
+        # not ask for.
+        self._stop.wait(settle_seconds)
+        focused = [r.thread_id for r in pending]
         after = self.census(threads, instance)
         gained = sorted(set(after["mounted"]) - set(before["mounted"]))
-        return {**after, "focused": focused, "mounted_by_sync": gained}
+        return {
+            **after,
+            "focused": focused,
+            "mounted_by_sync": gained,
+            "focus": guard.outcome,
+        }
 
     def focus_thread(
         self, ref: str, instance: str | None = None, activate: bool = False
@@ -745,21 +761,49 @@ class Session:
         surfaces it. The `codex://threads/<id>` deep link is how the app itself
         navigates, and it takes effect in a couple of seconds.
 
-        What has to change is which thread a window has *mounted*, not which app
-        the user is looking at, so this navigates in the background by default.
-        Plain `open` activates the app, which yanks Codex in front of whatever
-        someone is working in -- unpleasant for a call an orchestrator makes on
-        its own initiative, and worse when it makes several. `activate=True` is
-        there for a caller that genuinely wants the app in front.
+        This is not quiet. Handling the deep link runs the app's own
+        `ensurePrimaryWindowVisible`, which restores, shows and focuses the
+        primary window before navigating, so Codex comes to the front either
+        way. `-g` still buys the smaller half -- it keeps macOS from activating
+        the app on the launch side -- so it stays the default, and
+        `activate=True` is for a caller that wants the whole thing.
+
+        Since the raise cannot be declined, it is undone instead: `frontmost_guard`
+        hands the screen back to whoever had it. That makes this a flash rather
+        than a theft, and a flash is still an interruption -- what actually
+        spares the user is calling this less: focus to drive a thread, not to
+        look at one.
         """
         resolved = self.resolve(ref, instance)
+        self._refuse_unless_app_holds(resolved)
+        with self.frontmost_guard() as guard:
+            url = self._open_thread_link(resolved, activate)
+        return {
+            "instance": resolved.instance.slug,
+            "thread": resolved.thread_id,
+            "name": resolved.name,
+            "opened": url,
+            "activated": activate,
+            "focus": guard.outcome,
+            "note": "give the app a moment, then retry the call that failed",
+        }
+
+    def _refuse_unless_app_holds(self, resolved: ResolvedThread) -> None:
+        """Every precondition for firing a deep link, in one place.
+
+        Stricter than the shared guard, which lets an unclassifiable holder
+        through so the IPC verbs can at least try. Focusing is the one verb
+        with no diagnostic value in trying: it asks the app to open a rollout
+        whose writer we could not identify. The app would refuse the lock
+        itself, but this is the two-writer direction and it is not worth being
+        one bug away from.
+
+        `sync_threads` reaches the same conclusion by a different road -- it
+        only ever focuses threads `census` already routed as `desktop` -- and
+        calls this anyway, so the invariant has one enforcement point rather
+        than two that can drift apart.
+        """
         self._refuse_if_held_elsewhere(resolved)
-        # Stricter than the shared guard, which lets an unclassifiable holder
-        # through so the IPC verbs can at least try. Focusing is the one verb
-        # with no diagnostic value in trying: it asks the app to open a rollout
-        # whose writer we could not identify. The app would refuse the lock
-        # itself, but this is the two-writer direction and it is not worth
-        # being one bug away from.
         holder = resolved.info.holder
         if holder is not None and holder.is_app is None:
             raise ForeignWriterError(
@@ -768,17 +812,31 @@ class Session:
                 "to open a rollout another writer has. Check the pid "
                 f"(`ps -o command= -p {holder.pid}`) and retry once `lsof` is usable."
             )
+
+    def _open_thread_link(self, resolved: ResolvedThread, activate: bool = False) -> str:
+        """Fire the deep link and nothing else, so a batch can share one guard."""
         url = f"codex://threads/{resolved.thread_id}"
-        argv = ["open", url] if activate else ["open", "-g", url]
+        opener = frontmost.OPEN
+        argv = [opener, url] if activate else [opener, "-g", url]
         subprocess.run(argv, check=False, capture_output=True)
-        return {
-            "instance": resolved.instance.slug,
-            "thread": resolved.thread_id,
-            "name": resolved.name,
-            "opened": url,
-            "activated": activate,
-            "note": "give the app a moment, then retry the call that failed",
-        }
+        return url
+
+    def frontmost_guard(self) -> frontmost.FrontmostGuard:
+        """Give the user's foreground app back after the app raises itself.
+
+        Handling a `codex://` link raises Codex Desktop's window before it
+        navigates, so surfacing a thread always interrupts whoever is at the
+        keyboard. The guard puts them back. It is deliberately per *batch*:
+        mounting five threads should cost one flash, not five.
+
+        It takes no instance, deliberately. `codex://` is claimed by every
+        installed Codex bundle and LaunchServices picks the handler, so which
+        window actually rises is not ours to predict; narrowing to the
+        instance's own `app_path` would mean failing to recognise the raise and
+        never restoring. Watching all of them keeps the attribution honest
+        without ever reactivating on the strength of a change we did not cause.
+        """
+        return frontmost.FrontmostGuard(installed_apps())
 
     # -- mutating verbs -----------------------------------------------------
 

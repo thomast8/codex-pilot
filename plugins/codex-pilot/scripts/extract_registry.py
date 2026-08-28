@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from codex_pilot.instances import APP_GLOB, DEFAULT_SEARCH_DIRS  # noqa: E402
+from codex_pilot.instances import installed_apps  # noqa: E402
 from codex_pilot.registry import METHOD_VERSIONS  # noqa: E402
 
 # The map is an object literal whose first key is the stream-state method.
@@ -71,16 +71,6 @@ def registry_from_bundle(app: Path) -> dict[str, int] | None:
             parsed = json.loads(match.group(0))
             return {str(k): int(v) for k, v in parsed.items()}
     return None
-
-
-def installed_apps() -> list[Path]:
-    apps: list[Path] = []
-    for directory in DEFAULT_SEARCH_DIRS:
-        try:
-            apps.extend(sorted(directory.glob(APP_GLOB)))
-        except OSError:
-            continue
-    return apps
 
 
 def report(app: Path, found: dict[str, int]) -> bool:

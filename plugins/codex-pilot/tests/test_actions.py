@@ -24,6 +24,7 @@ import pytest
 from codex_pilot.actions import ActionError, ResolvedThread, Session
 from codex_pilot.follow import EVENT_RUN_FAILED, EVENT_TURN_COMPLETED
 from codex_pilot.framing import FrameReader, encode_frame
+from codex_pilot.frontmost import OPEN
 from codex_pilot.instances import Instance
 from codex_pilot.ipc import IpcError
 from codex_pilot.resume import DetachedError, DetachedRunner
@@ -661,15 +662,119 @@ def test_a_lost_follow_still_resubscribes_when_state_is_read(app):
         sess.close()
 
 
-def test_focus_thread_does_not_steal_the_screen(app, monkeypatch):
-    """Mounting a thread is about which route a window holds, not which app is in
-    front. Plain `open` activates Codex over whatever someone is working in, and
-    an orchestrator may focus several threads in a row."""
+def test_sync_threads_gives_the_screen_back_once_for_the_whole_sweep(app, monkeypatch):
+    """Mounting several threads is several deep links, and each one raises the app.
+
+    One guard around the sweep is the difference between one flash and one per
+    thread, and the settle wait belongs outside it -- the user should not spend
+    those seconds in a window they did not ask for.
+    """
+    second = "01a03f10-e3e1-7b30-9dfc-7c659c4d7435"
+    events: list[tuple[str, str]] = []
+    mail = "/System/Applications/Mail.app"
+    codex = "/Applications/ChatGPT.app"
+    fronts = [mail, codex]
+
+    monkeypatch.setattr(
+        "codex_pilot.actions.subprocess.run",
+        lambda argv, **kw: events.append(("open", argv[-1])),
+    )
+
+    def fake_run(argv):
+        if argv[1:2] == ["front"]:
+            return "ASN:0x0-0x1:"
+        if argv[1:2] == ["info"]:
+            front = fronts.pop(0) if len(fronts) > 1 else fronts[0]
+            return f'[ NULL ]  ASN:0x0-0x1:\n    bundle path="{front}"\n'
+        events.append(("restore", argv[-1]))
+        fronts[:] = [argv[-1]]  # the reactivation takes, as it does in life
+        return ""
+
+    monkeypatch.setattr("codex_pilot.frontmost._run", fake_run)
+    monkeypatch.setattr("codex_pilot.actions.installed_apps", lambda: [Path(codex)])
+
+    # Two threads the app holds a lock on: route 'desktop', so they are the
+    # app's to mount -- and the fake app never answers owner discovery, so both
+    # come back unmounted and the sweep has work to do.
+    sess, inst = live_session(app, ipc_timeout=0.2)
+    sess._stores["default"] = ThreadStore(
+        app.home,
+        lock_holder_probe=lambda paths: {TID: (4242, "codex"), second: (4242, "codex")},
+        app_process_probe=lambda socks: {4242},
+    )
+    seed = app.home / "sessions" / "2026" / "08" / "27"
+    seed.mkdir(parents=True, exist_ok=True)
+    with (app.home / "session_index.jsonl").open("w") as fh:
+        for tid, name in ((TID, "one"), (second, "two")):
+            fh.write(
+                json.dumps({"id": tid, "thread_name": name, "updated_at": "2026-01-01"}) + "\n"
+            )
+            (seed / f"rollout-2026-08-27T10-00-00-{tid}.jsonl").write_text(
+                json.dumps({"type": "session_meta", "payload": {"cwd": "/w", "id": tid}}) + "\n"
+            )
+
+    monkeypatch.setattr(sess._stop, "wait", lambda seconds: events.append(("settle", "")))
+    try:
+        out = sess.sync_threads(settle_seconds=0.0)
+
+        assert sorted(out["focused"]) == sorted([TID, second])
+        assert out["focus"] == {"restored": True, "app": mail}
+        opens = [e for e in events if e[0] == "open"]
+        restores = [e for e in events if e[0] == "restore"]
+        assert len(opens) == 2, f"expected one deep link per thread, got {events}"
+        # The whole point: one restore, and it comes after every link.
+        assert restores == [("restore", mail)], f"expected a single restore, got {events}"
+        assert events.index(restores[0]) > max(events.index(o) for o in opens)
+        # ...and the settle wait comes after the restore, not before it.
+        assert [e[0] for e in events if e[0] in ("open", "restore", "settle")] == [
+            "open",
+            "open",
+            "restore",
+            "settle",
+        ]
+    finally:
+        sess.close()
+
+
+def test_sync_threads_reports_no_focus_when_it_mounts_nothing(app, monkeypatch):
+    """A census with mount=false raises no window, so there is nothing to report."""
+    monkeypatch.setattr(
+        "codex_pilot.actions.subprocess.run",
+        lambda argv, **kw: pytest.fail(f"nothing should have been opened: {argv}"),
+    )
+    sess, inst = live_session(app, ipc_timeout=0.2)
+    try:
+        assert sess.sync_threads(mount=False)["focus"] is None
+    finally:
+        sess.close()
+
+
+def test_focus_thread_gives_the_screen_back(app, monkeypatch):
+    """Surfacing a thread raises Codex's window -- the app does that itself when it
+    handles the deep link, whatever `open` is asked for -- so the one thing left is
+    putting the user back where they were, once per batch rather than per thread."""
     calls: list[list[str]] = []
     monkeypatch.setattr(
         "codex_pilot.actions.subprocess.run",
         lambda argv, **kw: calls.append(argv),
     )
+    mail = "/System/Applications/Mail.app"
+    codex = "/Applications/ChatGPT.app"
+    fronts = [mail, codex]
+
+    def fake_run(argv):
+        if argv[1:2] == ["front"]:
+            return "ASN:0x0-0x1:"
+        if argv[1:2] == ["info"]:
+            front = fronts.pop(0) if len(fronts) > 1 else fronts[0]
+            return f'[ NULL ]  ASN:0x0-0x1:\n    bundle path="{front}"\n'
+        calls.append(argv)
+        if argv[1:2] == ["-a"]:
+            fronts[:] = [argv[-1]]  # the reactivation takes, as it does in life
+        return ""
+
+    monkeypatch.setattr("codex_pilot.frontmost._run", fake_run)
+    monkeypatch.setattr("codex_pilot.actions.installed_apps", lambda: [Path(codex)])
     sess, inst = live_session(app)
     try:
         seed = app.home / "sessions" / "2026" / "08" / "27"
@@ -678,11 +783,16 @@ def test_focus_thread_does_not_steal_the_screen(app, monkeypatch):
             json.dumps({"type": "session_meta", "payload": {"cwd": "/w", "id": TID}}) + "\n"
         )
         out = sess.focus_thread(TID, instance="default")
-        assert calls[-1] == ["open", "-g", f"codex://threads/{TID}"]
+        assert [OPEN, "-g", f"codex://threads/{TID}"] in calls
         assert out["activated"] is False
+        assert out["focus"] == {"restored": True, "app": mail}
+        assert calls[-1] == [OPEN, "-a", mail]
 
-        sess.focus_thread(TID, instance="default", activate=True)
-        assert calls[-1] == ["open", f"codex://threads/{TID}"]
+        fronts[:] = [codex]
+        out = sess.focus_thread(TID, instance="default", activate=True)
+        assert [OPEN, f"codex://threads/{TID}"] in calls
+        # Already in Codex: nothing was taken, so nothing is handed back.
+        assert out["focus"] == {"restored": False, "reason": "already_frontmost"}
     finally:
         sess.close()
 

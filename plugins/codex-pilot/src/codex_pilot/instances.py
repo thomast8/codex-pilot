@@ -98,6 +98,23 @@ def default_codex_home() -> Path:
     return Path(env) if env else Path.home() / ".codex"
 
 
+def installed_apps(search_dirs: list[Path] | None = None) -> list[Path]:
+    """Every Codex Desktop bundle on this machine, stamped or not.
+
+    Wider than `discover_instances`, and deliberately so: that keys by
+    CODEX_HOME and drops the stock unstamped bundle, which is exactly the app a
+    user is most likely to be looking at. Callers that need to recognise "a
+    Codex window just came forward" want all of them.
+    """
+    out: list[Path] = []
+    for directory in DEFAULT_SEARCH_DIRS if search_dirs is None else search_dirs:
+        try:
+            out.extend(sorted(directory.glob(APP_GLOB)))
+        except OSError:
+            continue
+    return out
+
+
 def discover_instances(
     search_dirs: list[Path] | None = None, default_home: Path | None = None
 ) -> list[Instance]:
