@@ -1056,6 +1056,8 @@ class Session:
         sandbox: str | None = None,
         approval: str | None = None,
         model: str | None = None,
+        effort: str | None = None,
+        service_tier: str | None = None,
     ) -> dict[str, Any]:
         """Create a new thread and start its first turn, in a place you name.
 
@@ -1090,6 +1092,8 @@ class Session:
             sandbox=sandbox or "workspace-write",
             approval=approval or "never",
             model=model,
+            effort=effort,
+            service_tier=service_tier,
         )
         out = run.as_dict()
         if worktree is not None:
@@ -1109,6 +1113,9 @@ class Session:
         instance: str | None = None,
         sandbox: str | None = None,
         approval: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        service_tier: str | None = None,
     ) -> dict[str, Any]:
         """Start a turn, by whichever route the thread's lock state permits.
 
@@ -1125,6 +1132,31 @@ class Session:
         resolved = self.resolve(ref, instance)
         self._refuse_if_held_elsewhere(resolved)
         if resolved.info.app_owned or not resolved.info.resumable:
+            # The IPC route starts a turn and carries no settings with it, so
+            # there is nowhere for these to go. Dropping them silently would
+            # run the turn at whatever the thread was already on while the
+            # caller believed it had asked for something else -- absence
+            # reported as fact, in the shape this codebase keeps finding.
+            # Applying them instead would mean mutating the thread's persistent
+            # settings as a side effect of sending a message, which is
+            # edit_thread's job and not this one's.
+            named = [
+                name
+                for name, value in (
+                    ("model", model),
+                    ("effort", effort),
+                    ("service_tier", service_tier),
+                )
+                if value is not None
+            ]
+            if named:
+                raise ActionError(
+                    f"{resolved.thread_id} routes over IPC (Codex Desktop has it open), and "
+                    f"that route cannot carry per-turn settings, so {', '.join(named)} would "
+                    "have been ignored rather than applied. Set them on the thread first with "
+                    "edit_thread(action='update_settings'), which lands on the next turn, then "
+                    "send the message."
+                )
             result = self._follower_request(
                 resolved,
                 "thread-follower-start-turn",
@@ -1143,6 +1175,9 @@ class Session:
             text,
             sandbox=sandbox or "workspace-write",
             approval=approval or "never",
+            model=model,
+            effort=effort,
+            service_tier=service_tier,
         )
         # Registered for the same reason start_thread's is: while this runs, it
         # and not the app holds the writer lock, and every other verb needs to

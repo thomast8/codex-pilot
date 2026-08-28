@@ -368,3 +368,23 @@ async def test_a_cursor_from_a_previous_server_is_reset(empty_home: Path):
     assert payload["ok"] is True
     assert payload["cursor_reset"] is True
     assert payload["cursor"] == 0
+
+
+@pytest.mark.anyio
+async def test_dispatch_tools_can_name_effort_and_service_tier(empty_home: Path):
+    """Both are otherwise inherited from a config file Codex Desktop rewrites.
+
+    Without them on the tool schema the only way to dispatch at a chosen effort
+    is to edit `~/.codex/config.toml`, which is shared with every other thread
+    and every interactive session.
+    """
+    async with (
+        stdio_client(server_params(empty_home)) as (read, write),
+        ClientSession(read, write) as sess,
+    ):
+        await sess.initialize()
+        tools = {t.name: t for t in (await sess.list_tools()).tools}
+        for name in ("start_thread", "send_message"):
+            props = tools[name].input_schema["properties"]
+            assert "effort" in props, name
+            assert "service_tier" in props, name

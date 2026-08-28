@@ -55,6 +55,12 @@ session sits idle for however long the task takes, and both inherit whatever
 directory they were called from. `start_thread` has neither problem, and the
 thread it creates is drivable by every other tool here.
 
+Name `model`, `effort` and `service_tier` on the call when the work deserves
+something other than the machine's defaults. Left out, each is inherited from the
+user's `~/.codex/config.toml` — which Codex Desktop rewrites, so what you inherit
+drifts. Passing them is also the *only* way to set them for a detached run:
+see *Never edit `~/.codex/config.toml` to set up a turn* below.
+
 ### `cwd` is not optional, and not your own directory
 
 `cwd` is where the agent works. Pass the repo or worktree the work belongs to.
@@ -409,6 +415,39 @@ inherited: a defect brief or production code is worth `xhigh` or `max`, a
 mechanical edit is not. After setting, read `thread_status` back on the next turn
 to confirm it took; an effort a model does not support has no promised behaviour.
 
+### Never edit `~/.codex/config.toml` to set up a turn
+
+That file is Codex Desktop's, and the app rewrites it — including keys you put
+there. Restoring `model_reasoning_effort` or `service_tier` in it before
+dispatching work is a trap that looks like diligence: it races the app, it is
+undone the next time the app writes, and until then it has moved every other
+thread and every interactive session onto settings they never asked for. Reading
+it is fine. Writing it is not yours to do, and a run that seems to need it is a
+sign you are reaching for the wrong lever.
+
+There are two right levers, one per route:
+
+- **Dispatching detached** (`start_thread`, and `send_message` on a thread no
+  window owns) — pass `model`, `effort` and `service_tier` on the call. They
+  become `-c` overrides on that one `codex exec`, so nothing outside the turn
+  moves. Each detached turn is its own process, so pass them again per call;
+  they do not carry over.
+- **A thread the app has open** — `edit_thread(action='update_settings')`, which
+  lands on the next turn. `send_message` refuses these arguments on that route
+  rather than dropping them, because the IPC turn carries no settings and would
+  otherwise run at the old ones while you believed otherwise.
+
+Two things neither lever will tell you, so check rather than assume:
+
+- **A bogus effort does not fail.** The CLI accepts any string
+  (`reasoning effort: bogus` in its own header) and dispatches. Read the rung
+  back from `thread_status`, or from the rollout's `turn_context`.
+- **An unsupported service tier is dropped, and the turn still runs.** A tier a
+  model does not advertise comes back as an error *item* in the run's JSONL —
+  "will be omitted from requests" — and then the turn proceeds at the default.
+  That item in `log_path` is the only warning; the tier is not recorded in the
+  rollout for a detached run, so there is nothing to read back afterwards.
+
 ### Changing settings on a thread that is already working
 
 `update_settings` lands on the **next** turn, so there are two ways to move a
@@ -430,10 +469,10 @@ codex-pilot does not send one, so do not plan around it.)
 Say which one you are doing and why, since the second one throws work away.
 
 Both routes need the app to own the thread, because `update_settings` is an IPC
-verb. On a detached run `stop_turn` works and the settings change that follows
-does not: the thread is then held by nobody and shown by no window. Either
-`focus_thread` it once it is idle and pay the foreground interruption, or accept
-the settings it was started with and choose better at `start_thread` time.
+verb. A thread nothing owns has a simpler answer: pass `model`, `effort` or
+`service_tier` straight to the next `send_message`, which is a fresh `codex exec`
+and takes them as overrides for that turn. `focus_thread` only to pay the
+foreground interruption for something the detached route genuinely cannot do.
 
 ## Several Codex apps
 

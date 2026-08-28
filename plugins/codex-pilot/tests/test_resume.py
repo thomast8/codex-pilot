@@ -466,3 +466,99 @@ def test_full_access_needs_an_explicit_env_opt_in(home, tmp_path, monkeypatch):
     run.wait(timeout=15)
     argv = json.loads(rec.read_text())["argv"]
     assert argv[argv.index("--sandbox") + 1] == "danger-full-access"
+
+
+# -- effort and service tier, per dispatch ------------------------------------
+#
+# Both are otherwise inherited from `~/.codex/config.toml`, which Codex Desktop
+# owns and rewrites. Without a per-call lever the only way to dispatch at a
+# chosen effort is to edit that shared file, which races the app and changes
+# every other thread and interactive session too.
+
+
+def test_start_passes_effort_and_service_tier_as_config_overrides(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    run = new_runner(home, tmp_path, rec, [STARTED]).start(
+        "x", cwd=work, effort="xhigh", service_tier="priority"
+    )
+    run.wait(timeout=15)
+    argv = json.loads(rec.read_text())["argv"]
+    assert "model_reasoning_effort=xhigh" in argv
+    assert "service_tier=priority" in argv
+
+
+def test_resume_passes_effort_and_service_tier_as_config_overrides(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    write_rollout(home, work)
+    rec = tmp_path / "rec.json"
+    # Every resume is a fresh process, so a follow-up turn needs the flags
+    # again -- the previous run's settings do not carry over.
+    run = runner(home, tmp_path, rec).run(TID, "x", effort="max", service_tier="flex")
+    run.wait(timeout=15)
+    argv = json.loads(rec.read_text())["argv"]
+    assert "model_reasoning_effort=max" in argv
+    assert "service_tier=flex" in argv
+    assert argv.index("-c") < argv.index("resume")
+
+
+def test_neither_is_sent_when_neither_was_asked_for(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    run = new_runner(home, tmp_path, rec, [STARTED]).start("x", cwd=work)
+    run.wait(timeout=15)
+    argv = " ".join(json.loads(rec.read_text())["argv"])
+    # No default of our own: an unasked-for dispatch keeps whatever the
+    # instance is configured for, rather than a rung invented here.
+    assert "model_reasoning_effort" not in argv
+    assert "service_tier" not in argv
+
+
+def test_an_effort_rung_this_code_has_never_heard_of_still_reaches_the_cli(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = tmp_path / "rec.json"
+    # The ladder is per model and comes from a server-side catalogue, so an
+    # allowlist here would refuse a rung a newer model added.
+    run = new_runner(home, tmp_path, rec, [STARTED]).start("x", cwd=work, effort="ultra2")
+    run.wait(timeout=15)
+    assert "model_reasoning_effort=ultra2" in json.loads(rec.read_text())["argv"]
+
+
+@pytest.mark.parametrize(
+    "effort",
+    ['xhigh"\nmodel="gpt-4', "xhigh sandbox_mode=danger-full-access", "", "x high"],
+)
+def test_an_effort_that_is_not_a_bare_token_is_refused(home, tmp_path, effort):
+    work = tmp_path / "work"
+    work.mkdir()
+    r = new_runner(home, tmp_path, tmp_path / "rec.json", [STARTED])
+    # `-c` parses the right-hand side as TOML, so anything but a bare token is
+    # a way to smuggle a second setting past the allowlists above it.
+    with pytest.raises(DetachedError, match="effort"):
+        r.start("x", cwd=work, effort=effort)
+
+
+def test_an_unknown_service_tier_is_refused_before_spawning(home, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    r = new_runner(home, tmp_path, tmp_path / "rec.json", [STARTED])
+    with pytest.raises(DetachedError, match="service_tier must be one of"):
+        r.start("x", cwd=work, service_tier="fast")
+
+
+def test_a_resume_checks_both_before_it_unarchives_anything(home, tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+    write_rollout(home, work, archived=True)
+    r = runner(home, tmp_path, tmp_path / "rec.json")
+    unarchived = []
+    monkeypatch.setattr(r, "_unarchive", lambda tid: unarchived.append(tid))
+    with pytest.raises(DetachedError, match="service_tier must be one of"):
+        r.run(TID, "x", service_tier="fast")
+    # Refusing after unarchiving would leave the thread moved for a turn that
+    # never ran.
+    assert unarchived == []
