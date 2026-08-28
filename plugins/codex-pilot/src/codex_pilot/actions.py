@@ -77,6 +77,13 @@ ROUTE_UNKNOWN = "unknown"
 # instance; requests are multiplexed by id, so they go concurrently.
 CENSUS_WORKERS = 8
 
+# What `focus_thread` will wait to learn a thread is already mounted before it
+# gives up asking and fires the link anyway. A mounted thread answers in ~0.4s,
+# so this is headroom rather than a guess; the router's ~10s no-client-found is
+# deliberately not waited for, because by then the link would have been the
+# cheaper way to find out.
+FOCUS_PROBE_TIMEOUT_SECONDS = 1.0
+
 
 class ActionError(Exception):
     """An action could not be carried out."""
@@ -603,11 +610,22 @@ class Session:
 
     # -- owner --------------------------------------------------------------
 
-    def owner_of(self, resolved: ResolvedThread) -> str:
-        """The clientId of the window that owns this thread."""
+    def owner_of(self, resolved: ResolvedThread, timeout: float | None = None) -> str:
+        """The clientId of the window that owns this thread.
+
+        `timeout` bounds the wait below the router's own ~10s discovery answer,
+        for a caller that only wants the cheap positive. Silence then means "did
+        not answer in time", not "the connection is dead", so it is exempt from
+        the strike counter.
+        """
         client = self.client(resolved.instance)
         try:
-            response = client.request(OWNER_DISCOVERY, payloads.owner_discovery(resolved.thread_id))
+            response = client.request(
+                OWNER_DISCOVERY,
+                payloads.owner_discovery(resolved.thread_id),
+                timeout=timeout,
+                silence_counts=timeout is None,
+            )
         except RouterError as exc:
             if exc.error == "no-client-found":
                 # Same reply, three different situations. Which one it is
@@ -647,10 +665,21 @@ class Session:
             raise ActionError(f"owner discovery returned no client id: {response}")
         return owner
 
-    def probe_mounted(self, resolved: ResolvedThread) -> str | None:
-        """The owning client id if the app is mounted on this thread, else None."""
+    def probe_mounted(self, resolved: ResolvedThread, timeout: float | None = None) -> str | None:
+        """The owning client id if the app is mounted on this thread, else None.
+
+        `None` is "not provably mounted", which is weaker than "unmounted": an
+        unreachable router, a refusal, or -- with `timeout` set -- an answer
+        that did not arrive in time all land here alongside a genuine
+        no-client-found. Callers must treat it as absence of proof and take the
+        safe branch, never as proof of absence.
+
+        The probe is lopsided. A mounted thread answers in ~0.4s; an unmounted
+        one costs the router's full ~10s discovery timeout before it says so.
+        A caller that only wants the cheap positive passes a `timeout`.
+        """
         try:
-            return self.owner_of(resolved)
+            return self.owner_of(resolved, timeout=timeout)
         except (UnclaimedThreadError, NoOwnerError):
             return None
         except (ActionError, IpcError):
@@ -867,6 +896,22 @@ class Session:
         resolved = self.resolve(ref, instance)
         self._refuse_unless_app_holds(resolved)
         target = self.link_target(resolved.instance)
+        owner = None if activate else self.probe_mounted(resolved, FOCUS_PROBE_TIMEOUT_SECONDS)
+        if owner is not None:
+            # Already rendering it: the link would re-run the app's window
+            # restore for a screen that needs no changing, which is the whole
+            # cost of a focus and none of its effect.
+            return {
+                "instance": resolved.instance.slug,
+                "app": str(target),
+                "thread": resolved.thread_id,
+                "name": resolved.name,
+                "owner": owner,
+                "opened": None,
+                "activated": False,
+                "focus": {"restored": False, "reason": "skipped_already_mounted"},
+                "note": "already mounted; the app answers for this thread now",
+            }
         with self.frontmost_guard([target]) as guard:
             url = self._open_thread_link(resolved, target, activate)
         return {
@@ -874,6 +919,9 @@ class Session:
             "app": str(target),
             "thread": resolved.thread_id,
             "name": resolved.name,
+            # Not proof it was unmounted -- only that nothing proved otherwise
+            # inside the probe's second. See `probe_mounted`.
+            "owner": None,
             "opened": url,
             "activated": activate,
             "focus": guard.outcome,

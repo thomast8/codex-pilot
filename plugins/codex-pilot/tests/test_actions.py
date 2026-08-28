@@ -781,6 +781,15 @@ def test_sync_threads_reports_no_focus_when_it_mounts_nothing(app, monkeypatch):
         sess.close()
 
 
+def _seed_rollout(app) -> None:
+    """Give the store a rollout for TID, so `resolve` has something to find."""
+    seed = app.home / "sessions" / "2026" / "08" / "27"
+    seed.mkdir(parents=True, exist_ok=True)
+    (seed / f"rollout-2026-08-27T10-00-00-{TID}.jsonl").write_text(
+        json.dumps({"type": "session_meta", "payload": {"cwd": "/w", "id": TID}}) + "\n"
+    )
+
+
 def test_focus_thread_gives_the_screen_back(app, monkeypatch):
     """Surfacing a thread raises Codex's window -- the app does that itself when it
     handles the deep link, whatever `open` is asked for -- so the one thing left is
@@ -825,6 +834,84 @@ def test_focus_thread_gives_the_screen_back(app, monkeypatch):
         assert [OPEN, "-a", codex, f"codex://threads/{TID}"] in calls
         # Already in Codex: nothing was taken, so nothing is handed back.
         assert out["focus"] == {"restored": False, "reason": "already_frontmost"}
+    finally:
+        sess.close()
+
+
+def test_focus_skips_the_link_for_a_thread_the_app_already_shows(app, monkeypatch):
+    """A raise buys nothing when the window is already rendering the thread.
+
+    The deep link is how the app navigates, so firing one at a thread already
+    mounted re-runs `ensurePrimaryWindowVisible` for a screen that needs no
+    changing: the whole cost, none of the effect. Remodex reaches the same
+    conclusion from the other side of the bus, suppressing navigation once
+    Desktop has announced it is following.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "codex_pilot.actions.subprocess.run",
+        lambda argv, **kw: calls.append(argv),
+    )
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: calls.append(argv) or "")
+    monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: "window-7")
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default")
+        assert calls == [], "a mounted thread must cost no subprocess at all"
+        assert out["opened"] is None
+        assert out["owner"] == "window-7"
+        assert out["focus"] == {"restored": False, "reason": "skipped_already_mounted"}
+    finally:
+        sess.close()
+
+
+def test_an_explicit_activate_still_raises_a_mounted_thread(app, monkeypatch):
+    """The skip is about pointless raises, not about refusing a asked-for one.
+
+    `activate=True` is a caller saying it wants the window in front, which is a
+    different request from "make the app answer for this thread" -- and one the
+    mounted state does not already satisfy.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "codex_pilot.actions.subprocess.run",
+        lambda argv, **kw: calls.append(argv),
+    )
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: "window-7")
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default", activate=True)
+        assert [OPEN, "-a", str(STUB_APP), f"codex://threads/{TID}"] in calls
+        assert out["opened"] == f"codex://threads/{TID}"
+    finally:
+        sess.close()
+
+
+def test_a_thread_that_cannot_be_probed_is_focused_rather_than_assumed_mounted(app, monkeypatch):
+    """`probe_mounted` returns None for "no" and for "could not tell" alike.
+
+    Reading that as mounted would skip the one call that fixes an unreachable
+    thread, and every retry would skip it again for the same non-reason. So the
+    unprobeable case fires the link: the response never claims the thread was
+    unmounted, only that it was surfaced.
+    """
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "codex_pilot.actions.subprocess.run",
+        lambda argv, **kw: calls.append(argv),
+    )
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: None)
+    sess, inst = live_session(app)
+    try:
+        _seed_rollout(app)
+        out = sess.focus_thread(TID, instance="default")
+        assert [OPEN, "-g", "-a", str(STUB_APP), f"codex://threads/{TID}"] in calls
+        assert out["opened"] == f"codex://threads/{TID}"
+        assert out["owner"] is None
     finally:
         sess.close()
 
