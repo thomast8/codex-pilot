@@ -14,6 +14,7 @@ import inspect
 import json
 import shutil
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -70,6 +71,22 @@ def recording_stub(tmp_path: Path, record: Path, lines: list[str]) -> Path:
     )
     path.chmod(0o755)
     return path
+
+
+def recording_open(calls: list[list[str]], returncode: int = 0, stderr: bytes = b"") -> object:
+    """A `subprocess.run` stand-in that records argv and answers like the real one.
+
+    Returning None was enough until `_open_thread_link` started reading the exit
+    status. A stub that does not model the API it replaces is exactly what lets
+    a real failure through, so this returns a real `CompletedProcess` and can be
+    told to fail.
+    """
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, returncode, b"", stderr)
+
+    return run
 
 
 @pytest.fixture
@@ -743,7 +760,9 @@ def test_sync_threads_gives_the_screen_back_once_for_the_whole_sweep(app, monkey
 
     monkeypatch.setattr(
         "codex_pilot.actions.subprocess.run",
-        lambda argv, **kw: events.append(("open", argv[-1])),
+        lambda argv, **kw: (
+            events.append(("open", argv[-1])) or subprocess.CompletedProcess(argv, 0, b"", b"")
+        ),
     )
 
     def fake_run(argv):
@@ -842,7 +861,7 @@ def test_focus_thread_gives_the_screen_back(app, monkeypatch):
     calls: list[list[str]] = []
     monkeypatch.setattr(
         "codex_pilot.actions.subprocess.run",
-        lambda argv, **kw: calls.append(argv),
+        recording_open(calls),
     )
     mail = "/System/Applications/Mail.app"
     codex = str(STUB_APP)
@@ -895,7 +914,7 @@ def test_focus_skips_the_link_for_a_thread_the_app_already_shows(app, monkeypatc
     calls: list[list[str]] = []
     monkeypatch.setattr(
         "codex_pilot.actions.subprocess.run",
-        lambda argv, **kw: calls.append(argv),
+        recording_open(calls),
     )
     monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: calls.append(argv) or "")
     monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: "window-7")
@@ -921,7 +940,7 @@ def test_the_skip_works_through_the_real_probe_not_a_stand_in(app, monkeypatch):
     or a dropped argument in that chain would pass every one of them.
     """
     calls: list[list[str]] = []
-    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
     monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
     app.owners[TID] = "window-from-the-wire"
     sess, inst = live_session(app)
@@ -944,7 +963,7 @@ def test_a_bounded_probe_does_not_retire_the_session_connection(app, monkeypatch
     more consecutive unanswered probes than the strike limit, against a router
     that never answers owner discovery, leaving the connection usable.
     """
-    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: None)
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open([]))
     monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
     monkeypatch.setattr(actions, "FOCUS_PROBE_TIMEOUT_SECONDS", 0.2)
     sess, inst = live_session(app)
@@ -971,7 +990,7 @@ def test_an_explicit_activate_still_raises_a_mounted_thread(app, monkeypatch):
     calls: list[list[str]] = []
     monkeypatch.setattr(
         "codex_pilot.actions.subprocess.run",
-        lambda argv, **kw: calls.append(argv),
+        recording_open(calls),
     )
     monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
     monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: "window-7")
@@ -996,7 +1015,7 @@ def test_a_thread_that_cannot_be_probed_is_focused_rather_than_assumed_mounted(a
     calls: list[list[str]] = []
     monkeypatch.setattr(
         "codex_pilot.actions.subprocess.run",
-        lambda argv, **kw: calls.append(argv),
+        recording_open(calls),
     )
     monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
     monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: None)
@@ -1021,7 +1040,7 @@ def test_a_cold_app_gets_longer_to_come_forward_than_a_warm_one(app, monkeypatch
     """
     monkeypatch.setattr(
         "codex_pilot.actions.subprocess.run",
-        lambda argv, **kw: None,
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, b"", b""),
     )
     monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: None)
     # Real deadlines, scaled down: the point is which one is chosen, and waiting
@@ -1074,7 +1093,7 @@ def test_the_kill_switch_fires_no_link_and_says_the_thread_is_not_surfaced(app, 
     an IPC verb forever against a thread nothing will ever answer for.
     """
     calls: list[list[str]] = []
-    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
     monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: calls.append(argv) or "")
     monkeypatch.setenv(actions.SUPPRESS_FOCUS_ENV, "1")
     sess, inst = live_session(app)
@@ -1098,7 +1117,7 @@ def test_suppression_does_not_claim_a_mounted_thread_is_unreachable(app, monkeyp
     read-only one.
     """
     calls: list[list[str]] = []
-    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
     monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
     monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: "window-7")
     monkeypatch.setenv(actions.SUPPRESS_FOCUS_ENV, "1")
@@ -1116,7 +1135,7 @@ def test_suppression_does_not_claim_a_mounted_thread_is_unreachable(app, monkeyp
 
 def test_without_the_kill_switch_nothing_changes(app, monkeypatch):
     calls: list[list[str]] = []
-    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
     monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
     monkeypatch.setattr(Session, "probe_mounted", lambda self, resolved, timeout=None: None)
     monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
@@ -1559,7 +1578,9 @@ def test_sync_threads_skips_a_thread_it_cannot_resolve_and_mounts_the_rest(app, 
 
     monkeypatch.setattr(
         "codex_pilot.actions.subprocess.run",
-        lambda argv, **kw: opened.append(argv[-1]),
+        lambda argv, **kw: (
+            opened.append(argv[-1]) or subprocess.CompletedProcess(argv, 0, b"", b"")
+        ),
     )
     monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
 
@@ -1620,7 +1641,7 @@ def test_a_finished_run_is_brought_forward_in_the_app(home, tmp_path, monkeypatc
     work.mkdir()
     monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
     calls: list[list[str]] = []
-    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
     monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
     sess, inst = _finished_run(home, tmp_path, work)
     try:
@@ -1628,7 +1649,7 @@ def test_a_finished_run_is_brought_forward_in_the_app(home, tmp_path, monkeypatc
         # The link is what makes the finished thread visible and drivable; the
         # rollout is complete by now, because the child's exit is what closed it.
         assert [OPEN, "-g", "-a", str(STUB_APP), f"codex://threads/{TID}"] in calls
-        surfaced = sess.collect_events()["events"][0]["data"]["surfaced"]
+        surfaced = sess.collect_events()["events"][0]["data"]["surfacing"]
         assert surfaced["surfaced"] is True
         assert surfaced["app"] == str(STUB_APP)
     finally:
@@ -1642,14 +1663,14 @@ def test_a_finished_run_is_not_surfaced_into_an_app_that_is_not_running(
     work.mkdir()
     monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
     calls: list[list[str]] = []
-    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
     sess, inst = _finished_run(home, tmp_path, work)
     try:
         sess._reap_runs(inst)
         # Cold-starting Codex to display a thread nobody asked to see is a
         # heavier interruption than the one surfacing exists to save.
         assert calls == []
-        surfaced = sess.collect_events()["events"][0]["data"]["surfaced"]
+        surfaced = sess.collect_events()["events"][0]["data"]["surfacing"]
         assert surfaced["surfaced"] is False
         assert surfaced["reason"] == "app_not_running"
         # And it says so rather than leaving the caller to infer it.
@@ -1663,7 +1684,7 @@ def test_surface_false_leaves_a_finished_run_where_it_is(home, tmp_path, monkeyp
     work.mkdir()
     monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
     calls: list[list[str]] = []
-    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
     monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
     sess, inst = _finished_run(home, tmp_path, work, surface=False)
     try:
@@ -1671,7 +1692,7 @@ def test_surface_false_leaves_a_finished_run_where_it_is(home, tmp_path, monkeyp
         # A wide fan-out should be able to finish without taking the screen
         # once per thread.
         assert calls == []
-        surfaced = sess.collect_events()["events"][0]["data"]["surfaced"]
+        surfaced = sess.collect_events()["events"][0]["data"]["surfacing"]
         assert (surfaced["surfaced"], surfaced["reason"]) == (False, "not_requested")
     finally:
         sess.close()
@@ -1682,13 +1703,13 @@ def test_suppressing_focus_also_suppresses_the_completion_raise(home, tmp_path, 
     work.mkdir()
     monkeypatch.setenv(actions.SUPPRESS_FOCUS_ENV, "1")
     calls: list[list[str]] = []
-    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
     sess, inst = _finished_run(home, tmp_path, work)
     try:
         sess._reap_runs(inst)
         # The switch turns every deep link off, and this is a deep link.
         assert calls == []
-        surfaced = sess.collect_events()["events"][0]["data"]["surfaced"]
+        surfaced = sess.collect_events()["events"][0]["data"]["surfacing"]
         assert (surfaced["surfaced"], surfaced["reason"]) == (False, "suppressed")
     finally:
         sess.close()
@@ -1706,7 +1727,7 @@ def test_threads_finishing_together_cost_one_raise_not_one_each(home, tmp_path, 
     work.mkdir()
     monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
     calls: list[list[str]] = []
-    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
     monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
     guards: list[object] = []
     real_guard = Session.frontmost_guard
@@ -1749,7 +1770,7 @@ def test_a_thread_another_writer_took_is_skipped_with_a_reason(home, tmp_path, m
     work.mkdir()
     monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
     calls: list[list[str]] = []
-    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
     sess, inst = session(
         home, tmp_path, stub(tmp_path, [STARTED]), holders={TID: (FOREIGN_PID, "codex")}
     )
@@ -1759,7 +1780,7 @@ def test_a_thread_another_writer_took_is_skipped_with_a_reason(home, tmp_path, m
         sess._runs[TID].wait(timeout=15)
         sess._reap_runs(inst)
         assert calls == []
-        surfaced = sess.collect_events()["events"][0]["data"]["surfaced"]
+        surfaced = sess.collect_events()["events"][0]["data"]["surfacing"]
         assert (surfaced["surfaced"], surfaced["reason"]) == (False, "refused")
         assert "not Codex Desktop" in surfaced["detail"]
     finally:
@@ -1786,7 +1807,7 @@ def test_a_surfacing_failure_never_costs_the_completion_event(home, tmp_path, mo
         sess._reap_runs(inst)
         event = sess.collect_events()["events"][0]
         assert event["type"] == EVENT_TURN_COMPLETED
-        surfaced = event["data"]["surfaced"]
+        surfaced = event["data"]["surfacing"]
         assert (surfaced["surfaced"], surfaced["reason"]) == (False, "error")
         assert "lsof went missing" in surfaced["detail"]
     finally:
@@ -1804,7 +1825,7 @@ def test_a_run_we_stopped_is_not_raised_into_a_window(home, tmp_path, monkeypatc
     work.mkdir()
     monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
     calls: list[list[str]] = []
-    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
     monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
     sess, inst = session(home, tmp_path, stub(tmp_path, [STARTED], sleep=30))
     try:
@@ -1813,7 +1834,195 @@ def test_a_run_we_stopped_is_not_raised_into_a_window(home, tmp_path, monkeypatc
         sess.stop_turn(TID)
         sess._reap_runs(inst)
         assert [c for c in calls if c and c[0] == OPEN] == []
-        surfaced = sess.collect_events()["events"][0]["data"]["surfaced"]
+        surfaced = sess.collect_events()["events"][0]["data"]["surfacing"]
         assert (surfaced["surfaced"], surfaced["reason"]) == (False, "stopped")
     finally:
+        sess.close()
+
+
+def test_a_link_the_app_refused_is_not_reported_as_surfaced(home, tmp_path, monkeypatch):
+    """`open` exiting non-zero is knowledge we already hold, so it must be used.
+
+    A bundle deleted while its process still serves the socket, or a
+    LaunchServices refusal, comes back as a non-zero exit. Reporting
+    `surfaced: true` on the strength of "no exception was raised" is the
+    absence-as-fact bug, in the one field this feature reports through.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "codex_pilot.actions.subprocess.run",
+        recording_open(calls, returncode=1, stderr=b"Unable to find application named 'Codex'"),
+    )
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    sess, inst = _finished_run(home, tmp_path, work)
+    try:
+        sess._reap_runs(inst)
+        assert [c for c in calls if c and c[0] == OPEN] != []
+        surfaced = sess.collect_events()["events"][0]["data"]["surfacing"]
+        assert (surfaced["surfaced"], surfaced["reason"]) == (False, "link_failed")
+        # The reason the app gave, not just that something went wrong.
+        assert "Unable to find application" in surfaced["detail"]
+    finally:
+        sess.close()
+
+
+def test_one_failed_link_does_not_taint_the_threads_beside_it(home, tmp_path, monkeypatch):
+    """Per thread, not per batch.
+
+    Marking the whole batch `link_failed` because one link failed would report
+    threads that really did land as though they had not.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    other = "01a03f10-e3e1-7b30-9dfc-000000000003"
+    sess, inst = _finished_run(home, tmp_path, work)
+    try:
+        second = sess._runners["default"].start("second", cwd=work)
+        second.thread_id = other
+        second.wait(timeout=15)
+        write_rollout(home, other, work)
+
+        def flaky(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            failed = argv[-1].endswith(other)
+            return subprocess.CompletedProcess(argv, 1 if failed else 0, b"", b"refused")
+
+        monkeypatch.setattr("codex_pilot.actions.subprocess.run", flaky)
+        surfaced = sess._surface_finished(inst, [(TID, sess._runs[TID]), (other, second)])
+        assert surfaced[TID]["surfaced"] is True
+        assert (surfaced[other]["surfaced"], surfaced[other]["reason"]) == (False, "link_failed")
+    finally:
+        sess.close()
+
+
+def test_an_unreadable_writer_lock_is_not_treated_as_a_free_one(home, tmp_path, monkeypatch):
+    """`holder is None` proves nothing when the probe could not run.
+
+    `route_for` already refuses to call this state `detached`. The deep link is
+    the mirror of that route -- it asks the app to take the lock -- and this now
+    fires unattended on every completion, so an lsof that timed out must not be
+    what decides a rollout gets a second writer.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    inst = Instance(slug="default", codex_home=home, app_path=None, is_default=True)
+    sess = Session(instances=[inst])
+    # None, not {}: the probe could not run at all.
+    store = ThreadStore(home, lock_holder_probe=lambda paths: None)
+    sess._stores["default"] = store
+    sess._runners["default"] = DetachedRunner(inst, store, codex_binary=stub(tmp_path, [STARTED]))
+    try:
+        sess.start_thread("build it", cwd=str(work))
+        write_rollout(home, TID, work)
+        sess._runs[TID].wait(timeout=15)
+        assert sess.resolve(TID, "default").info.lock_known is False
+        sess._reap_runs(inst)
+        assert [c for c in calls if c and c[0] == OPEN] == []
+        surfaced = sess.collect_events()["events"][0]["data"]["surfacing"]
+        assert (surfaced["surfaced"], surfaced["reason"]) == (False, "refused")
+        assert "could not be probed" in surfaced["detail"]
+    finally:
+        sess.close()
+
+
+def test_a_thread_with_no_nameable_app_is_reported_unaimable(home, tmp_path, monkeypatch):
+    """An unaimed link is the bug, so it is declined and said so."""
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
+
+    def unaimable(self, instance):
+        raise UnboundLinkError("could not tell which app is serving instance 'default'")
+
+    monkeypatch.setattr(Session, "link_target", unaimable)
+    sess, inst = _finished_run(home, tmp_path, work)
+    try:
+        sess._reap_runs(inst)
+        assert calls == []
+        surfaced = sess.collect_events()["events"][0]["data"]["surfacing"]
+        assert (surfaced["surfaced"], surfaced["reason"]) == (False, "unaimable")
+    finally:
+        sess.close()
+
+
+def test_send_message_carries_the_surface_choice_too(home, tmp_path, monkeypatch):
+    """Not just `start_thread`.
+
+    `send_message` is the verb used most on an existing thread, so a dropped
+    `surface` there is the likelier regression.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    write_rollout(home, TID, work)
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open(calls))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    sess, inst = session(home, tmp_path, stub(tmp_path, ["resumed"]))
+    try:
+        sess.send_message(TID, "go", surface=False)
+        sess._runs[TID].wait(timeout=15)
+        sess._reap_runs(inst)
+        assert calls == []
+        surfaced = sess.collect_events()["events"][0]["data"]["surfacing"]
+        assert (surfaced["surfaced"], surfaced["reason"]) == (False, "not_requested")
+    finally:
+        sess.close()
+
+
+def test_two_reapers_on_one_instance_announce_a_run_exactly_once(home, tmp_path, monkeypatch):
+    """The reason `_reap_guard` exists, pinned deterministically.
+
+    Claiming a run and announcing it are no longer adjacent -- surfacing sits
+    between them -- so without the lock a second reaper can arrive in that gap,
+    find the run already claimed, and report nothing for a turn that finished.
+    Before this was a lock it showed up as whichever unrelated test happened to
+    race the pump, which is not coverage.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    inside = threading.Event()
+    release = threading.Event()
+    real = Session._surface_finished
+
+    def slow(self, instance, finished):
+        inside.set()
+        release.wait(timeout=10)
+        return real(self, instance, finished)
+
+    monkeypatch.setattr(Session, "_surface_finished", slow)
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", recording_open([]))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    sess, inst = _finished_run(home, tmp_path, work)
+    try:
+        first = threading.Thread(target=sess._reap_runs, args=(inst,), daemon=True)
+        first.start()
+        assert inside.wait(timeout=10), "the first reaper never reached surfacing"
+
+        second_done = threading.Event()
+        threading.Thread(
+            target=lambda: (sess._reap_runs(inst), second_done.set()), daemon=True
+        ).start()
+        # The second reaper must be held at the door, not let through to find a
+        # claimed-but-unannounced run.
+        assert not second_done.wait(timeout=1.0)
+
+        release.set()
+        first.join(timeout=10)
+        assert second_done.wait(timeout=10)
+        events = [e for e in sess.collect_events()["events"] if e["thread"] == TID]
+        assert [e["type"] for e in events] == [EVENT_TURN_COMPLETED]
+    finally:
+        release.set()
         sess.close()

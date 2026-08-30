@@ -10,6 +10,7 @@ draws between surfacing a thread and proving it mounted.
 
 `--cwd` is required and nothing is hard-coded, because this starts a real turn
 against a real agent: point it at a directory you do not mind an agent seeing.
+It is created if it does not exist, so the command above is runnable as written.
 The turn itself is read-only and asks for one word, so the interesting part is
 the few seconds after it exits.
 
@@ -27,7 +28,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from codex_pilot.actions import Session  # noqa: E402
+from codex_pilot.actions import ActionError, Session  # noqa: E402
+from codex_pilot.resume import DetachedError  # noqa: E402
 
 # Short, read-only, and uninteresting on purpose: this is about what happens
 # when the run ends, so the run should end quickly and change nothing.
@@ -42,8 +44,22 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=300.0, help="seconds to wait for the run")
     args = parser.parse_args()
 
+    # Made rather than demanded: this is explicitly a disposable scratch dir,
+    # and a reviewer copying the command out of the PR should not meet a
+    # traceback from deep inside the runner because it did not exist yet.
+    cwd = Path(args.cwd).expanduser()
+    try:
+        cwd.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"cannot use --cwd {cwd}: {exc}")
+        return 2
+
     session = Session()
-    instance = session.instance_for(args.instance)
+    try:
+        instance = session.instance_for(args.instance)
+    except ActionError as exc:
+        print(f"{exc}")
+        return 2
     print(f"instance={instance.slug} home={instance.codex_home} live={instance.is_live}")
     if not instance.is_live:
         print("no app is serving that instance -- start Codex Desktop first")
@@ -51,9 +67,13 @@ def main() -> int:
     print(f"link target: {session.link_target(instance)}")
 
     try:
-        started = session.start_thread(
-            PROMPT, cwd=args.cwd, sandbox="read-only", model=args.model, effort="low"
-        )
+        try:
+            started = session.start_thread(
+                PROMPT, cwd=str(cwd), sandbox="read-only", model=args.model, effort="low"
+            )
+        except (ActionError, DetachedError) as exc:
+            print(f"could not start the thread: {exc}")
+            return 2
         thread = started["thread"]
         if thread is None:
             print(f"the run reported no thread id; see {started['log_path']}")
@@ -76,7 +96,15 @@ def main() -> int:
             print("no completion event -- that is a bug, not a slow app")
             return 1
         print(f"event: {events[-1]['type']}")
-        print(f"surfaced: {json.dumps(events[-1]['data']['surfaced'], default=str)}")
+        surfacing = events[-1]["data"]["surfacing"]
+        print(f"surfacing: {json.dumps(surfacing, default=str)}")
+        if not surfacing["surfaced"]:
+            # Say what actually happened. Falling through to the mount loop
+            # would end in "the link fired but the app did not take it", which
+            # is the wrong diagnosis from the one tool whose job is diagnosing
+            # this -- for every reason but `link_failed`, no link was fired.
+            print(f"not surfaced ({surfacing['reason']}): {surfacing['detail']}")
+            return 1
 
         # After: the app answering owner discovery is what "it is on screen"
         # actually means, and it is the whole claim this script exists to check.

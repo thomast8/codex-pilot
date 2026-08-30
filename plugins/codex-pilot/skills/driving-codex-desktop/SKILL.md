@@ -175,13 +175,28 @@ group. Once it goes idle:
   renderable by nobody, which is the same invariant that makes focusing it mid-run
   a two-writer bug.
 - **It says whether that worked.** The `turn_completed` (or `run_failed`) event
-  carries `surfaced`, either `{"surfaced": true, "app": ...}` or a `reason` and
-  `detail`: `app_not_running` (Codex is closed, and it is not cold-started just
-  to display a thread nobody asked to see), `suppressed`
-  (`CODEX_PILOT_SUPPRESS_FOCUS`), `not_requested` (`surface=false` on the
-  dispatch), `refused` (something took the lock in between), `unaimable` (the
-  serving app could not be named). Do not read a completion as "it is on screen"
-  without checking.
+  carries `surfacing`: `{"surfaced": true, "app": ...}`, or `surfaced: false`
+  with a `reason` and a `detail`. Branch on `surfacing.surfaced` — note the
+  container is `surfacing` precisely so that `surfaced` is a bool here and a
+  bool on `focus_thread`, rather than one name meaning two shapes. The reasons,
+  in the order they are decided:
+  - `not_requested` — `surface=false` on the dispatch.
+  - `stopped` — the run was stopped rather than finishing, so nobody asked to be
+    shown it. Any `stop_turn` produces this.
+  - `suppressed` — `CODEX_PILOT_SUPPRESS_FOCUS` is set.
+  - `unaimable` — the app serving that instance could not be named, and an
+    unaimed link is the bug this refuses to commit.
+  - `app_not_running` — Codex is closed, and it is not cold-started just to
+    display a thread nobody asked to see.
+  - `unresolvable` — the thread was not in the store by the time it was reaped.
+  - `refused` — something else took the writer lock in between, or the lock
+    could not be probed at all. Either way the app is not asked for it.
+  - `link_failed` — the link was fired and `open` rejected it; `detail` carries
+    the exit status and whatever it said.
+  - `error` — surfacing itself raised. The completion is reported anyway; the
+    announcement is never sacrificed to the raise.
+
+  Do not read a completion as "it is on screen" without checking.
 - **`surface=false` on `start_thread` or `send_message`** turns it off per
   dispatch. Worth it for a wide fan-out, where the flash per completion adds up;
   the threads are still listed, and `read_thread` still harvests them.
@@ -783,9 +798,9 @@ The loop is start, follow, wait once, look in, harvest.
 5. **`turn_completed` means that thread is free.** For a detached run its `data`
    carries `route: "detached"` and the exit code; `run_failed` means it exited
    non-zero, so read `log_path` before assuming the work happened — unless its
-   `stopped` is true, which means you stopped it yourself. `surfaced` says
-   whether the thread was brought into the app as it finished, and why not when
-   it was not.
+   `stopped` is true, which means you stopped it yourself. `surfacing.surfaced`
+   says whether the thread was brought into the app as it finished, and
+   `surfacing.reason` why not when it was not.
 6. **Harvest with `read_thread`**, not by re-running the agent. It works
    whether or not the app ever mounted the thread. (`rollout` from
    `thread_status`/`list_threads` is the same file if you want it raw, and

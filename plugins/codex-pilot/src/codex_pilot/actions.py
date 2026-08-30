@@ -84,6 +84,12 @@ CENSUS_WORKERS = 8
 # cheaper way to find out.
 FOCUS_PROBE_TIMEOUT_SECONDS = 1.0
 
+# Ceiling on one `open` call. Every other subprocess here bounds itself
+# (`frontmost._run` at 5s, the lsof sweeps at 30s) and this one now runs on the
+# follow pump, where an unbounded hang stops every instance's reaping without
+# raising anything for the pump's own fault handler to report.
+OPEN_TIMEOUT_SECONDS = 5.0
+
 # Set to turn every deep link off. The raise is the app's own behaviour and
 # cannot be declined, so the only complete answer is not to fire the link --
 # which costs the threads it would have surfaced: they stay unreachable over
@@ -100,6 +106,23 @@ _OFF = {"", "0", "false", "no", "off"}
 
 def focus_suppressed() -> bool:
     return os.environ.get(SUPPRESS_FOCUS_ENV, "").strip().lower() not in _OFF
+
+
+class FiredLink(NamedTuple):
+    """One `open` invocation: the url it carried, and how it went.
+
+    `returncode` travels with the url because the two are only meaningful
+    together -- a url that was handed to a bundle which then refused it is not
+    a thread that was surfaced.
+    """
+
+    url: str
+    returncode: int
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
 
 
 class LinkTarget(NamedTuple):
@@ -218,9 +241,15 @@ class Session:
         # between claiming a finished run and announcing it, and two reapers
         # interleaving there would let one observe a run already claimed but not
         # yet announced, and report nothing for a turn that had in fact
-        # finished. The pump reaps on a timer and callers reap directly, so that
-        # overlap is routine rather than hypothetical.
-        self._reap_guard = threading.Lock()
+        # finished. Each instance's pump reaps on a timer, and a smoke script or
+        # a test can reap the same instance directly alongside it.
+        #
+        # Per instance, keyed like `_connecting`, because instances share no
+        # state here: a reap filters to one slug and surfaces into one app. One
+        # lock for all of them would let a slow `open` on one instance park
+        # every other instance's pump -- which is where the follows are kept
+        # alive, so they would go quiet without anything marking them lost.
+        self._reap_guards: dict[str, threading.Lock] = {}
         self._snapshot_waiters: dict[str, list[queue.Queue[dict[str, Any]]]] = {}
 
     @property
@@ -376,8 +405,14 @@ class Session:
         Serialized, because claiming a run and announcing it are no longer
         adjacent: surfacing the thread happens between them.
         """
-        with self._reap_guard:
+        with self._reap_guard(instance):
             self._reap_locked(instance)
+
+    def _reap_guard(self, instance: Instance) -> threading.Lock:
+        with self._guard:
+            if instance.slug not in self._reap_guards:
+                self._reap_guards[instance.slug] = threading.Lock()
+            return self._reap_guards[instance.slug]
 
     def _reap_locked(self, instance: Instance) -> None:
         finished: list[tuple[str, DetachedRun]] = []
@@ -416,7 +451,15 @@ class Session:
                     # is not. Reported rather than implied: a caller told only
                     # that the turn finished would have no way to tell a thread
                     # waiting on screen from one that stayed invisible.
-                    "surfaced": surfaced[thread_id],
+                    #
+                    # Named for the attempt, not the outcome, so that `surfaced`
+                    # means the same thing everywhere: a bool here and a bool on
+                    # `focus_thread`. One name carrying a bool in one place and
+                    # an object in another is the kind of collision an agent
+                    # reads straight past -- a non-empty dict is truthy, so
+                    # `if result["surfaced"]` would call a declined surface a
+                    # success.
+                    "surfacing": surfaced[thread_id],
                 },
             )
 
@@ -506,26 +549,49 @@ class Session:
         for thread_id in wanted:
             try:
                 resolved = self.resolve(thread_id, instance.slug)
-                self._refuse_unless_app_holds(resolved)
-            except (ThreadError, ActionError) as exc:
+            except ThreadError as exc:
                 # Per thread, like `sync_threads`: one thread the app cannot be
                 # asked for is not a fact about the others finishing beside it.
+                # Split from `refused` the way `sync_threads` splits it -- a
+                # thread that vanished from the store and one the app must not
+                # be asked for are different states with different remedies.
+                out[thread_id] = self._not_surfaced("unresolvable", str(exc))
+                continue
+            except ActionError as exc:
+                out[thread_id] = self._not_surfaced("refused", str(exc))
+                continue
+            try:
+                self._refuse_unless_app_holds(resolved)
+            except ActionError as exc:
                 out[thread_id] = self._not_surfaced("refused", str(exc))
                 continue
             pending.append(resolved)
         if not pending:
             return out
 
-        try:
-            with self.frontmost_guard([target], live=live) as guard:
-                for resolved in pending:
-                    self._open_thread_link(resolved, target)
-            outcome = guard.outcome
-        except OSError as exc:
+        # Per thread inside the shared guard, not per batch around it. A link
+        # that failed says nothing about the ones fired beside it, and marking
+        # the whole batch `link_failed` would report threads that really did
+        # land as though they had not.
+        failures: dict[str, str] = {}
+        with self.frontmost_guard([target], live=live) as guard:
             for resolved in pending:
-                out[resolved.thread_id] = self._not_surfaced("link_failed", str(exc))
-            return out
+                try:
+                    fired = self._open_thread_link(resolved, target)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    failures[resolved.thread_id] = f"{type(exc).__name__}: {exc}"
+                    continue
+                if not fired.ok:
+                    failures[resolved.thread_id] = (
+                        f"`open` exited {fired.returncode}"
+                        f"{f': {fired.stderr}' if fired.stderr else ''}"
+                    )
+        outcome = guard.outcome
         for resolved in pending:
+            failure = failures.get(resolved.thread_id)
+            if failure is not None:
+                out[resolved.thread_id] = self._not_surfaced("link_failed", failure)
+                continue
             out[resolved.thread_id] = {
                 "surfaced": True,
                 "reason": None,
@@ -1147,7 +1213,7 @@ class Session:
                 "note": "already mounted; the app answers for this thread now",
             }
         with self.frontmost_guard([target], live=aimed.live) as guard:
-            url = self._open_thread_link(resolved, target, activate)
+            url = self._open_thread_link(resolved, target, activate).url
         return {
             "instance": resolved.instance.slug,
             "app": str(target),
@@ -1179,6 +1245,19 @@ class Session:
         than two that can drift apart.
         """
         self._refuse_if_held_elsewhere(resolved)
+        if not resolved.info.lock_known:
+            # `holder is None` proves nothing here -- `ThreadInfo.lock_known`
+            # says so itself. `route_for` already refuses to call this state
+            # `detached`, and the deep link is the mirror of that route: it asks
+            # the app to take the lock. Surfacing now runs unattended on every
+            # detached completion, so an unreadable probe must not be the thing
+            # that decides a rollout gets a second writer.
+            raise ForeignWriterError(
+                f"the writer lock on {resolved.thread_id} could not be probed, so whether "
+                "anything holds it is unknown -- refusing to ask the app to open it rather "
+                "than risk a second writer on the rollout. Check that `lsof` is usable and "
+                "retry; `read_thread` works off the rollout meanwhile."
+            )
         holder = resolved.info.holder
         if holder is not None and holder.is_app is None:
             raise ForeignWriterError(
@@ -1246,18 +1325,30 @@ class Session:
 
     def _open_thread_link(
         self, resolved: ResolvedThread, target: Path, activate: bool = False
-    ) -> str:
+    ) -> FiredLink:
         """Fire the deep link and nothing else, so a batch can share one guard.
 
         The target comes in rather than being resolved here so that a sweep can
         aim every thread of one instance from a single probe, and so that the
         guard can be told which bundles are about to rise.
+
+        The exit status comes back rather than being dropped. `open` failing --
+        a bundle deleted while its process still serves the socket, or a
+        LaunchServices refusal -- is knowledge this process already has, and
+        discarding it would leave a caller to infer success from the mere
+        absence of an exception. That is the house rule, in the one field this
+        reports through.
+
+        Bounded like every other subprocess here (`frontmost._run` at 5s, the
+        lsof sweeps at 30s). Unbounded it can wedge the follow pump, which now
+        fires this on every detached completion rather than only on request.
         """
         url = f"codex://threads/{resolved.thread_id}"
         background = [] if activate else ["-g"]
         argv = [frontmost.OPEN, *background, "-a", str(target), url]
-        subprocess.run(argv, check=False, capture_output=True)
-        return url
+        done = subprocess.run(argv, check=False, capture_output=True, timeout=OPEN_TIMEOUT_SECONDS)
+        stderr = done.stderr.decode(errors="replace").strip() if done.stderr else ""
+        return FiredLink(url=url, returncode=done.returncode, stderr=stderr)
 
     def frontmost_guard(self, targets: Iterable[Path], *, live: bool) -> frontmost.FrontmostGuard:
         """Give the user's foreground app back after the app raises itself.

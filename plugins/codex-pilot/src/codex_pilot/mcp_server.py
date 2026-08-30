@@ -258,7 +258,10 @@ def thread_status(thread: str, instance: str | None = None) -> dict[str, Any]:
         "than silently ignored. "
         "A detached turn is brought forward in Codex Desktop when it exits, so "
         "the finished thread is on screen to carry on from; pass surface=false "
-        "to leave it where it is."
+        "to leave it where it is. Unlike those three, `surface` is NOT refused "
+        "on the IPC route -- a turn the app is already rendering has nothing to "
+        "bring forward, so the value is simply not consulted there and no "
+        "`surfacing` is reported."
     )
 )
 def send_message(
@@ -321,8 +324,9 @@ def send_message(
         "run_failed) when it exits. Do NOT focus_thread it while it runs. "
         "When it exits the thread is brought forward in Codex Desktop by itself, "
         "so finished work lands on screen ready to drive over IPC -- the "
-        "turn_completed event's `surfaced` says whether that happened and why "
-        "not when it did not (a dead app is left dead rather than cold-started). "
+        "turn_completed event's `surfacing` says whether that happened and why "
+        "not when it did not (a dead app is left dead rather than cold-started, "
+        "and an `open` the app rejected is reported, not counted as success). "
         "Pass surface=false for a fan-out whose completions should stay silent. "
         "Read `log_path` for streamed JSONL, or `rollout` for the transcript. "
         "`model`, `effort` (reasoning) and `service_tier` ('priority' is fast mode) "

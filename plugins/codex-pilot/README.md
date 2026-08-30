@@ -138,9 +138,10 @@ verb refuses instead of walking you into a second writer on the rollout, and
 
 That exit is also when the thread becomes visible. codex-pilot fires the deep
 link for it there, so finished work lands in Codex Desktop instead of only on
-disk, and the completion event's `surfaced` says whether it did — with a reason
-when it did not, including a closed app, which is left closed rather than
-cold-started to display something nobody asked for. Earlier is not available at
+disk, and the completion event's `surfacing` says whether it did — with a reason
+when it did not, including a closed app (left closed rather than cold-started to
+display something nobody asked for) and an `open` the app rejected, which is
+reported rather than counted as a success. Earlier is not available at
 any price: the run's own writer lock is what makes the thread unrenderable while
 it works. Pass `surface=false` to a dispatch whose completion should stay quiet,
 or set `CODEX_PILOT_SUPPRESS_FOCUS` to turn every deep link off.
