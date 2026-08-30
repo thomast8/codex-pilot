@@ -121,11 +121,12 @@ set to `auto_review` (the default) a subagent silently decides escalations and
 never asked. Set it to `user` on threads you intend to supervise.
 
 **Creating a thread is the one thing the IPC surface cannot do.** The app's
-follower protocol only drives threads that already exist, and there is no
-`codex://new` deep link, so `start_thread` spawns `codex exec` detached and
-reads the new thread id off its JSONL. It returns in about a second, works in
-the directory you name rather than the caller's, and the thread it creates can
-be pulled into Codex Desktop afterwards with `focus_thread`.
+follower protocol only drives threads that already exist. A `codex://threads/new`
+deep link does exist, and takes both `path` and `prompt`, but it only *prefills*
+the composer and waits for a human to press Return — fired at a live app it
+creates no thread and writes no rollout (verified). So `start_thread` spawns
+`codex exec` detached and reads the new thread id off its JSONL. It returns in
+about a second and works in the directory you name rather than the caller's.
 
 That introduces a third lock state, which the rest of the surface is built
 around rather than papering over. While such a run is going, the lock holder is
@@ -134,6 +135,16 @@ verb refuses instead of walking you into a second writer on the rollout, and
 `stop_turn` terminates the run's process group. When it exits, the run reports
 `turn_completed` on the same event stream a followed thread uses, so one
 `collect_events` waits on app threads and detached runs alike.
+
+That exit is also when the thread becomes visible. codex-pilot fires the deep
+link for it there, so finished work lands in Codex Desktop instead of only on
+disk, and the completion event's `surfacing` says whether it did — with a reason
+when it did not, including a closed app (left closed rather than cold-started to
+display something nobody asked for) and an `open` the app rejected, which is
+reported rather than counted as a success. Earlier is not available at
+any price: the run's own writer lock is what makes the thread unrenderable while
+it works. Pass `surface=false` to a dispatch whose completion should stay quiet,
+or set `CODEX_PILOT_SUPPRESS_FOCUS` to turn every deep link off.
 
 The run does not have to be one this process started. A writer belonging to
 another session reads as `detached_running` just the same, with no

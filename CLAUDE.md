@@ -24,17 +24,21 @@ There is no CI. The suite is the gate, and it is machine-dependent in one place:
 actually installed here and skips entirely when there are none. Passing on a
 machine without the app proves less than passing on one with it.
 
-Two smoke scripts drive a **real** app and are not part of the suite:
+Three smoke scripts drive a **real** app and are not part of the suite:
 
 ```sh
 uv run python scripts/live_smoke.py --thread <id>       # one method at a time
 uv run python scripts/restart_smoke.py --thread <id> --dry-run
+uv run python scripts/surface_smoke.py --cwd <dir>      # a finished run reaching the app
 ```
 
 `live_smoke.py` requires an explicit `--thread` and hard-codes no ids — point it
 at something disposable, it sends real turns to a real agent. `restart_smoke.py`
 quits and relaunches Codex Desktop to prove reconnect recovery, so it is
 allow-listed to one CODEX_HOME by construction; run `--dry-run` before `--yes`.
+`surface_smoke.py` starts a throwaway thread in the `--cwd` you name and checks
+that the app renders it once the run exits — the suite can only show the link
+was fired, and whether the app took it is a fact about the app.
 
 ## Layout
 
