@@ -30,6 +30,7 @@ escalations on its own and nothing ever appears in `thread_status`. Set it to
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -155,7 +156,13 @@ def list_threads(instance: str | None = None) -> dict[str, Any]:
         "all. When it is false, `disk` reports what the rollout on disk "
         "still shows -- `phase: mid_turn` is a thread that was left inside a "
         "turn, which together with a large `age_seconds` is the signature of "
-        "a wedged app: focus_thread it or check the UI."
+        "a wedged app: focus_thread it or check the UI. "
+        "`state.latest_turn` is the turn the app itself would steer, which is "
+        "not the same question as `turn_id` (any turn running) and can name a "
+        "different turn. `latest_turn.placeholder` means the app has not been "
+        "given an id for it; momentarily that is every turn, so read it with "
+        "`latest_turn.age_seconds` -- past 60s the app refuses to steer the "
+        "thread and steer_turn refuses in front of it."
     )
 )
 def thread_status(thread: str, instance: str | None = None) -> dict[str, Any]:
@@ -229,6 +236,13 @@ def thread_status(thread: str, instance: str | None = None) -> dict[str, Any]:
             "runtime": state.runtime,
             "busy": state.busy,
             "turn_id": state.turn_id,
+            # The turn the app's own steer gate acts on, which is not always
+            # the one `turn_id` names. A `placeholder` turn is one the app has
+            # not been given an id for; once it is more than momentarily old,
+            # the app will refuse to steer the thread.
+            "latest_turn": (
+                state.latest_turn.as_dict(time.time()) if state.latest_turn is not None else None
+            ),
             "model": state.model,
             "effort": state.effort,
             "collaboration_mode": state.collaboration_mode,
@@ -379,7 +393,10 @@ def start_thread(
     description=(
         "Inject text into a turn that is already running, without restarting it. "
         "This is the correction channel: the running turn sees the new input and "
-        "adjusts. Requires the app to have the thread open."
+        "adjusts. Requires the app to have the thread open. Refuses when the "
+        "thread's latest turn has been in progress for a while with no turn id "
+        "(`state.latest_turn.placeholder` on thread_status) -- the app cannot "
+        "steer that and says so only in its own UI; send_message instead."
     )
 )
 def steer_turn(thread: str, text: str, instance: str | None = None) -> dict[str, Any]:

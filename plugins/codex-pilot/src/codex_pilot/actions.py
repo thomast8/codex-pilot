@@ -49,6 +49,22 @@ OWNER_DISCOVERY = "thread-owner-discovery"
 FOLLOWING_CHANGED = "thread-stream-following-changed"
 STREAM_STATE_CHANGED = "thread-stream-state-changed"
 SNAPSHOT_WAIT_SECONDS = 3.0
+# How long a turn may sit in progress without a server-assigned id before we
+# call it stuck rather than young. The id normally lands with the turn's first
+# stream event, so this is orders of magnitude past the honest case; it exists
+# to be certain, not to be prompt.
+# How long a turn may sit in progress without a server-assigned id before we
+# call it stuck rather than merely young. The app sends `turn/start` with its
+# own 30s timeout, so an id that has not arrived within 30s of the turn
+# starting is not in flight any more -- the request it would have come back on
+# has already given up. Twice that is chosen to be certain, not to be prompt.
+STALLED_TURN_SECONDS = 60.0
+# The pre-check reads state that is already known; it does not go looking. A
+# thread with a live follow answers from memory, a mounted one answered in
+# under 0.3s when measured, and an app-held thread no window renders never
+# answers at all -- and that last case is the common one, so the wait it costs
+# has to stay small. Falling through on silence only means steering as before.
+STALLED_TURN_PROBE_SECONDS = 1.0
 # How long an unanswered snapshot request waits before being asked again.
 # Long enough not to spam an app that is merely slow, short enough that a
 # thread the app reopens after a restart starts streaming without a nudge.
@@ -180,6 +196,15 @@ class ForeignWriterError(ActionError):
     hold, and resuming would put a second writer on the rollout. The only thing
     to do is wait for the holder to exit -- or, when it is one of our own runs,
     stop it. `_refuse_if_held_elsewhere` phrases both.
+    """
+
+
+class StalledTurnError(ActionError):
+    """The app's newest turn has no id, so the app will not steer this thread.
+
+    Its own type because the remedy is specific and nothing else in this class
+    shares it: send a new message rather than wait, retry or focus. Callers
+    branch on `type(exc).__name__`, which the MCP surface returns as `error`.
     """
 
 
@@ -1660,8 +1685,50 @@ class Session:
         out["name"] = resolved.name
         return out
 
+    def _refuse_a_turn_the_app_cannot_steer(self, resolved: ResolvedThread) -> None:
+        """Refuse a steer the app is going to fail slowly and say nothing about.
+
+        The app steers the turn its `lv()` calls the latest one and needs that
+        turn to carry a server-assigned id. When it has none the app waits 30s
+        for one and then fails -- but the main process abandons a forwarded
+        follower request after 5s, so the only thing that reaches us is
+        `thread-follower-steer-turn-timeout`. The useful diagnosis never leaves
+        the app, which is why this refuses in front of it rather than passing
+        the request on and reporting whatever comes back.
+
+        Only age separates a stuck turn from a healthy one: the app appends
+        every turn optimistically and fills the id in when the first stream
+        event arrives, so a young one without an id is ordinary. Anything that
+        cannot be known -- unreadable state, an undated turn -- steers as
+        before, because not knowing is not evidence.
+        """
+        state = self.thread_state(resolved, wait=STALLED_TURN_PROBE_SECONDS)
+        if state is None:
+            return
+        latest = state.latest_turn
+        if latest is None or not latest.placeholder:
+            return
+        age = latest.age_seconds(time.time())
+        if age is None or age < STALLED_TURN_SECONDS:
+            return
+        raise StalledTurnError(
+            f"{resolved.thread_id} has had a turn in progress for {age:.0f}s without a turn "
+            "id, so Codex Desktop will refuse to steer it -- the app assigns the id from the "
+            "turn's first stream event, and for this one that never arrived. Steering it "
+            "would spend 5s and come back as `thread-follower-steer-turn-timeout`. Use "
+            "send_message instead: the new turn lands after the stuck one and becomes the "
+            "turn the app steers."
+        )
+
     def steer_turn(self, ref: str, text: str, instance: str | None = None) -> dict[str, Any]:
         resolved = self.resolve(ref, instance)
+        # Before reading any state: a lock held by another writer means neither
+        # route reaches the thread at all, which outranks what the app's stream
+        # last showed about it. `_follower_request` checks again below, which is
+        # deliberate -- the check is a pure read of two cheap fields, and a lock
+        # that changed hands during the state read is news worth having.
+        self._refuse_if_held_elsewhere(resolved)
+        self._refuse_a_turn_the_app_cannot_steer(resolved)
         result = self._follower_request(
             resolved,
             "thread-follower-steer-turn",
