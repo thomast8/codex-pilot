@@ -233,10 +233,24 @@ def test_a_thread_we_started_stays_listed_once_it_goes_idle(home, tmp_path):
     sess.close()
 
 
+@pytest.fixture
+def app_closed(monkeypatch):
+    """No Codex Desktop running for this instance.
+
+    Reaping a finished run now tries to bring its thread forward, and a test
+    about the completion *event* should not depend on whether this machine has
+    an app to surface it into. Declining is also the honest state for a session
+    built without a FakeApp behind it.
+    """
+    monkeypatch.setattr(
+        Session, "link_target", lambda self, instance: LinkTarget(STUB_APP, live=False)
+    )
+
+
 # -- completion reaches collect_events ---------------------------------------
 
 
-def test_a_finished_detached_run_reports_turn_completed(home, tmp_path):
+def test_a_finished_detached_run_reports_turn_completed(home, tmp_path, app_closed):
     work = tmp_path / "work"
     work.mkdir()
     sess, inst = session(home, tmp_path, stub(tmp_path, [STARTED]))
@@ -251,7 +265,7 @@ def test_a_finished_detached_run_reports_turn_completed(home, tmp_path):
     sess.close()
 
 
-def test_a_failed_detached_run_is_reported_as_failed(home, tmp_path):
+def test_a_failed_detached_run_is_reported_as_failed(home, tmp_path, app_closed):
     work = tmp_path / "work"
     work.mkdir()
     sess, inst = session(home, tmp_path, stub(tmp_path, [STARTED], exit_code=3))
@@ -264,7 +278,7 @@ def test_a_failed_detached_run_is_reported_as_failed(home, tmp_path):
     sess.close()
 
 
-def test_a_run_is_reported_only_once(home, tmp_path):
+def test_a_run_is_reported_only_once(home, tmp_path, app_closed):
     work = tmp_path / "work"
     work.mkdir()
     sess, inst = session(home, tmp_path, stub(tmp_path, [STARTED]))
@@ -276,7 +290,7 @@ def test_a_run_is_reported_only_once(home, tmp_path):
     sess.close()
 
 
-def test_reporting_a_detached_run_does_not_make_it_a_follow(home, tmp_path):
+def test_reporting_a_detached_run_does_not_make_it_a_follow(home, tmp_path, app_closed):
     work = tmp_path / "work"
     work.mkdir()
     sess, inst = session(home, tmp_path, stub(tmp_path, [STARTED]))
@@ -371,7 +385,7 @@ def test_a_late_thread_id_is_picked_up_rather_than_lost(home, tmp_path):
     sess.close()
 
 
-def test_a_run_we_stopped_is_not_reported_as_having_failed(home, tmp_path):
+def test_a_run_we_stopped_is_not_reported_as_having_failed(home, tmp_path, app_closed):
     work = tmp_path / "work"
     work.mkdir()
     sess, inst = session(home, tmp_path, stub(tmp_path, [STARTED], sleep=30))
@@ -1580,5 +1594,226 @@ def test_sync_threads_skips_a_thread_it_cannot_resolve_and_mounts_the_rest(app, 
         assert skipped["reason"] == "unresolvable"
         assert skipped["instance"] == "default"
         assert phantom in skipped["detail"]
+    finally:
+        sess.close()
+
+
+# -- a finished run is brought forward ----------------------------------------
+#
+# A detached run is invisible for its whole life: it holds the writer lock, so
+# neither route reaches the thread and no window renders it. That is not a bug
+# to be fixed -- it is the two-writer invariant -- but it did mean dispatched
+# work never appeared in the app at all. Completion is the first moment the
+# thread is free, and these pin what happens there.
+
+
+def _finished_run(home: Path, tmp_path: Path, work: Path, **kwargs):
+    sess, inst = session(home, tmp_path, stub(tmp_path, [STARTED]))
+    sess.start_thread("build it", cwd=str(work), **kwargs)
+    write_rollout(home, TID, work)
+    sess._runs[TID].wait(timeout=15)
+    return sess, inst
+
+
+def test_a_finished_run_is_brought_forward_in_the_app(home, tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    sess, inst = _finished_run(home, tmp_path, work)
+    try:
+        sess._reap_runs(inst)
+        # The link is what makes the finished thread visible and drivable; the
+        # rollout is complete by now, because the child's exit is what closed it.
+        assert [OPEN, "-g", "-a", str(STUB_APP), f"codex://threads/{TID}"] in calls
+        surfaced = sess.collect_events()["events"][0]["data"]["surfaced"]
+        assert surfaced["surfaced"] is True
+        assert surfaced["app"] == str(STUB_APP)
+    finally:
+        sess.close()
+
+
+def test_a_finished_run_is_not_surfaced_into_an_app_that_is_not_running(
+    home, tmp_path, monkeypatch, app_closed
+):
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    sess, inst = _finished_run(home, tmp_path, work)
+    try:
+        sess._reap_runs(inst)
+        # Cold-starting Codex to display a thread nobody asked to see is a
+        # heavier interruption than the one surfacing exists to save.
+        assert calls == []
+        surfaced = sess.collect_events()["events"][0]["data"]["surfaced"]
+        assert surfaced["surfaced"] is False
+        assert surfaced["reason"] == "app_not_running"
+        # And it says so rather than leaving the caller to infer it.
+        assert "read_thread" in surfaced["detail"]
+    finally:
+        sess.close()
+
+
+def test_surface_false_leaves_a_finished_run_where_it_is(home, tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    sess, inst = _finished_run(home, tmp_path, work, surface=False)
+    try:
+        sess._reap_runs(inst)
+        # A wide fan-out should be able to finish without taking the screen
+        # once per thread.
+        assert calls == []
+        surfaced = sess.collect_events()["events"][0]["data"]["surfaced"]
+        assert (surfaced["surfaced"], surfaced["reason"]) == (False, "not_requested")
+    finally:
+        sess.close()
+
+
+def test_suppressing_focus_also_suppresses_the_completion_raise(home, tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.setenv(actions.SUPPRESS_FOCUS_ENV, "1")
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    sess, inst = _finished_run(home, tmp_path, work)
+    try:
+        sess._reap_runs(inst)
+        # The switch turns every deep link off, and this is a deep link.
+        assert calls == []
+        surfaced = sess.collect_events()["events"][0]["data"]["surfaced"]
+        assert (surfaced["surfaced"], surfaced["reason"]) == (False, "suppressed")
+    finally:
+        sess.close()
+
+
+def test_threads_finishing_together_cost_one_raise_not_one_each(home, tmp_path, monkeypatch):
+    """The guard is per batch, as in `sync_threads`.
+
+    Runs that land in one reap should hand the screen back once between them,
+    rather than fighting the user for it per thread. Driven through
+    `_surface_finished` directly because whether two real children exit inside
+    one pump tick is a matter of timing, and the batching is not.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    guards: list[object] = []
+    real_guard = Session.frontmost_guard
+    monkeypatch.setattr(
+        Session,
+        "frontmost_guard",
+        lambda self, targets, *, live: guards.append(1) or real_guard(self, targets, live=live),
+    )
+
+    other = "01a03f10-e3e1-7b30-9dfc-000000000002"
+    sess, inst = _finished_run(home, tmp_path, work)
+    try:
+        second = sess._runners["default"].start("second", cwd=work)
+        second.thread_id = other
+        second.wait(timeout=15)
+        write_rollout(home, other, work)
+
+        # The pump may already have reaped the first run on its own; this is
+        # about what one batch costs, not about what came before it.
+        calls.clear()
+        guards.clear()
+        surfaced = sess._surface_finished(inst, [(TID, sess._runs[TID]), (other, second)])
+        links = [c for c in calls if c and c[0] == OPEN]
+        assert len(links) == 2
+        assert len(guards) == 1
+        assert all(surfaced[t]["surfaced"] for t in (TID, other))
+    finally:
+        sess.close()
+
+
+def test_a_thread_another_writer_took_is_skipped_with_a_reason(home, tmp_path, monkeypatch):
+    """Not surfaced, and not silent about it either.
+
+    Between the child exiting and the reap, anything may have taken the lock.
+    Focusing then would ask the app to open a rollout somebody else is writing,
+    so it is declined -- but declining without saying so would leave a caller
+    believing the thread was on screen.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    sess, inst = session(
+        home, tmp_path, stub(tmp_path, [STARTED]), holders={TID: (FOREIGN_PID, "codex")}
+    )
+    try:
+        sess.start_thread("build it", cwd=str(work))
+        write_rollout(home, TID, work)
+        sess._runs[TID].wait(timeout=15)
+        sess._reap_runs(inst)
+        assert calls == []
+        surfaced = sess.collect_events()["events"][0]["data"]["surfaced"]
+        assert (surfaced["surfaced"], surfaced["reason"]) == (False, "refused")
+        assert "not Codex Desktop" in surfaced["detail"]
+    finally:
+        sess.close()
+
+
+def test_a_surfacing_failure_never_costs_the_completion_event(home, tmp_path, monkeypatch):
+    """The raise is best-effort; the announcement is not.
+
+    A run is marked reported before it is surfaced, so anything escaping the
+    surfacing would leave a finished turn with nothing to announce it -- an
+    orchestrator waiting on `turn_completed` would wait forever. The failure is
+    reported in its place rather than defaulted away.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+
+    def explode(self, instance, finished):
+        raise RuntimeError("lsof went missing")
+
+    monkeypatch.setattr(Session, "_surface_finished", explode)
+    sess, inst = _finished_run(home, tmp_path, work)
+    try:
+        sess._reap_runs(inst)
+        event = sess.collect_events()["events"][0]
+        assert event["type"] == EVENT_TURN_COMPLETED
+        surfaced = event["data"]["surfaced"]
+        assert (surfaced["surfaced"], surfaced["reason"]) == (False, "error")
+        assert "lsof went missing" in surfaced["detail"]
+    finally:
+        sess.close()
+
+
+def test_a_run_we_stopped_is_not_raised_into_a_window(home, tmp_path, monkeypatch):
+    """Cancelling a slice is not a request to be shown it.
+
+    `stop_turn` is how an orchestrator abandons work it means to redispatch;
+    surfacing the corpse would take the screen for the one outcome nobody
+    wanted to look at.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delenv(actions.SUPPRESS_FOCUS_ENV, raising=False)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("codex_pilot.actions.subprocess.run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr("codex_pilot.frontmost._run", lambda argv: "")
+    sess, inst = session(home, tmp_path, stub(tmp_path, [STARTED], sleep=30))
+    try:
+        sess.start_thread("build it", cwd=str(work))
+        write_rollout(home, TID, work)
+        sess.stop_turn(TID)
+        sess._reap_runs(inst)
+        assert [c for c in calls if c and c[0] == OPEN] == []
+        surfaced = sess.collect_events()["events"][0]["data"]["surfaced"]
+        assert (surfaced["surfaced"], surfaced["reason"]) == (False, "stopped")
     finally:
         sess.close()

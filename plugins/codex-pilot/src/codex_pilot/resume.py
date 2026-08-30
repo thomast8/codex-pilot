@@ -211,6 +211,11 @@ class DetachedRun:
     # Set when we terminated it ourselves, so its non-zero exit is not
     # reported as though the agent had failed on its own.
     stopped: bool = False
+    # Whether to bring this thread forward in the app once the run exits. A
+    # detached run is invisible while it holds the lock, so without this the
+    # work never appears in Codex Desktop at all. Policy rather than mechanism:
+    # the runner spawns processes, and the Session sets this on the way past.
+    surface: bool = True
 
     @property
     def pid(self) -> int:

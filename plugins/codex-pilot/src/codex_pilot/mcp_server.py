@@ -255,7 +255,10 @@ def thread_status(thread: str, instance: str | None = None) -> dict[str, Any]:
         "`model`, `effort` and `service_tier` set the turn without touching the "
         "user's shared config: they reach the detached route only, so on a thread "
         "the app has open they are refused with a pointer to edit_thread rather "
-        "than silently ignored."
+        "than silently ignored. "
+        "A detached turn is brought forward in Codex Desktop when it exits, so "
+        "the finished thread is on screen to carry on from; pass surface=false "
+        "to leave it where it is."
     )
 )
 def send_message(
@@ -267,6 +270,7 @@ def send_message(
     model: str | None = None,
     effort: str | None = None,
     service_tier: str | None = None,
+    surface: bool = True,
 ) -> dict[str, Any]:
     try:
         result = session().send_message(
@@ -278,6 +282,7 @@ def send_message(
             model=model,
             effort=effort,
             service_tier=service_tier,
+            surface=surface,
         )
     except (ActionError, IpcError, ThreadError) as exc:
         return _fail(exc)
@@ -313,9 +318,13 @@ def send_message(
         "'detached_running' (with `started_here` true, since it is ours) and the "
         "thread cannot be steered or driven over IPC; "
         "stop_turn terminates it, and collect_events reports turn_completed (or "
-        "run_failed) when it exits. Do NOT focus_thread it while it runs. Once "
-        "it is idle, focus_thread brings it into Codex Desktop for IPC. Read "
-        "`log_path` for streamed JSONL, or `rollout` for the transcript. "
+        "run_failed) when it exits. Do NOT focus_thread it while it runs. "
+        "When it exits the thread is brought forward in Codex Desktop by itself, "
+        "so finished work lands on screen ready to drive over IPC -- the "
+        "turn_completed event's `surfaced` says whether that happened and why "
+        "not when it did not (a dead app is left dead rather than cold-started). "
+        "Pass surface=false for a fan-out whose completions should stay silent. "
+        "Read `log_path` for streamed JSONL, or `rollout` for the transcript. "
         "`model`, `effort` (reasoning) and `service_tier` ('priority' is fast mode) "
         "are worth naming rather than leaving: unset, each is inherited from the "
         "instance's config.toml, which Codex Desktop rewrites, so what a dispatch "
@@ -340,6 +349,7 @@ def start_thread(
     model: str | None = None,
     effort: str | None = None,
     service_tier: str | None = None,
+    surface: bool = True,
 ) -> dict[str, Any]:
     try:
         result = session().start_thread(
@@ -354,6 +364,7 @@ def start_thread(
             model=model,
             effort=effort,
             service_tier=service_tier,
+            surface=surface,
         )
     except (ActionError, IpcError, ThreadError, DetachedError) as exc:
         return _fail(exc)

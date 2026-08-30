@@ -592,6 +592,34 @@ adopted: remodex refuses outright (`conversation-not-owned`) any thread it did
 not create, so an inverted writer reaches none of the app-held threads whose
 raises are the cost.
 
+### `codex://threads/new` prefills the composer, it does not start a turn — verified
+
+Worth recording because it is the obvious place to look for "make the app create
+the thread", and it does not do that.
+
+The bundle's deep-link router (`YE`) handles host `threads` with first segment
+`new`, and `aD` accepts `path`, `prompt`, `mode`, `originUrl`, `projectId` and
+`browserUrl`. `path` really is the working directory, and `prompt` really is the
+text. But the route's handler ends at
+
+    u(e, `/`, {codexAppMode, focusComposerNonce: Date.now(), prefillPrompt: t.prompt})
+
+— `prefillPrompt`, not a turn. The `localConversation` branch does the same with
+its own `prompt`, so this is the app's one meaning for the parameter, not a
+quirk of one branch.
+
+Verified 2026-08-29: `open -a /Applications/ChatGPT.app "codex://threads/new?path=...&prompt=..."`
+against the live default instance, with a 468-character multi-paragraph prompt,
+left the rollout count at 998 across 20s. No thread id, no rollout, no turn. The
+window came up with the text typed into the composer, unsent.
+
+Two consequences. There is no way to make Codex Desktop start a *new* thread's
+first turn programmatically: the 22 IPC methods are all `thread-follower-*`
+against a thread that already exists, and this is the only other creation path.
+And a thread cannot be created directly in the app on the user's behalf without
+a keystroke, which is why `start_thread` owns the creation itself and surfaces
+the result afterwards.
+
 ### The link is not bound to an instance, so it has to be aimed — verified
 
 `codex://` names a thread, not an app. Every bundle here declares the scheme in

@@ -168,9 +168,25 @@ While it runs, the CLI holds the thread's writer lock, so its `route` reads
 lock. `stop_turn` still works: on a run started here it terminates the process
 group. Once it goes idle:
 
-- `focus_thread` pulls it into Codex Desktop, after which IPC works on it
-  normally: steer, stop, respond, follow. Only once it is idle — never while it
-  is running.
+- **It brings itself forward.** When the run exits, codex-pilot fires the same
+  deep link `focus_thread` would, so the finished thread lands in Codex Desktop
+  ready to drive over IPC and the user can see what came back. This is the
+  earliest it can happen: while the run holds the writer lock the thread is
+  renderable by nobody, which is the same invariant that makes focusing it mid-run
+  a two-writer bug.
+- **It says whether that worked.** The `turn_completed` (or `run_failed`) event
+  carries `surfaced`, either `{"surfaced": true, "app": ...}` or a `reason` and
+  `detail`: `app_not_running` (Codex is closed, and it is not cold-started just
+  to display a thread nobody asked to see), `suppressed`
+  (`CODEX_PILOT_SUPPRESS_FOCUS`), `not_requested` (`surface=false` on the
+  dispatch), `refused` (something took the lock in between), `unaimable` (the
+  serving app could not be named). Do not read a completion as "it is on screen"
+  without checking.
+- **`surface=false` on `start_thread` or `send_message`** turns it off per
+  dispatch. Worth it for a wide fan-out, where the flash per completion adds up;
+  the threads are still listed, and `read_thread` still harvests them.
+- `focus_thread` remains the manual route, for a thread that was not surfaced or
+  was surfaced and then closed. Only once it is idle — never while it is running.
 - `log_path` holds streamed JSONL for the run; `thread_status` gives the
   `rollout` path for the full transcript.
 
@@ -767,7 +783,9 @@ The loop is start, follow, wait once, look in, harvest.
 5. **`turn_completed` means that thread is free.** For a detached run its `data`
    carries `route: "detached"` and the exit code; `run_failed` means it exited
    non-zero, so read `log_path` before assuming the work happened — unless its
-   `stopped` is true, which means you stopped it yourself.
+   `stopped` is true, which means you stopped it yourself. `surfaced` says
+   whether the thread was brought into the app as it finished, and why not when
+   it was not.
 6. **Harvest with `read_thread`**, not by re-running the agent. It works
    whether or not the app ever mounted the thread. (`rollout` from
    `thread_status`/`list_threads` is the same file if you want it raw, and
@@ -787,10 +805,13 @@ to ask a human, which is why `start_thread` defaults to `approval="never"`. So
 ordering matters, and the obvious order is wrong:
 
     start_thread(...)                       # runs unattended, holds the lock
-    → wait for turn_completed
-    → focus_thread                          # now the app owns it
+    → wait for turn_completed               # it surfaces itself here
     → edit_thread(..., {"approvalsReviewer": "user"})
     → send_message(...)                     # this turn is supervised
+
+(`focus_thread` between the last two only if the completion's `surfaced` says
+it was not brought forward -- on a thread already mounted it is a no-op that
+reports `skipped_already_mounted`.)
 
 `edit_thread` needs the app to own the thread, so it cannot be used on a
 freshly started one — the run itself holds the lock. If a slice needs approvals

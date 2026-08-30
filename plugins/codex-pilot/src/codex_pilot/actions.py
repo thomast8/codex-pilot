@@ -213,6 +213,14 @@ class Session:
         # epoch is what lets a caller notice instead of going quietly deaf.
         self._epoch = uuid.uuid4().hex
         self._guard = threading.RLock()
+        # Reaping is serialized separately from `_guard`, which is held only in
+        # short bursts. A reap now spans slow work -- surfacing the thread --
+        # between claiming a finished run and announcing it, and two reapers
+        # interleaving there would let one observe a run already claimed but not
+        # yet announced, and report nothing for a turn that had in fact
+        # finished. The pump reaps on a timer and callers reap directly, so that
+        # overlap is routine rather than hypothetical.
+        self._reap_guard = threading.Lock()
         self._snapshot_waiters: dict[str, list[queue.Queue[dict[str, Any]]]] = {}
 
     @property
@@ -365,7 +373,13 @@ class Session:
         """Turn each finished detached run into a `turn_completed`, once.
 
         Polling the child is also what reaps it, so this doubles as the reaper.
+        Serialized, because claiming a run and announcing it are no longer
+        adjacent: surfacing the thread happens between them.
         """
+        with self._reap_guard:
+            self._reap_locked(instance)
+
+    def _reap_locked(self, instance: Instance) -> None:
         finished: list[tuple[str, DetachedRun]] = []
         with self._guard:
             for thread_id, run in self._runs.items():
@@ -373,6 +387,19 @@ class Session:
                     continue
                 run.reported = True
                 finished.append((thread_id, run))
+        if not finished:
+            return
+        try:
+            surfaced = self._surface_finished(instance, finished)
+        except Exception as exc:  # noqa: BLE001 - see the comment
+            # Surfacing is best-effort; the completion event is not. These runs
+            # are already marked reported, so anything escaping here would lose
+            # the only announcement that they finished -- a turn silently never
+            # completing, which is worse than any failure to raise a window.
+            surfaced = {
+                thread_id: self._not_surfaced("error", f"{type(exc).__name__}: {exc}")
+                for thread_id, _ in finished
+            }
         manager = self.follow_manager(instance)
         for thread_id, run in finished:
             code = run.returncode
@@ -385,8 +412,138 @@ class Session:
                     "pid": run.pid,
                     "log_path": str(run.log_path),
                     "stopped": run.stopped,
+                    # Whether the thread is now in the app, and why not when it
+                    # is not. Reported rather than implied: a caller told only
+                    # that the turn finished would have no way to tell a thread
+                    # waiting on screen from one that stayed invisible.
+                    "surfaced": surfaced[thread_id],
                 },
             )
+
+    def _surface_finished(
+        self, instance: Instance, finished: list[tuple[str, DetachedRun]]
+    ) -> dict[str, dict[str, Any]]:
+        """Bring each just-finished thread forward, so the app can show it.
+
+        This is the moment a detached thread becomes visible at all. While the
+        run holds the writer lock the thread is reachable by neither route and
+        no window renders it, so there is nothing to surface and focusing it
+        would be the two-writer case. The instant the child exits the lock is
+        free and the thread is an ordinary one the app can open -- which makes
+        completion the first point where surfacing is both possible and safe.
+
+        No settle before firing. The child's exit is what closes and flushes the
+        rollout, so by the time `poll()` has an answer the file the app is about
+        to read is already complete.
+
+        One guard around the whole batch, as in `sync_threads`: three runs
+        finishing together should cost the user one flash, not three.
+
+        A dead app is left dead. The link would cold-start Codex to display a
+        thread nobody asked to see, which is a heavier interruption than the one
+        it was meant to save -- remodex declines the same launch for the same
+        reason (`docs/protocol.md`). The result is on disk either way, and
+        `read_thread` needs no window. A run that was *stopped* is not surfaced
+        either: it did not finish, and whoever cancelled it did not ask to be
+        shown it.
+
+        Nothing here raises. It runs inside the pump, where an exception used to
+        end the thread outright, and a link that could not be fired is no reason
+        to lose the completion event it travels with.
+        """
+        out: dict[str, dict[str, Any]] = {}
+        wanted = []
+        for thread_id, run in finished:
+            if not run.surface:
+                out[thread_id] = self._not_surfaced(
+                    "not_requested", "the dispatch asked for surface=false"
+                )
+            elif run.stopped:
+                # A run we terminated did not finish, it was cancelled -- most
+                # often to redispatch the slice. Raising the corpse into a
+                # window is the opposite of what the caller just asked for.
+                out[thread_id] = self._not_surfaced(
+                    "stopped", "the run was stopped rather than finishing on its own"
+                )
+            else:
+                wanted.append(thread_id)
+
+        def decline(reason: str, detail: str) -> None:
+            for thread_id in wanted:
+                out[thread_id] = self._not_surfaced(reason, detail)
+            wanted.clear()
+
+        target: Path | None = None
+        live = False
+        if wanted and focus_suppressed():
+            decline("suppressed", f"{SUPPRESS_FOCUS_ENV} is set; no link was fired")
+        if wanted:
+            try:
+                aimed = self.link_target(instance)
+            except UnboundLinkError as exc:
+                decline("unaimable", str(exc))
+            else:
+                # `link_target` hands back a cold bundle rather than refusing,
+                # because focusing is allowed to launch the app. Here it is not:
+                # nothing asked to see this thread, and a cold start is a
+                # heavier interruption than the one surfacing was meant to save.
+                if aimed.live:
+                    target, live = aimed.path, aimed.live
+                else:
+                    decline(
+                        "app_not_running",
+                        f"no app is serving instance {instance.slug!r}, so the thread was "
+                        "left where it is rather than cold-starting Codex to show it -- "
+                        "open the app and focus_thread it, or read_thread off the rollout",
+                    )
+
+        if target is None:
+            # Every wanted thread was declined above -- `decline` empties the
+            # list, so there is nothing left that could still be fired.
+            return out
+
+        pending: list[ResolvedThread] = []
+        for thread_id in wanted:
+            try:
+                resolved = self.resolve(thread_id, instance.slug)
+                self._refuse_unless_app_holds(resolved)
+            except (ThreadError, ActionError) as exc:
+                # Per thread, like `sync_threads`: one thread the app cannot be
+                # asked for is not a fact about the others finishing beside it.
+                out[thread_id] = self._not_surfaced("refused", str(exc))
+                continue
+            pending.append(resolved)
+        if not pending:
+            return out
+
+        try:
+            with self.frontmost_guard([target], live=live) as guard:
+                for resolved in pending:
+                    self._open_thread_link(resolved, target)
+            outcome = guard.outcome
+        except OSError as exc:
+            for resolved in pending:
+                out[resolved.thread_id] = self._not_surfaced("link_failed", str(exc))
+            return out
+        for resolved in pending:
+            out[resolved.thread_id] = {
+                "surfaced": True,
+                "reason": None,
+                "detail": None,
+                "app": str(target),
+                "focus": outcome,
+            }
+        return out
+
+    @staticmethod
+    def _not_surfaced(reason: str, detail: str) -> dict[str, Any]:
+        return {
+            "surfaced": False,
+            "reason": reason,
+            "detail": detail,
+            "app": None,
+            "focus": None,
+        }
 
     def follow_thread(
         self, ref: str, follow: bool = True, instance: str | None = None
@@ -1268,6 +1425,7 @@ class Session:
         model: str | None = None,
         effort: str | None = None,
         service_tier: str | None = None,
+        surface: bool = True,
     ) -> dict[str, Any]:
         """Create a new thread and start its first turn, in a place you name.
 
@@ -1276,6 +1434,12 @@ class Session:
         existing directory, or `repo` plus `branch` makes a worktree for it,
         laid out the way Codex lays one out. A thread started from wherever the
         caller happened to be is the failure this exists to prevent.
+
+        The thread is brought forward in Codex Desktop when the run exits, so
+        finished work lands somewhere the user can see and carry on from. It
+        cannot be shown any earlier than that: a running detached thread holds
+        the writer lock, which is exactly what makes it unrenderable. Pass
+        `surface=False` for a fan-out whose completions should stay silent.
         """
         from . import worktrees
 
@@ -1305,6 +1469,7 @@ class Session:
             effort=effort,
             service_tier=service_tier,
         )
+        run.surface = surface
         out = run.as_dict()
         if worktree is not None:
             out["worktree"] = worktree.as_dict()
@@ -1326,6 +1491,7 @@ class Session:
         model: str | None = None,
         effort: str | None = None,
         service_tier: str | None = None,
+        surface: bool = True,
     ) -> dict[str, Any]:
         """Start a turn, by whichever route the thread's lock state permits.
 
@@ -1338,6 +1504,11 @@ class Session:
         detached one. Both may be wrong, but only one of them can corrupt a
         rollout: an IPC attempt against a thread the app does not hold comes
         back as an error, while a resume onto a held lock is a second writer.
+
+        `surface` applies to the detached route only. A turn that goes over IPC
+        is already in a window the app is rendering, so there is nothing to
+        bring forward; a detached one is invisible until it exits, and is
+        surfaced then unless this says otherwise.
         """
         resolved = self.resolve(ref, instance)
         self._refuse_if_held_elsewhere(resolved)
@@ -1389,6 +1560,7 @@ class Session:
             effort=effort,
             service_tier=service_tier,
         )
+        run.surface = surface
         # Registered for the same reason start_thread's is: while this runs, it
         # and not the app holds the writer lock, and every other verb needs to
         # know that.
