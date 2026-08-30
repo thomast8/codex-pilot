@@ -421,6 +421,28 @@ even when it stopped nothing, both for an already-idle thread and for an
 `expected_turn_id` that did not match the running turn. Pass
 `expected_turn_id` from `thread_status` when you mean "stop *that* turn".
 
+### `latest_turn` is not `turn_id`
+
+`turn_id` answers "is a turn running", and is what `stop_turn` wants.
+`latest_turn` answers "which turn will the app steer", and they are different
+questions on a thread carrying more than one turn in progress.
+
+`latest_turn.placeholder: true` means the app has a turn in progress that it
+was never given an id for. Momentarily that is every turn — the id arrives with
+the turn's first stream event — so read it with `age_seconds`, which counts
+from when that turn started (not the thread recency `age_seconds` elsewhere in
+this surface). Past 60 seconds the id is no longer expected: the app starts
+turns with a 30s timeout of its own, so it is not still on its way, and Codex
+Desktop refuses to steer a thread whose newest turn is in that state.
+`steer_turn` refuses in front of it, because left to itself the app spends five
+seconds and answers `thread-follower-steer-turn-timeout`, which says nothing
+about why.
+
+The way out is `send_message`, not a retry. A new turn lands after the stuck
+one and becomes the turn the app steers, and steering works again from there.
+A person hitting this in the app sees "Cannot steer conversation ... without an
+active turn id" in the composer, and has the same way out.
+
 ## Settings
 
 `update_settings` applies to the **next** turn, not the running one.

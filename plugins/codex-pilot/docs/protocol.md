@@ -335,6 +335,98 @@ re-announce. Set `following: false` to stop.
 | `currentPermissions` | `approvalPolicy`, `approvalsReviewer`, `sandboxPolicy.writableRoots` |
 | `cwd`, `rolloutPath`, `id` | thread identity and location |
 
+### Turn history is a list of islands — decoded
+
+`turnHistory` is a tagged union. When `kind` is `canonical` the turns live in
+`history`, which is `{islands, entitiesByKey}`: each island holds `entries`
+whose `value` is a key into `entitiesByKey`, and carries `olderBoundary` /
+`newerBoundary` saying whether the history continues past it. Anything other
+than `canonical` means the turns are a plain `turns` list on the state instead.
+
+The app picks the newest turn with `lv`, and the choice of island is not
+obvious:
+
+```js
+function av(e){let t=e.islands.at(-1);return t?.newerBoundary.status===`exhausted`?t:null}
+function YEt(e){return e.islands.flatMap(t=>t.entries.map(t=>e.entitiesByKey[t.value]))}
+function sv(e){return e.turnHistory?.kind===`canonical`?YEt(e.turnHistory.history):e.turns}
+function lv(e){
+  if(e.turnHistory?.kind===`canonical`){
+    let{history:t}=e.turnHistory,n=av(t);
+    if(n!=null){let e=n.entries.at(-1)?.value;return e==null?null:t.entitiesByKey[e]??null}
+  }
+  return sv(e).at(-1)??null
+}
+```
+
+The tail island is used only when it is closed at its newer boundary; otherwise
+every island is flattened and the last entry taken. Those name the same turn
+whenever the tail island has entries, and differ only for an empty tail, where
+the first branch stops at nothing and the second keeps walking back. An entry
+whose key is missing from `entitiesByKey` also reads as nothing, with no walk
+back. `snapshot._latest_turn` models all of it.
+
+### A turn in progress can have no id, and sometimes never gets one — decoded
+
+The app appends a turn optimistically, before the server has confirmed it:
+
+```js
+pAt(e,{params:w.params,...,turnId:null,status:`inProgress`,
+       turnStartedAtMs:Date.now(),...},o)
+E?.type!==`active`&&(e.threadRuntimeStatus=D)
+O=await e.sendRequest(`turn/start`,r,{priority:`critical`,timeoutMs:j_,...})
+```
+
+The id is filled in later from the turn's first stream event
+(`rebindLatestInProgressPlaceholder`). Every failure branch of `turn/start`
+rolls the placeholder back to `status: "failed"` except one — an
+`outcome-unknown` delivery records the unknown delivery and leaves the turn in
+progress with a null id permanently. The entry is local-only
+(`tail:N:local:<uuid>` in a `local-live-tail:` island), so nothing in the
+window's own state completes it. What the decode does *not* settle is whether
+the turn started server-side anyway: an unknown outcome is unknown in both
+directions, and a late stream event carrying the id would still rebind the
+placeholder. What is certain is that the response it would have come back on
+has already timed out.
+
+`turnStartedAtMs` is epoch milliseconds at every producer in the bundle
+(`Date.now()` on the optimistic append, `e*1e3` from epoch seconds elsewhere),
+so it is directly comparable to a local wall clock.
+
+### Steering needs the newest turn to have an id — decoded
+
+`steerTurn` throws immediately when `lv()` is not `inProgress`
+(`Cannot steer conversation X because its active turn already ended`). When it
+is in progress but carries no id, the app waits on a conversation callback for
+`j_` = **30s** and then rejects with `Cannot steer conversation X without an
+active turn id`. Both reach a person as the composer's own toast
+(`composer.cloudTaskError.v2`, "Error creating chat").
+
+Neither reaches a follower. The main process races the forwarded request
+against `y9` = **5s** — `a=(r,a=y9)=>t.addRequestHandler(...)`, and
+`thread-follower-steer-turn` registers without an override, unlike
+`thread-follower-load-complete-history` which passes `yle` = 300s. At 5s it
+rejects, and the client turns any handler rejection into a response frame
+carrying the message:
+
+```js
+catch(n){m9(t,{type:`response`,requestId:e.requestId,resultType:`error`,
+               error:n instanceof Error?n.message:`error-handling-request`})}
+```
+
+So a follower steering a thread whose newest turn has no id gets
+`thread-follower-steer-turn-timeout` after five seconds and no diagnosis. It is
+a real frame, so it costs no silent-timeout strike, but the useful error stays
+in the app. `Session.steer_turn` refuses in front of this rather than passing
+it on — see `STALLED_TURN_SECONDS`, set at twice the app's own 30s
+`turn/start` timeout, past which an id cannot still be in flight.
+
+**Verified** against a live thread: a placeholder turn in this exact state
+(`inProgress`, `turnId: null`, appended 18:43) sat between two completed turns
+in the app's own broadcast, and steering was impossible for the eleven minutes
+it was the newest entry. The 30s and 5s constants themselves are decoded, not
+executed.
+
 ## What the rollout does and does not hold — corpus-validated
 
 A third label, distinct from the two used elsewhere here. **Verified** means

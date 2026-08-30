@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_pilot import actions, frontmost, mcp_server
+from codex_pilot import actions, frontmost, mcp_server, payloads, snapshot
 from codex_pilot.actions import (
     ActionError,
     LinkTarget,
@@ -443,6 +443,9 @@ class FakeApp:
         # window renders. Empty by default, which is why threads read as
         # unmounted here unless a test says otherwise.
         self.owners: dict[str, str] = {}
+        # Follower methods this app answers, and with what. Absent means
+        # silence, which is what an app that is not rendering the thread does.
+        self.follower_results: dict[str, dict] = {}
         self._stop = threading.Event()
         self._srv: socket.socket | None = None
         self.bind()
@@ -521,6 +524,22 @@ class FakeApp:
                             )
                     # An unowned thread gets silence, which is what the real
                     # router does until its own discovery timeout fires.
+                    continue
+                method = str(msg.get("method") or "")
+                if method.startswith("thread-follower-") and method in self.follower_results:
+                    with contextlib.suppress(OSError):
+                        conn.sendall(
+                            encode_frame(
+                                {
+                                    "type": "response",
+                                    "requestId": msg["requestId"],
+                                    "resultType": "success",
+                                    "method": method,
+                                    "handledByClientId": "c1",
+                                    "result": self.follower_results[method],
+                                }
+                            )
+                        )
                     continue
                 if msg.get("method") == "initialize" and self.answer_initialize:
                     reply = {
@@ -2025,4 +2044,240 @@ def test_two_reapers_on_one_instance_announce_a_run_exactly_once(home, tmp_path,
         assert [e["type"] for e in events] == [EVENT_TURN_COMPLETED]
     finally:
         release.set()
+        sess.close()
+
+
+# -- the stalled placeholder guard --------------------------------------------
+
+
+def projected(status, turn_id, started_at_ms):
+    """A real projection of a thread whose latest turn is as described."""
+    return snapshot.project(
+        {
+            "params": {
+                "change": {
+                    "conversationState": {
+                        "threadRuntimeStatus": {"type": "active"},
+                        "turnHistory": {
+                            "kind": "canonical",
+                            "history": {
+                                "islands": [
+                                    {
+                                        "entries": [{"key": "t", "value": "t"}],
+                                        "newerBoundary": {"status": "exhausted"},
+                                    }
+                                ],
+                                "entitiesByKey": {
+                                    "t": {
+                                        "status": status,
+                                        "turnId": turn_id,
+                                        "turnStartedAtMs": started_at_ms,
+                                    }
+                                },
+                            },
+                        },
+                    }
+                }
+            }
+        }
+    )
+
+
+def steerable(home, tmp_path, state):
+    """A session whose steer is stubbed, reporting `state` for the thread."""
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []))
+    sent: list[str] = []
+    sess.thread_state = lambda resolved, **kw: state
+    sess._follower_request = lambda resolved, method, params: sent.append(method) or {"ok": True}
+    return sess, sent
+
+
+def test_steer_refuses_a_turn_the_app_has_left_without_an_id(home, tmp_path):
+    # The app steers whatever its `lv()` calls the latest turn and wants that
+    # turn to carry a server id. One stuck without an id fails inside the app
+    # 30s later, and the request is abandoned after 5s regardless, so the
+    # caller's only signal is `thread-follower-steer-turn-timeout`.
+    now_ms = time.time() * 1000
+    sess, sent = steerable(home, tmp_path, projected("inProgress", None, now_ms - 600_000))
+    with pytest.raises(ActionError, match="without a turn id"):
+        sess.steer_turn(TID, "hello")
+    assert sent == []
+    sess.close()
+
+
+def test_the_refusal_says_how_old_the_turn_is_and_what_to_do(home, tmp_path):
+    # The age is rendered from the wall clock at refusal time, so this pins the
+    # shape rather than an exact number -- a slow fixture setup would otherwise
+    # turn 600s into 601s and fail on nothing.
+    now_ms = time.time() * 1000
+    sess, _ = steerable(home, tmp_path, projected("inProgress", None, now_ms - 600_000))
+    with pytest.raises(ActionError, match=r"in progress for 6\d\ds without a turn id") as caught:
+        sess.steer_turn(TID, "hello")
+    assert "send_message" in str(caught.value)
+    sess.close()
+
+
+def test_the_refusal_has_its_own_type_so_callers_can_branch(home, tmp_path):
+    # The MCP surface returns `type(exc).__name__` as `error`; without a
+    # distinct type this refusal is indistinguishable from every other one.
+    now_ms = time.time() * 1000
+    sess, _ = steerable(home, tmp_path, projected("inProgress", None, now_ms - 600_000))
+    with pytest.raises(actions.StalledTurnError):
+        sess.steer_turn(TID, "hello")
+    sess.close()
+
+
+def test_a_thread_with_no_turn_history_is_steered_rather_than_crashing(home, tmp_path):
+    # A thread that has never run a turn projects `latest_turn: None`. The
+    # guard has to read that as "nothing to judge", not dereference it.
+    sess, sent = steerable(
+        home,
+        tmp_path,
+        snapshot.project(
+            {"params": {"change": {"conversationState": {"threadRuntimeStatus": {"type": "idle"}}}}}
+        ),
+    )
+    sess.steer_turn(TID, "hello")
+    assert sent == ["thread-follower-steer-turn"]
+    sess.close()
+
+
+def test_the_refusal_starts_exactly_at_the_constant(home, tmp_path, monkeypatch):
+    # Pinned against a frozen clock, because the boundary is the whole point:
+    # a turn that has reached the threshold is refused, one a millisecond short
+    # of it is not.
+    now = 1_788_111_858.512
+    monkeypatch.setattr(actions.time, "time", lambda: now)
+    at_threshold = (now - actions.STALLED_TURN_SECONDS) * 1000
+
+    sess, sent = steerable(home, tmp_path, projected("inProgress", None, at_threshold + 1))
+    sess.steer_turn(TID, "hello")
+    assert sent == ["thread-follower-steer-turn"]
+
+    sess.thread_state = lambda resolved, **kw: projected("inProgress", None, at_threshold)
+    with pytest.raises(actions.StalledTurnError):
+        sess.steer_turn(TID, "hello")
+    sess.close()
+
+
+def test_a_turn_that_only_just_started_is_steered_rather_than_refused(home, tmp_path):
+    # An id-less turn in progress is the normal state of every turn start --
+    # the id arrives with the first stream event. Refusing on the null alone
+    # would reject steering a turn that is working perfectly.
+    now_ms = time.time() * 1000
+    sess, sent = steerable(home, tmp_path, projected("inProgress", None, now_ms - 500))
+    sess.steer_turn(TID, "hello")
+    assert sent == ["thread-follower-steer-turn"]
+    sess.close()
+
+
+def test_a_turn_with_a_real_id_is_steered(home, tmp_path):
+    now_ms = time.time() * 1000
+    sess, sent = steerable(home, tmp_path, projected("inProgress", "01a053cf", now_ms - 600_000))
+    sess.steer_turn(TID, "hello")
+    assert sent == ["thread-follower-steer-turn"]
+    sess.close()
+
+
+def test_unreadable_state_steers_rather_than_refusing_on_a_guess(home, tmp_path):
+    # Absence is never reported as fact: not knowing the turn is not evidence
+    # of a stuck one, so the app gets the request and answers for itself.
+    sess, sent = steerable(home, tmp_path, None)
+    sess.steer_turn(TID, "hello")
+    assert sent == ["thread-follower-steer-turn"]
+    sess.close()
+
+
+def test_an_undated_placeholder_is_steered_because_its_age_is_unknown(home, tmp_path):
+    sess, sent = steerable(home, tmp_path, projected("inProgress", None, None))
+    sess.steer_turn(TID, "hello")
+    assert sent == ["thread-follower-steer-turn"]
+    sess.close()
+
+
+def test_the_writer_lock_refusal_still_beats_the_placeholder_guard(home, tmp_path):
+    # Ordering matters: a foreign writer means the thread is unreachable at
+    # all, which is a bigger fact than what the app's stream last showed.
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={TID: (FOREIGN_PID, "codex")})
+    now_ms = time.time() * 1000
+    sess.thread_state = lambda resolved, **kw: projected("inProgress", None, now_ms - 600_000)
+    with pytest.raises(ActionError, match=rf"codex\({FOREIGN_PID}\)"):
+        sess.steer_turn(TID, "hello")
+    sess.close()
+
+
+def test_thread_status_shows_the_turn_the_app_would_steer(home, tmp_path, monkeypatch):
+    # Without this the condition is invisible: `runtime` comes from
+    # threadRuntimeStatus and `turn_id` from a scan for any in-progress turn
+    # carrying an id, so a thread the app refuses to steer reads exactly like
+    # an ordinary one.
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={TID: (APP_PID, "codex")})
+    now_ms = time.time() * 1000
+    sess.thread_state = lambda resolved, **kw: projected("inProgress", None, now_ms - 600_000)
+    monkeypatch.setattr(mcp_server, "_session", sess)
+
+    latest = mcp_server.thread_status(TID)["state"]["latest_turn"]
+    assert latest["placeholder"] is True
+    assert latest["turn_id"] is None
+    assert latest["age_seconds"] == pytest.approx(600, abs=5)
+    sess.close()
+
+
+def test_thread_status_reports_no_latest_turn_without_raising(home, tmp_path, monkeypatch):
+    # `latest_turn: None` is the ordinary state of a thread before its first
+    # turn is recorded, so building the response must not dereference it.
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={TID: (APP_PID, "codex")})
+    sess.thread_state = lambda resolved, **kw: snapshot.project(
+        {"params": {"change": {"conversationState": {"threadRuntimeStatus": {"type": "idle"}}}}}
+    )
+    monkeypatch.setattr(mcp_server, "_session", sess)
+
+    out = mcp_server.thread_status(TID)
+    assert out["ok"] is True
+    assert out["state"]["latest_turn"] is None
+    sess.close()
+
+
+def test_thread_status_reports_a_healthy_latest_turn_too(home, tmp_path, monkeypatch):
+    write_rollout(home, TID, tmp_path)
+    sess, _ = session(home, tmp_path, stub(tmp_path, []), holders={TID: (APP_PID, "codex")})
+    now_ms = time.time() * 1000
+    sess.thread_state = lambda resolved, **kw: projected("inProgress", "01a053cf", now_ms - 1_000)
+    monkeypatch.setattr(mcp_server, "_session", sess)
+
+    latest = mcp_server.thread_status(TID)["state"]["latest_turn"]
+    assert latest["placeholder"] is False
+    assert latest["turn_id"] == "01a053cf"
+    sess.close()
+
+
+def test_an_ordinary_steer_still_reaches_the_wire(app):
+    """The happy path, end to end over a real socket.
+
+    The guard now sits in front of `steer_turn`, so "it did not raise" is no
+    longer evidence the steer went anywhere. This pins that it arrives, as the
+    method and version the app answers, carrying the `restoreMessage` the
+    renderer dereferences without a guard.
+    """
+    write_rollout(app.home, TID, app.home)
+    app.owners[TID] = "window-that-renders-it"
+    app.follower_results["thread-follower-steer-turn"] = {"ok": True}
+    sess, _ = live_session(app, ipc_timeout=5.0)
+    try:
+        out = sess.steer_turn(TID, "go left instead")
+        assert out["thread"] == TID
+
+        sent = [f for f in app.frames if f.get("method") == "thread-follower-steer-turn"]
+        assert len(sent) == 1
+        assert sent[0]["version"] == 1
+        assert sent[0]["targetClientId"] == "window-that-renders-it"
+        params = sent[0]["params"]
+        assert params["conversationId"] == TID
+        assert params["input"] == payloads.text_input("go left instead")
+        assert params["restoreMessage"]["context"]["workspaceRoots"] == [str(app.home)]
+    finally:
         sess.close()

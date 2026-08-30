@@ -22,6 +22,7 @@ from .payloads import REQUEST_METHOD_TO_KIND
 
 RUNTIME_ACTIVE = "active"
 RUNTIME_IDLE = "idle"
+STATUS_IN_PROGRESS = "inProgress"
 
 
 @dataclass(frozen=True)
@@ -56,9 +57,63 @@ class PendingRequest:
 
 
 @dataclass(frozen=True)
+class LatestTurn:
+    """The turn the app's steer gate will act on.
+
+    A separate fact from `ThreadState.turn_id`, and deliberately so: that one
+    answers "is a turn running", scanning for any in-progress turn carrying an
+    id, which is what `stop_turn` wants. This one answers "which turn will the
+    app steer".
+
+    They agree on the ordinary thread. They part company once a thread carries
+    two turns in progress at once, and then only in one direction: a turn with
+    no id sitting *behind* one that has an id reads as that real id in
+    `turn_id` and as the id-less turn here, because the app steers the newest
+    turn and not the healthiest one. The same pair in the other order agrees,
+    which is why the live capture this was built from showed no disagreement.
+    """
+
+    status: str | None
+    turn_id: str | None
+    started_at_ms: int | None
+
+    @property
+    def placeholder(self) -> bool:
+        """In progress, with no server-assigned id.
+
+        The app appends a turn optimistically and fills the id in when the
+        first stream event arrives, so this is the ordinary state of a turn
+        that has only just started. It is also the state of one the app gave up
+        on -- see `age_seconds`, because nothing else tells the two apart.
+        """
+        return self.status == STATUS_IN_PROGRESS and not self.turn_id
+
+    def as_dict(self, now: float) -> dict[str, Any]:
+        """The wire shape. One definition, because two would drift."""
+        return {
+            "status": self.status,
+            "turn_id": self.turn_id,
+            "age_seconds": self.age_seconds(now),
+            "placeholder": self.placeholder,
+        }
+
+    def age_seconds(self, now: float) -> float | None:
+        """How long the turn has been running, given `now` as a unix timestamp.
+
+        None when the app did not stamp a start time: age is what separates a
+        turn that just started from one that is never going to finish, so an
+        unknown age has to stay unknown rather than default to zero.
+        """
+        if self.started_at_ms is None:
+            return None
+        return max(0.0, now - self.started_at_ms / 1000.0)
+
+
+@dataclass(frozen=True)
 class ThreadState:
     runtime: str | None
     turn_id: str | None
+    latest_turn: LatestTurn | None
     pending: list[PendingRequest]
     revision: int | None
     cwd: str | None
@@ -160,6 +215,63 @@ def _active_turn_id(state: dict[str, Any]) -> str | None:
     return None
 
 
+def _turn_entity(entity: Any) -> LatestTurn | None:
+    if not isinstance(entity, dict):
+        return None
+    status = entity.get("status")
+    turn_id = entity.get("turnId")
+    started = entity.get("turnStartedAtMs")
+    return LatestTurn(
+        status=status if isinstance(status, str) else None,
+        turn_id=turn_id if isinstance(turn_id, str) and turn_id else None,
+        started_at_ms=int(started) if isinstance(started, (int, float)) else None,
+    )
+
+
+def _entry_turn(entities: dict[str, Any], entry: Any) -> LatestTurn | None:
+    """Resolve one island entry through the entity table, as the app does."""
+    if not isinstance(entry, dict):
+        return None
+    key = entry.get("value")
+    return _turn_entity(entities.get(key)) if isinstance(key, str) else None
+
+
+def _latest_turn(state: dict[str, Any]) -> LatestTurn | None:
+    """The turn the app would steer -- its `lv()`, modelled from the bundle.
+
+    Canonical history is a list of islands. The app takes the tail island when
+    that island is closed at its newer boundary (`av`), and otherwise flattens
+    every island and takes the last entry. Those pick the same turn whenever
+    the tail island has entries; they differ only for an empty tail, where the
+    closed branch stops at nothing and the flattening one keeps walking back.
+    A history that is present but malformed reads as unknown, not as empty.
+    """
+    holder = _as_dict(state.get("turnHistory"))
+    if holder.get("kind") != "canonical":
+        turns = state.get("turns")
+        return _turn_entity(turns[-1]) if isinstance(turns, list) and turns else None
+
+    history = _as_dict(holder.get("history"))
+    islands = history.get("islands")
+    entities = _as_dict(history.get("entitiesByKey"))
+    if not isinstance(islands, list):
+        return None
+
+    tail = islands[-1] if islands else None
+    if isinstance(tail, dict):
+        entries = tail.get("entries")
+        closed = _as_dict(tail.get("newerBoundary")).get("status") == "exhausted"
+        if closed:
+            last = entries[-1] if isinstance(entries, list) and entries else None
+            return _entry_turn(entities, last)
+
+    for maybe in reversed(islands):
+        entries = maybe.get("entries") if isinstance(maybe, dict) else None
+        if isinstance(entries, list) and entries:
+            return _entry_turn(entities, entries[-1])
+    return None
+
+
 def project(frame: dict[str, Any] | None) -> ThreadState | None:
     """Turn a `thread-stream-state-changed` frame into a ThreadState.
 
@@ -186,6 +298,7 @@ def project(frame: dict[str, Any] | None) -> ThreadState | None:
     return ThreadState(
         runtime=runtime if isinstance(runtime, str) else None,
         turn_id=turn_id,
+        latest_turn=_latest_turn(state),
         pending=pending,
         revision=change.get("revision"),
         cwd=state.get("cwd"),
