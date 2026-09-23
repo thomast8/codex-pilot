@@ -3,7 +3,7 @@ name = "codex-pilot"
 version = "0.4.0"
 description = "Drive Codex Desktop threads from Claude Code over the app's local IPC socket"
 requires-python = ">=3.11"
-dependencies = ["mcp>=2.1"]
+dependencies = ["codex-desktop-core", "mcp>=2.1"]
 
 [project.scripts]
 codex-pilot-mcp = "codex_pilot.mcp_server:main"
@@ -16,6 +16,7 @@ dev = [
     "mypy>=1.11",
     "anyio>=4.14.2",
     "pytest-anyio>=0.0.0",
+    "codex-ci-helper",
 ]
 
 [build-system]
@@ -25,9 +26,13 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/codex_pilot"]
 
+[tool.uv.sources]
+codex-desktop-core = { path = "core" }
+codex-ci-helper = { path = "helpers/codex-ci" }
+
 [tool.ruff]
 line-length = 100
-src = ["src", "tests"]
+src = ["src", "core/src", "helpers/codex-ci/src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
@@ -35,7 +40,11 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src/codex_pilot"]
+files = [
+    "src/codex_pilot",
+    "helpers/codex-ci/src/codex_ci",
+    "core/src/codex_desktop_core",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

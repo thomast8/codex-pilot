@@ -12,11 +12,11 @@ has no `pyproject.toml`.
 ## Commands
 
 ```sh
-uv run pytest                                      # the suite
-uv run pytest tests/test_follow.py -k resync       # one test
-uv run ruff check src tests scripts
-uv run mypy                                        # strict, src/codex_pilot only
-uv run python scripts/extract_registry.py --check  # protocol drift vs installed app
+uv run --no-editable pytest                         # the suite
+uv run --no-editable pytest tests/test_follow.py -k resync
+uv run --no-editable ruff check src core/src helpers/codex-ci/src tests scripts
+uv run --no-editable mypy                           # strict, all three packages
+uv run --no-editable python scripts/extract_registry.py --check
 ```
 
 There is no CI. The suite is the gate, and it is machine-dependent in one place:
@@ -38,7 +38,11 @@ allow-listed to one CODEX_HOME by construction; run `--dry-run` before `--yes`.
 
 ## Layout
 
-Transport is `framing` (length-prefixed JSON) → `registry` (pinned method
+`core/` builds the independent `codex-desktop-core` Python package.
+`helpers/codex-ci/` builds an independent webhook helper; installing it does
+not install the Claude Code frontend. The `codex_pilot` MCP/CLI frontend and
+`codex_ci` webhook helper both import the core;
+`codex_pilot` retains aliases for old imports. Transport is `framing` (length-prefixed JSON) → `registry` (pinned method
 versions, envelope building) → `ipc` (one long-lived socket client per instance,
 with a read pump, connection retirement and re-handshake). Discovery is
 `instances` (one Codex install == one CODEX_HOME) and `threads` (ids, cwd,
@@ -48,8 +52,8 @@ facts we act on — so they are testable without a socket. `follow` keeps a
 subscription current and turns transitions into events; `transcript` reads the
 same story off the rollout on disk; `resume` is the detached `codex exec resume`
 route and `worktrees` makes the git worktree a new thread runs in.
-`actions.Session` ties all of it together, and `mcp_server` and `cli` are two
-frontends over the same Session.
+`actions.Session` ties all of it together. `mcp_server`, `cli`, and the CI
+helper are frontends over the same Session.
 
 ## The invariants any change has to respect
 

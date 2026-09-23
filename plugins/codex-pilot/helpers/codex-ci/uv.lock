@@ -1,0 +1,19 @@
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[[package]]
+name = "codex-ci-helper"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "codex-desktop-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "codex-desktop-core", directory = "../../core" }]
+
+[[package]]
+name = "codex-desktop-core"
+version = "0.1.0"
+source = { directory = "../../core" }

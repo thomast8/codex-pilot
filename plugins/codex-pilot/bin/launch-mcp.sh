@@ -12,4 +12,4 @@ if ! command -v uv >/dev/null 2>&1; then
 	exit 1
 fi
 
-exec uv run --quiet --project "$ROOT" python -m codex_pilot.mcp_server "$@"
+exec uv run --no-dev --no-editable --quiet --project "$ROOT" python -m codex_pilot.mcp_server "$@"
