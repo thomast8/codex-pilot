@@ -17,14 +17,13 @@ from codex_pilot.registry import (
 
 
 def test_registry_matches_bundle_map_exactly():
-    # Verbatim from the app bundle's `b_` object; remodex's
-    # DESKTOP_IPC_METHOD_VERSIONS agrees, which is the drift cross-check.
+    # Verbatim from the currently installed app bundles' `b_` object.
     assert METHOD_VERSIONS == {
         "thread-stream-state-changed": 11,
         "thread-stream-following-changed": 1,
         "thread-stream-following-status-requested": 1,
         "ipc-connection-reset": 1,
-        "thread-read-state-changed": 2,
+        "thread-read-state-changed": 3,
         "thread-archived": 2,
         "thread-unarchived": 1,
         "thread-owner-discovery": 1,
@@ -33,7 +32,7 @@ def test_registry_matches_bundle_map_exactly():
         "thread-follower-compact-thread": 1,
         "thread-follower-steer-turn": 1,
         "thread-follower-interrupt-turn": 4,
-        "thread-follower-update-thread-settings": 1,
+        "thread-follower-update-thread-settings": 2,
         "thread-follower-edit-last-user-turn": 2,
         "thread-follower-command-approval-decision": 1,
         "thread-follower-file-approval-decision": 1,
@@ -41,7 +40,7 @@ def test_registry_matches_bundle_map_exactly():
         "thread-follower-submit-user-input": 1,
         "thread-follower-submit-mcp-server-elicitation-response": 1,
         "thread-follower-set-queued-follow-ups-state": 1,
-        "thread-queued-followups-changed": 1,
+        "thread-queued-followups-changed": 2,
     }
 
 

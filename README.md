@@ -3,7 +3,8 @@
 A Claude Code plugin for driving [Codex](https://openai.com/index/codex/) Desktop
 threads: send work, steer a turn that is already running, stop one, answer its
 approval requests, change model / reasoning / plan mode, and get told when a
-thread goes idle.
+thread goes idle. The bundle also includes a signed GitHub webhook helper for
+delivering CI and review events into an explicitly bound task.
 
 Useful if you supervise several Codex agents at once and would rather orchestrate
 them from Claude Code than tab between them.

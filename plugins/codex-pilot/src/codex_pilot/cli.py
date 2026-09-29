@@ -34,8 +34,8 @@ from pathlib import Path
 from types import FrameType
 from typing import Any
 
-from .actions import ActionError, Session
-from .follow import (
+from codex_desktop_core.actions import ActionError, Session
+from codex_desktop_core.follow import (
     EVENT_FOLLOW_LOST,
     EVENT_REQUEST_PENDING,
     EVENT_REQUEST_RESOLVED,
@@ -43,9 +43,9 @@ from .follow import (
     EVENT_TURN_COMPLETED,
     EVENT_TURN_STARTED,
 )
-from .instances import Instance, discover_instances
-from .ipc import IpcError
-from .threads import ThreadError
+from codex_desktop_core.instances import Instance, discover_instances
+from codex_desktop_core.ipc import IpcError
+from codex_desktop_core.threads import ThreadError
 
 EXIT_OK = 0
 EXIT_ERROR = 1

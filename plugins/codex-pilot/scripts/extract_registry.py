@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Extract the IPC method version map from a Codex Desktop app bundle.
 
-The registry in `codex_pilot/registry.py` is a copy of the `b_` object in the
+The registry in `codex_desktop_core/registry.py` is a copy of the `b_` object in the
 app's Electron main bundle. When Codex Desktop updates, a bumped version turns
 into `no-client-found` on a thread the app visibly owns -- the same error as
 "nobody owns this thread" -- so this script exists to make the diff a one-liner
@@ -23,10 +23,10 @@ import struct
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core" / "src"))
 
-from codex_pilot.instances import installed_apps  # noqa: E402
-from codex_pilot.registry import METHOD_VERSIONS  # noqa: E402
+from codex_desktop_core.instances import installed_apps  # noqa: E402
+from codex_desktop_core.registry import METHOD_VERSIONS  # noqa: E402
 
 # The map is an object literal whose first key is the stream-state method.
 REGISTRY_RE = re.compile(r'\{"thread-stream-state-changed":\d+[^}]*\}')
@@ -121,7 +121,9 @@ def main() -> int:
 
     if args.check and not ok:
         print(
-            "\nregistry drift -- update METHOD_VERSIONS in codex_pilot/registry.py", file=sys.stderr
+            "\nregistry drift -- update METHOD_VERSIONS in "
+            "codex_desktop_core/registry.py",
+            file=sys.stderr,
         )
         return 1
     return 0

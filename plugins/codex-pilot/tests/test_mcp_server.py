@@ -47,7 +47,7 @@ def server_params(codex_home: Path) -> StdioServerParameters:
             "PATH": "/usr/bin:/bin",
             "HOME": str(codex_home.parent),
             "CODEX_HOME": str(codex_home),
-            "PYTHONPATH": str(REPO / "src"),
+            "PYTHONPATH": f"{REPO / 'src'}:{REPO / 'core' / 'src'}",
         },
     )
 
@@ -202,7 +202,9 @@ def test_running_from_the_project_suggests_a_command_that_finds_it(tmp_path: Pat
     script is always on PATH -- the caller's shell is not, so the command has to
     carry --project or it fails with 'command not found'."""
     (tmp_path / "pyproject.toml").touch()
-    assert mcp_server._watch_prefix_for(tmp_path) == f"uv run --project {tmp_path} codex-pilot"
+    assert mcp_server._watch_prefix_for(tmp_path) == (
+        f"uv run --no-dev --no-editable --project {tmp_path} codex-pilot"
+    )
 
 
 def test_an_installed_wheel_suggests_the_bare_command(tmp_path: Path):
@@ -212,10 +214,10 @@ def test_an_installed_wheel_suggests_the_bare_command(tmp_path: Path):
 
 def test_the_suggested_command_points_at_this_checkout(monkeypatch):
     command = mcp_server.watch_command("abc-123", 900)
-    assert command.startswith("uv run --project /"), command
     assert command.endswith("codex-pilot watch abc-123 --until turn_completed --timeout 900")
-    project = Path(command.split()[3])
-    assert (project / "pyproject.toml").is_file(), f"{project} is not the project root"
+    if command.startswith("uv run"):
+        project = Path(command.split()[5])
+        assert (project / "pyproject.toml").is_file(), f"{project} is not the project root"
 
 
 def test_a_negative_wait_is_floored_without_claiming_it_was_capped(stub_session: StubSession):

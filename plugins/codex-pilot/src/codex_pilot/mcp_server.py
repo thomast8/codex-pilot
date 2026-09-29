@@ -36,11 +36,11 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from . import transcript
-from .actions import ActionError, Session
-from .ipc import IpcError
-from .resume import DetachedError
-from .threads import ThreadError
+from codex_desktop_core import transcript
+from codex_desktop_core.actions import ActionError, Session
+from codex_desktop_core.ipc import IpcError
+from codex_desktop_core.resume import DetachedError
+from codex_desktop_core.threads import ThreadError
 
 server = MCPServer(
     name="codex-pilot",
@@ -66,7 +66,7 @@ def _watch_prefix_for(project: Path) -> str:
     from an installed wheel, so the command needs `--project` to find it.
     """
     if (project / "pyproject.toml").is_file():
-        return f"uv run --project {project} codex-pilot"
+        return f"uv run --no-dev --no-editable --project {project} codex-pilot"
     return "codex-pilot"
 
 

@@ -50,6 +50,46 @@ Or as a plugin, which ships the MCP server and the usage skill together:
 /plugin install codex-pilot@<your-marketplace>
 ```
 
+## GitHub CI event helper
+
+The repository contains two independently installable frontends over
+`codex-desktop-core`: `codex_pilot` exposes Claude Code MCP tools;
+`helpers/codex-ci` accepts signed GitHub webhooks and sends a follow-up to an
+explicitly bound Codex task. Installing the helper does not install the
+`codex_pilot` frontend. The core is a separate Python package under `core/`,
+with one copy of the IPC, instance, writer-lock, and detached-resume logic.
+
+Run these from `helpers/codex-ci`:
+
+```sh
+uv run --no-editable codex-ci bind OWNER/REPO 123 --instance default --thread TASK_UUID
+CODEX_CI_WEBHOOK_SECRET=... uv run --no-editable codex-ci serve --ignore-user YOUR_GITHUB_LOGIN
+uv run --no-editable codex-ci status
+```
+
+`serve` listens on `127.0.0.1:8765/github`. Point a GitHub webhook or a
+trusted forwarder at that endpoint and subscribe to `check_run`, `check_suite`,
+`workflow_run`, `pull_request_review`, `pull_request_review_comment`, and
+`issue_comment`. Review comments are the primary workflow. Completed
+non-successful checks are also sent. Bot review
+events and logins named with `--ignore-user` are skipped to avoid reply loops. The helper
+checks `X-Hub-Signature-256`, stores received events in a local SQLite ledger,
+deduplicates them, and groups pending events for the same PR and commit. It
+does not send webhook comment bodies as instructions. It never guesses a task
+from a PR title or automatically merges a PR.
+
+The listener is local by default. A public webhook needs a separately managed
+HTTPS forwarder; to retain events while the Mac is offline, that forwarder
+must provide a durable queue and retry until the local listener acknowledges
+the delivery. Some GitHub check events have no associated PR in their payload;
+those are ignored rather than assigned by guesswork. `codex-ci status` shows
+pending, delivered, and held events. An uncertain send is held, never resent
+automatically; inspect the task before using `codex-ci retry OWNER/REPO 123`,
+which can duplicate a message if the original send actually landed.
+
+The packaged launcher uses `uv run --no-editable` because the local Python
+runtime ignores editable `.pth` files whose names begin with an underscore.
+
 ## The things that decide what is possible
 
 **The writer lock picks the route.** Codex allows one writer per thread. A thread

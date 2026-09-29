@@ -214,16 +214,34 @@ wheels = [
 ]
 
 [[package]]
+name = "codex-ci-helper"
+version = "0.1.0"
+source = { directory = "helpers/codex-ci" }
+dependencies = [
+    { name = "codex-desktop-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "codex-desktop-core", directory = "core" }]
+
+[[package]]
+name = "codex-desktop-core"
+version = "0.1.0"
+source = { directory = "core" }
+
+[[package]]
 name = "codex-pilot"
 version = "0.4.0"
 source = { editable = "." }
 dependencies = [
+    { name = "codex-desktop-core" },
     { name = "mcp" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "anyio" },
+    { name = "codex-ci-helper" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-anyio" },
@@ -231,11 +249,15 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mcp", specifier = ">=2.1" }]
+requires-dist = [
+    { name = "codex-desktop-core", directory = "core" },
+    { name = "mcp", specifier = ">=2.1" },
+]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "anyio", specifier = ">=4.14.2" },
+    { name = "codex-ci-helper", directory = "helpers/codex-ci" },
     { name = "mypy", specifier = ">=1.11" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-anyio", specifier = ">=0.0.0" },
