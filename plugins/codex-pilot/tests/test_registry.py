@@ -40,6 +40,9 @@ def test_registry_matches_bundle_map_exactly():
         "thread-follower-submit-user-input": 1,
         "thread-follower-submit-mcp-server-elicitation-response": 1,
         "thread-follower-set-queued-follow-ups-state": 1,
+        "thread-follower-clear-queued-messages": 1,
+        "thread-follower-remove-queued-message": 1,
+        "thread-follower-update-daybreak": 1,
         "thread-queued-followups-changed": 2,
     }
 
